@@ -6,3 +6,5 @@ dist/
 !deploy/.env.example
 coverage/
 apps/web/public/charting_library/
+.playwright-cli/
+output/playwright/

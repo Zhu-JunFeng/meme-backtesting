@@ -4,6 +4,6 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "scripts": {"build": "tsc -p tsconfig.json", "test": "vitest run"},
+  "scripts": {"build": "tsc -p tsconfig.json", "test": "vitest run --passWithNoTests"},
   "devDependencies": {"@types/node": "^22.13.10", "typescript": "^5.8.3", "vitest": "^3.2.4"}
 }

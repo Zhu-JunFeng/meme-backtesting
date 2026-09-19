@@ -1,21 +1,34 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { message } from "ant-design-vue";
-import TradingViewChart from "./components/TradingViewChart.vue";
-import { api } from "./api";
-const projects = ref<any[]>([]); const runs = ref<any[]>([]); const selectedPairId = ref<string>(); const activeRunId = ref<string>(); const report = ref<any>(); const loading = ref(false);
-const selected = computed(() => projects.value.find(p => p.pairId === selectedPairId.value));
-const form = ref({ name: "Fib 回撤回测", initialCapital: 10000, interval: "30s", valueType: "mcap", startTime: "2026-01-01T00:00:00Z", endTime: new Date().toISOString(), feePercent: 0.3, slippagePercent: 1, mode: "single_entry", maxEntries: 1 });
-const symbol = computed(() => selected.value ? `${selected.value.chain}:${selected.value.ca}:${selected.value.pairId}:${form.value.valueType}` : "");
-async function refresh() { projects.value = (await api.get("/market/projects")).data; runs.value = (await api.get("/backtests")).data; }
-async function create() { if (!selected.value) return message.warning("请先选择项目"); loading.value = true; try { const config = { name: form.value.name, initialCapital: form.value.initialCapital, symbols: [selected.value], interval: form.value.interval, valueType: form.value.valueType, startTime: form.value.startTime, endTime: form.value.endTime, entryConditions: { logic: "AND", conditions: [{ type: "fib_retracement", impulseMinPercent: 80, maxBars: 100, zoneLow: 0.618, zoneHigh: 0.786, requireVolumeContraction: false }] }, exitConfig: { stopLoss: { type: "percent", value: 10 }, takeProfit: { type: "risk_reward", ratio: 2 }, closeAtEnd: true }, executionConfig: { feePercent: form.value.feePercent, slippagePercent: form.value.slippagePercent, buyTaxPercent: 0, sellTaxPercent: 0, fillMode: "next_bar_open" }, positionConfig: { mode: form.value.mode, maxEntries: form.value.maxEntries, maxConcurrentPositions: 1, allowReentry: false, sizing: { type: "fixed_percent", value: 10 } } }; await api.post("/backtests", config); message.success("回测任务已提交"); await refresh(); } finally { loading.value = false; } }
-async function openRun(run:any) { activeRunId.value = run.id; selectedPairId.value = projects.value[0]?.pairId; await api.get(`/backtests/${run.id}`); report.value = (await api.get(`/backtests/${run.id}/report`)).data; }
-onMounted(refresh);
+import { computed, ref } from "vue";
+import { ExperimentOutlined, FundOutlined } from "@ant-design/icons-vue";
+import StrategyWorkspace from "./components/StrategyWorkspace.vue";
+import BacktestWorkspace from "./components/BacktestWorkspace.vue";
+
+const page = ref<"backtest"|"strategy">("backtest");
+const pageTitle = computed(() => page.value === "strategy" ? "策略配置" : "回测工作台");
+const pageDescription = computed(() => page.value === "strategy" ? "定义指标、组合规则，并保存不可变策略版本" : "选择策略版本与历史 K 线数据集，执行并复核回测结果");
 </script>
+
 <template>
-  <a-layout class="layout"><a-layout-header><h1>Meme K 线回测</h1></a-layout-header><a-layout-content class="content">
-    <a-card title="创建回测任务"><a-form layout="inline"><a-form-item label="名称"><a-input v-model:value="form.name" /></a-form-item><a-form-item label="周期"><a-select v-model:value="form.interval" style="width:100px"><a-select-option value="30s">30s</a-select-option><a-select-option value="1m">1m</a-select-option><a-select-option value="5m">5m</a-select-option></a-select></a-form-item><a-form-item label="项目"><a-select v-model:value="selectedPairId" :options="projects.map(p => ({ value: p.pairId, label: `${p.chain} / ${p.ca} / ${p.pairId}` }))" placeholder="请选择链 / CA / 交易池" allow-clear show-search style="width:360px" /></a-form-item><a-button type="primary" :loading="loading" @click="create">开始回测</a-button></a-form></a-card>
-    <a-row :gutter="16" class="row"><a-col :span="8"><a-card title="历史任务"><a-list :data-source="runs"><template #renderItem="{item}"><a-list-item @click="openRun(item)"><a-tag>{{item.status}}</a-tag>{{item.name}}<span>{{Math.round(item.progress*100)}}%</span></a-list-item></template></a-list></a-card></a-col><a-col :span="16"><a-card title="K 线与交易点位"><TradingViewChart v-if="symbol" :symbol="symbol" :interval="form.interval" :run-id="activeRunId" /><a-empty v-else description="请选择项目" /></a-card><a-card v-if="report" title="报告"><a-statistic title="净收益" :value="report.netPnl" /><a-statistic title="胜率" :value="report.winRate * 100" suffix="%" /><a-statistic title="最大回撤" :value="report.maxDrawdownPercent" suffix="%" /></a-card></a-col></a-row>
-  </a-layout-content></a-layout>
+  <a-config-provider :theme="{ token: { colorPrimary:'#176b5b',colorInfo:'#376a9f',colorSuccess:'#2f7d5b',colorWarning:'#b7791f',colorError:'#c2413b',borderRadius:8,fontFamily:'Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif' } }">
+    <div class="app-shell">
+      <aside class="side-nav">
+        <div class="brand"><div class="brand-mark">M</div><div><strong>Meme Lab</strong><span>Backtesting</span></div></div>
+        <nav>
+          <button :class="{active:page==='backtest'}" @click="page='backtest'"><FundOutlined /><span>回测工作台</span></button>
+          <button :class="{active:page==='strategy'}" @click="page='strategy'"><ExperimentOutlined /><span>策略配置</span></button>
+        </nav>
+        <div class="environment"><i></i><div><span>数据服务</span><strong>已连接</strong></div></div>
+      </aside>
+      <main>
+        <header class="page-header"><div><h1>{{ pageTitle }}</h1><p>{{ pageDescription }}</p></div><div class="scope-badge">历史 K 线 · 单周期</div></header>
+        <BacktestWorkspace v-if="page==='backtest'" />
+        <StrategyWorkspace v-else />
+      </main>
+    </div>
+  </a-config-provider>
 </template>
-<style scoped>.layout{min-height:100vh;background:#f5f5f5}.ant-layout-header{color:white}.ant-layout-header h1{color:white;margin:0}.content{padding:24px}.row{margin-top:16px}.ant-list-item{cursor:pointer;gap:10px}.ant-statistic{display:inline-block;margin-right:40px}</style>
+
+<style>
+*{box-sizing:border-box}html,body,#app{margin:0;min-height:100%;background:#f4f6f8;color:#18211f;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.app-shell{min-height:100vh;display:grid;grid-template-columns:216px minmax(0,1fr)}.side-nav{position:sticky;top:0;height:100vh;background:#17201e;color:#dce7e3;padding:22px 14px;display:flex;flex-direction:column}.brand{display:flex;align-items:center;gap:11px;padding:0 7px 24px}.brand-mark{width:34px;height:34px;border-radius:8px;background:#d5ebe4;color:#174e43;display:grid;place-items:center;font-weight:850;font-size:18px}.brand strong,.brand span{display:block}.brand strong{font-size:15px;color:#f1f6f4}.brand span{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#85958f;margin-top:2px}.side-nav nav{display:flex;flex-direction:column;gap:5px}.side-nav nav button{display:flex;align-items:center;gap:10px;width:100%;border:0;background:transparent;color:#9fb0aa;padding:11px 12px;border-radius:7px;text-align:left;cursor:pointer;font-size:14px}.side-nav nav button:hover{color:#f1f6f4;background:#212c29}.side-nav nav button.active{background:#293c37;color:#e3f2ed}.environment{margin-top:auto;border-top:1px solid #2d3936;padding:18px 8px 2px;display:flex;align-items:center;gap:9px}.environment i{width:8px;height:8px;border-radius:50%;background:#55b98e;box-shadow:0 0 0 3px rgba(85,185,142,.12)}.environment span,.environment strong{display:block;font-size:11px}.environment span{color:#82928d}.environment strong{color:#c8d6d1;margin-top:2px}main{min-width:0;padding:24px}.page-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.page-header h1{font-size:22px;letter-spacing:-.02em;margin:0;color:#18211f}.page-header p{margin:5px 0 0;color:#66736f;font-size:13px}.scope-badge{font-size:12px;color:#53615d;border:1px solid #d7dfdc;border-radius:999px;padding:7px 11px;background:#fff;font-weight:600}@media(max-width:900px){.app-shell{display:block}.side-nav{position:static;height:auto;padding:12px 16px;flex-direction:row;align-items:center;gap:15px}.brand{padding:0}.brand span,.environment{display:none}.side-nav nav{flex-direction:row;margin-left:auto}.side-nav nav button span{display:none}.side-nav nav button{padding:10px 13px}.app-shell main{padding:18px}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
+</style>
