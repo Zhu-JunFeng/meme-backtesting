@@ -2,5 +2,7 @@ node_modules/
 dist/
 .env
 .env.*
+!.env.example
+!deploy/.env.example
 coverage/
 apps/web/public/charting_library/
