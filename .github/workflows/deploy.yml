@@ -1,0 +1,66 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm --filter @meme/domain build
+      - run: pnpm --filter @meme/engine build
+      - run: pnpm --filter @meme/engine test
+      - run: pnpm --filter @meme/api build
+      - run: pnpm --filter @meme/worker build
+      - run: pnpm --filter @meme/web build
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+      - name: Upload source
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          tar --exclude=.git --exclude=node_modules --exclude='apps/web/public/charting_library' -czf /tmp/meme-backtesting.tgz .
+          scp -i ~/.ssh/deploy_key /tmp/meme-backtesting.tgz "$DEPLOY_USER@$DEPLOY_HOST:/tmp/meme-backtesting.tgz"
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$DEPLOY_PATH' && tar -xzf /tmp/meme-backtesting.tgz -C '$DEPLOY_PATH' && rm -f /tmp/meme-backtesting.tgz"
+      - name: Migrate and restart
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+        run: |
+          printf 'DATABASE_URL=%s\nREDIS_HOST=host.docker.internal\nREDIS_PORT=6379\nREDIS_PASSWORD=%s\nPORT=3000\n' "$DATABASE_URL" "$REDIS_PASSWORD" | ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" "cat > '$DEPLOY_PATH/deploy/.env'"
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" "cd '$DEPLOY_PATH' && docker run --rm --network host --env-file deploy/.env -v \"\$PWD:/app\" -w /app postgres:18-alpine psql \"\$DATABASE_URL\" -v ON_ERROR_STOP=1 -f apps/api/migrations/001_init.sql && docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build"

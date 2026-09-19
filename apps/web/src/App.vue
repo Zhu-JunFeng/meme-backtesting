@@ -1,0 +1,21 @@
+<script setup lang="ts">
+import { computed, onMounted, ref } from "vue";
+import { message } from "ant-design-vue";
+import TradingViewChart from "./components/TradingViewChart.vue";
+import { api } from "./api";
+const projects = ref<any[]>([]); const runs = ref<any[]>([]); const selectedPairId = ref<string>(); const activeRunId = ref<string>(); const report = ref<any>(); const loading = ref(false);
+const selected = computed(() => projects.value.find(p => p.pairId === selectedPairId.value));
+const form = ref({ name: "Fib 回撤回测", initialCapital: 10000, interval: "30s", valueType: "mcap", startTime: "2026-01-01T00:00:00Z", endTime: new Date().toISOString(), feePercent: 0.3, slippagePercent: 1, mode: "single_entry", maxEntries: 1 });
+const symbol = computed(() => selected.value ? `${selected.value.chain}:${selected.value.ca}:${selected.value.pairId}:${form.value.valueType}` : "");
+async function refresh() { projects.value = (await api.get("/market/projects")).data; runs.value = (await api.get("/backtests")).data; }
+async function create() { if (!selected.value) return message.warning("请先选择项目"); loading.value = true; try { const config = { name: form.value.name, initialCapital: form.value.initialCapital, symbols: [selected.value], interval: form.value.interval, valueType: form.value.valueType, startTime: form.value.startTime, endTime: form.value.endTime, entryConditions: { logic: "AND", conditions: [{ type: "fib_retracement", impulseMinPercent: 80, maxBars: 100, zoneLow: 0.618, zoneHigh: 0.786, requireVolumeContraction: false }] }, exitConfig: { stopLoss: { type: "percent", value: 10 }, takeProfit: { type: "risk_reward", ratio: 2 }, closeAtEnd: true }, executionConfig: { feePercent: form.value.feePercent, slippagePercent: form.value.slippagePercent, buyTaxPercent: 0, sellTaxPercent: 0, fillMode: "next_bar_open" }, positionConfig: { mode: form.value.mode, maxEntries: form.value.maxEntries, maxConcurrentPositions: 1, allowReentry: false, sizing: { type: "fixed_percent", value: 10 } } }; await api.post("/backtests", config); message.success("回测任务已提交"); await refresh(); } finally { loading.value = false; } }
+async function openRun(run:any) { activeRunId.value = run.id; selectedPairId.value = projects.value[0]?.pairId; await api.get(`/backtests/${run.id}`); report.value = (await api.get(`/backtests/${run.id}/report`)).data; }
+onMounted(refresh);
+</script>
+<template>
+  <a-layout class="layout"><a-layout-header><h1>Meme K 线回测</h1></a-layout-header><a-layout-content class="content">
+    <a-card title="创建回测任务"><a-form layout="inline"><a-form-item label="名称"><a-input v-model:value="form.name" /></a-form-item><a-form-item label="周期"><a-select v-model:value="form.interval" style="width:100px"><a-select-option value="30s">30s</a-select-option><a-select-option value="1m">1m</a-select-option><a-select-option value="5m">5m</a-select-option></a-select></a-form-item><a-form-item label="项目"><a-select v-model:value="selectedPairId" :options="projects.map(p => ({ value: p.pairId, label: `${p.chain} / ${p.ca} / ${p.pairId}` }))" placeholder="请选择链 / CA / 交易池" allow-clear show-search style="width:360px" /></a-form-item><a-button type="primary" :loading="loading" @click="create">开始回测</a-button></a-form></a-card>
+    <a-row :gutter="16" class="row"><a-col :span="8"><a-card title="历史任务"><a-list :data-source="runs"><template #renderItem="{item}"><a-list-item @click="openRun(item)"><a-tag>{{item.status}}</a-tag>{{item.name}}<span>{{Math.round(item.progress*100)}}%</span></a-list-item></template></a-list></a-card></a-col><a-col :span="16"><a-card title="K 线与交易点位"><TradingViewChart v-if="symbol" :symbol="symbol" :interval="form.interval" :run-id="activeRunId" /><a-empty v-else description="请选择项目" /></a-card><a-card v-if="report" title="报告"><a-statistic title="净收益" :value="report.netPnl" /><a-statistic title="胜率" :value="report.winRate * 100" suffix="%" /><a-statistic title="最大回撤" :value="report.maxDrawdownPercent" suffix="%" /></a-card></a-col></a-row>
+  </a-layout-content></a-layout>
+</template>
+<style scoped>.layout{min-height:100vh;background:#f5f5f5}.ant-layout-header{color:white}.ant-layout-header h1{color:white;margin:0}.content{padding:24px}.row{margin-top:16px}.ant-list-item{cursor:pointer;gap:10px}.ant-statistic{display:inline-block;margin-right:40px}</style>
