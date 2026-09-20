@@ -39,11 +39,10 @@ describe("run detail compatibility",()=>{
  const result=await runCas({query} as any,{id:"run",config_json:{symbols:[{chain:"sol",ca:"a",pairId:"p"}]}},{chain:"sol",ca:"a"},true);
  expect(result.unrealizedPnl).toBeNull();expect(result.pools[0].noData).toBeNull();
  });
- it("binds event filters and pagination without SQL interpolation",async()=>{
- const query=vi.fn().mockResolvedValueOnce({rows:[{count:"1"}]}).mockResolvedValueOnce({rows:[{id:"event"}]});
- const result=await resultRows({query} as any,"run","signals",{chain:"sol",ca:"a",pairId:"p",from:"100",to:"200",page:"2",pageSize:"20"});
- expect(result.items).toHaveLength(1);expect(query.mock.calls[1][1]).toEqual(["run","sol","a","p",100,200,20,20]);
- expect(query.mock.calls[1][0]).toContain("ORDER BY time,id");
+ it("binds pool scope and applies time/page filters only after stable numbering",async()=>{
+ const query=vi.fn().mockResolvedValueOnce({rows:[]}).mockResolvedValueOnce({rows:[{id:'outside',time:99,signal_type:'entry'},{id:'event',time:150,signal_type:'entry'}]}).mockResolvedValueOnce({rows:[{config_json:{}}]});
+ const result=await resultRows({query} as any,"run","signals",{chain:"sol",ca:"a",pairId:"p",from:"100",to:"200",page:"1",pageSize:"20"});
+ expect(result.items).toHaveLength(1);expect(result.items[0].id).toBe('event');expect(query.mock.calls[1][1]).toEqual(["run","sol","a","p"]);
+ expect(query.mock.calls[1][0]).toContain('chain=$2 AND ca=$3 AND pair_id=$4');
  });
 });
-

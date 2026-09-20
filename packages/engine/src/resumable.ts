@@ -1,14 +1,15 @@
 import type { BacktestConfig, BacktestReport, Candle, Condition, ConditionGroup, EquityPoint, Signal, SymbolRef, Trade } from '@meme/domain';
 import { evaluateCondition, stopPrice, targetPrice, type Impulse } from './index.js';
+import { validateProfitLock } from '@meme/domain';
 
-export const ENGINE_VERSION = 'portfolio-3';
-export const CHECKPOINT_VERSION = 2;
+export const ENGINE_VERSION = 'portfolio-4';
+export const CHECKPOINT_VERSION = 3;
 export const intervalMs = (interval: string) => ({'30s':30000,'1m':60000,'5m':300000,'15m':900000,'1h':3600000,'4h':14400000,'1d':86400000}[interval]!);
 export const poolKey = (s: SymbolRef) => `${s.chain}:${s.ca}:${s.pairId}`;
 export function validCandle(c: Candle) {
   return c.valid !== false && [c.time,c.open,c.high,c.low,c.close,c.volume].every(Number.isFinite) && c.low>0 && c.high>=Math.max(c.open,c.close) && c.low<=Math.min(c.open,c.close) && c.high>=c.low && c.volume>=0;
 }
-type Active = {trade:Trade;entryIndex:number;entries:number;impulse:Impulse};
+type Active = {trade:Trade;entryIndex:number;entries:number;impulse:Impulse;lockPrice?:number;lockTier?:number;lockCost?:number;lockPriceTier?:number};
 type PoolState = {
   symbol:SymbolRef; index:number; history:Candle[]; offset:number; highPivots:number[]; lowPivots:number[];
   ema:Record<string,number>; previousEma:Record<string,number>; obv:number; obvs:number[];
@@ -35,7 +36,9 @@ export class ResumableEngine {
   private readonly rollingPeriods:number[];
   private batch:EngineBatch={trades:[],signals:[],equity:[]};
   constructor(readonly config:BacktestConfig, checkpoint?:EngineCheckpoint) {
-    if(checkpoint && (checkpoint.version!==CHECKPOINT_VERSION || checkpoint.engineVersion!==ENGINE_VERSION)) throw new Error('检查点版本不兼容，禁止从头自动重跑');
+    const invalidLock=validateProfitLock(config.exitConfig.profitLock);if(invalidLock)throw new Error(invalidLock);
+    const legacy=checkpoint?.version===2 && checkpoint.engineVersion==='portfolio-3' && !config.exitConfig.profitLock?.enabled;
+    if(checkpoint && !legacy && (checkpoint.version!==CHECKPOINT_VERSION || checkpoint.engineVersion!==ENGINE_VERSION)) throw new Error('检查点版本不兼容，禁止从头自动重跑');
     const all=[...conditions(config.entryConditionGroup),...conditions(config.invalidationConditionGroup),...conditions(config.addConditionGroup ?? config.entryConditionGroup)];
     this.emaPeriods=[...new Set(all.filter(c=>c.type==='ema_reclaim').map(c=>Number(c.period)))];
     this.rollingPeriods=[...new Set(all.flatMap(c=>'period' in c && c.type!=='ema_reclaim'?[Number(c.period)]:[]))];
@@ -48,6 +51,8 @@ export class ResumableEngine {
       wins:0,losses:0,net:0,gross:0,grossProfit:0,grossLoss:0,holding:0,lossStreak:0,maxLossStreak:0
     };
     this.byKey=new Map(this.s.states.map(s=>[poolKey(s.symbol),s]));
+    this.s.version=CHECKPOINT_VERSION;this.s.engineVersion=ENGINE_VERSION;
+    if(legacy)for(const s of this.s.states)if(s.active){const t=s.active.trade;t.tradeNo=s.closed+1;t.buyAmount=t.entryPrice*t.quantity;t.buyFees=t.fees;t.buySlippageCost=t.slippageCost;t.buyTaxCost=t.taxCost;}
   }
   checkpoint():EngineCheckpoint {return structuredClone(this.s);}
   get bufferedRows(){return this.batch.trades.length+this.batch.signals.length+this.batch.equity.length;}
@@ -130,14 +135,15 @@ export class ResumableEngine {
     const quantity=value/c.close,fee=value*cost.feePercent/100,slip=value*cost.slippagePercent/100,tax=value*cost.buyTaxPercent/100;
     this.s.cash-=value+fee+slip+tax;
     if(existing){const t=existing.trade;t.entryPrice=(t.entryPrice*t.quantity+value)/(t.quantity+quantity);t.quantity+=quantity;t.fees+=fee;t.slippageCost+=slip;t.taxCost+=tax;existing.entries++;
-      const signal:Signal={time:c.time,price:c.close,type:'add',quantity,reason:{conditionGroup:cfg.addConditionGroup ?? cfg.entryConditionGroup}};t.adds.push(signal);this.batch.signals.push({symbol:s.symbol,...signal});
-    }else{const trade:Trade={symbol:s.symbol,entryTime:c.time,entryPrice:c.close,quantity,fees:fee,slippageCost:slip,taxCost:tax,adds:[]};s.active={trade,entryIndex:s.index,entries:1,impulse};this.batch.signals.push({symbol:s.symbol,time:c.time,price:c.close,type:'entry',quantity,reason:{impulse,conditionGroup:cfg.entryConditionGroup}});}
+      t.buyAmount=(t.buyAmount ?? 0)+value;t.buyFees=(t.buyFees ?? 0)+fee;t.buySlippageCost=(t.buySlippageCost ?? 0)+slip;t.buyTaxCost=(t.buyTaxCost ?? 0)+tax;
+      const signal:Signal={time:c.time,price:c.close,type:'add',quantity,tradeNo:t.tradeNo,eventOrder:existing.entries,reason:{conditionGroup:cfg.addConditionGroup ?? cfg.entryConditionGroup}};t.adds.push(signal);this.batch.signals.push({symbol:s.symbol,...signal});
+    }else{const trade:Trade={symbol:s.symbol,entryTime:c.time,entryPrice:c.close,quantity,fees:fee,slippageCost:slip,taxCost:tax,adds:[],tradeNo:s.closed+1,firstEntryPrice:c.close,buyAmount:value,buyFees:fee,buySlippageCost:slip,buyTaxCost:tax};s.active={trade,entryIndex:s.index,entries:1,impulse};this.batch.signals.push({symbol:s.symbol,time:c.time,price:c.close,type:'entry',quantity,tradeNo:trade.tradeNo,eventOrder:1,reason:{impulse,conditionGroup:cfg.entryConditionGroup}});}
   }
   private close(s:PoolState,c:Candle,price:number,type:Signal['type'],reason:Record<string,unknown>) {
     if(!s.active)return;const a=s.active,t=a.trade,cost=this.config.executionConfig,proceeds=t.quantity*price;
     const fee=proceeds*cost.feePercent/100,slip=proceeds*cost.slippagePercent/100,tax=proceeds*cost.sellTaxPercent/100;
     t.fees+=fee;t.slippageCost+=slip;t.taxCost+=tax;t.exitTime=c.time;t.exitPrice=price;t.grossPnl=(price-t.entryPrice)*t.quantity;t.netPnl=t.grossPnl-t.fees-t.slippageCost-t.taxCost;t.exitReason=type;t.holdingBars=s.index-a.entryIndex;
-    this.s.cash+=proceeds-fee-slip-tax;this.batch.signals.push({symbol:s.symbol,time:c.time,price,type,quantity:t.quantity,reason});this.batch.trades.push(t);
+    this.s.cash+=proceeds-fee-slip-tax;this.batch.signals.push({symbol:s.symbol,time:c.time,price,type,quantity:t.quantity,reason,tradeNo:t.tradeNo,eventOrder:a.entries+1});this.batch.trades.push(t);
     s.closed++;s.net+=t.netPnl;this.s.net+=t.netPnl;this.s.gross+=t.grossPnl;this.s.holding+=t.holdingBars;
     if(t.netPnl>0){s.wins++;this.s.wins++;this.s.grossProfit+=t.netPnl;this.s.lossStreak=0;}else{this.s.losses++;this.s.grossLoss-=t.netPnl;this.s.lossStreak++;this.s.maxLossStreak=Math.max(this.s.maxLossStreak,this.s.lossStreak);}
     s.active=undefined;s.traded=true;s.entryWasMet=true;
@@ -148,19 +154,25 @@ export class ResumableEngine {
     const ordered=[...ticks].sort((a,b)=>poolKey(a.symbol)<poolKey(b.symbol)?-1:1),time=ordered[0].candle.time;
     if(ordered.some(t=>t.candle.time!==time) || (this.s.lastTime!==null && time<=this.s.lastTime))throw new Error('时间批次必须完整且严格递增');
     const contexts=ordered.map(t=>{const s=this.byKey.get(poolKey(t.symbol));if(!s)throw new Error('未知交易池');this.update(s,t.candle);if(t.candle.synthetic)this.s.syntheticBars++;return {...t,s};});
-    for(const {s,candle:c,last} of contexts){if(!s.active)continue;const stop=stopPrice(this.config,s.active),target=targetPrice(this.config,s.active,stop);let exit:{price:number;type:Signal['type']}|undefined;
-      if(c.open<=stop || c.low<=stop)exit={price:c.open<=stop?c.open:stop,type:'stop_loss'};
+    for(const {s,candle:c,last} of contexts){if(!s.active)continue;const baseStop=stopPrice(this.config,s.active),stop=Math.max(baseStop,s.active.lockPrice ?? -Infinity),target=targetPrice(this.config,s.active,baseStop);let exit:{price:number;type:Signal['type']}|undefined;
+      if(c.open<=stop || c.low<=stop)exit={price:c.open<=stop?c.open:stop,type:(s.active.lockPrice ?? -Infinity)>baseStop?'profit_lock':'stop_loss'};
       else if(this.group(this.config.invalidationConditionGroup,s,s.active.impulse))exit={price:c.close,type:'invalidation'};
       else if(target>s.active.trade.entryPrice && (c.open>=target || c.high>=target))exit={price:c.open>=target?c.open:target,type:'take_profit'};
       else if(this.config.exitConfig.maxHoldingBars && s.index-s.active.entryIndex>=this.config.exitConfig.maxHoldingBars)exit={price:c.close,type:'timeout'};
       else if(last && this.config.exitConfig.closeAtEnd)exit={price:c.close,type:'end_of_backtest'};
-      if(exit)this.close(s,c,exit.price,exit.type,{priority:exit.type,stop,target});
+      if(exit)this.close(s,c,exit.price,exit.type,{priority:exit.type,stop,target,...(exit.type==='profit_lock'?{tier:(s.active.lockPriceTier ?? 0)+1,thresholds:this.config.exitConfig.profitLock?.tiers[s.active.lockPriceTier ?? 0],cost:s.active.lockCost,lockPrice:s.active.lockPrice}: {})});
     }
     let positions=this.s.states.filter(s=>s.active).length;
     for(const {s,candle:c,last} of contexts){
       if(s.active){const add=this.group(this.config.addConditionGroup ?? this.config.entryConditionGroup,s,s.active.impulse);if(this.config.positionConfig.mode==='pyramiding' && s.active.entries<this.config.positionConfig.maxEntries && add && !s.addWasMet)this.enter(s,c,s.active.impulse);s.addWasMet=add;}
       else{const impulse=this.impulse(s),entry=!!impulse && this.group(this.config.entryConditionGroup,s,impulse);if(entry && !s.entryWasMet && (this.config.positionConfig.allowReentry || !s.traded) && positions<this.config.positionConfig.maxConcurrentPositions){this.enter(s,c,impulse!);if(s.active)positions++;}s.entryWasMet=entry;s.addWasMet=false;}
       if(last && this.config.exitConfig.closeAtEnd && s.active){this.close(s,c,c.close,'end_of_backtest',{closeAtEnd:true});positions--;}
+      // Confirm at close, after this candle's exits/adds. This line is used only on the next tick.
+      if(s.active && this.config.exitConfig.profitLock?.enabled){const a=s.active,cost=a.trade.entryPrice;
+        this.config.exitConfig.profitLock.tiers.forEach((tier,i)=>{if((a.lockTier ?? -1)>=i || c.close<cost*(1+tier.activationPercent/100))return;a.lockTier=i;
+          const price=cost*(1+tier.floorPercent/100);if(price>(a.lockPrice ?? -Infinity)){a.lockPrice=price;a.lockCost=cost;a.lockPriceTier=i;}
+        });
+      }
       this.s.processed++;
     }
     let open=0,unrealized=0;for(const s of this.s.states)if(s.active){const t=s.active.trade;open+=s.lastPrice*t.quantity;unrealized+=(s.lastPrice-t.entryPrice)*t.quantity;}

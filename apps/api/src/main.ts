@@ -1,5 +1,7 @@
 import "reflect-metadata";
 import { locate } from './locator.js';
+import { statistics } from './results.js';
+import { validateProfitLock } from '@meme/domain';
 import { marketCas, resolveDataset, datasetCounts, resultRows, runCas } from "./datasets.js";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -101,6 +103,7 @@ export class AppService {
     const stop = strategy.exitConfig?.stopLoss;
     const target = strategy.exitConfig?.takeProfit;
     if (!stop || !target) throw new BadRequestException("止盈止损配置不能为空");
+    const lockError=validateProfitLock(strategy.exitConfig.profitLock);if(lockError)throw new BadRequestException(lockError);
     if (stop.type === "percent" && (!asNumber(stop.value) || stop.value <= 0 || stop.value >= 100)) throw new BadRequestException("固定止损比例必须在 0 到 100 之间");
     if (stop.type === "fib_level" && (!asNumber(stop.ratio) || stop.ratio <= 0 || stop.ratio >= 1)) throw new BadRequestException("止损 Fib 位无效");
     if (stop.type === "swing_low" && (!asNumber(stop.bufferPercent) || stop.bufferPercent < 0)) throw new BadRequestException("Swing Low 止损缓冲无效");
@@ -232,6 +235,7 @@ class AppController {
   @Post("backtests/:id/retry") async retry(@Param("id") id:string){const run=await this.service.backtest(id);if(!run.actions.retry && !['pending','running'].includes(run.status))throw new ConflictException('该任务不支持断点重试，请重新回测');await retryRun(this.service.pool,this.service.queue,id);return this.service.backtest(id);}
   @Post("backtests/:id/rerun") async rerun(@Param("id") id:string,@Body() body:{requestId:string}){if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body?.requestId ?? ''))throw new BadRequestException('需要 requestId 作为幂等标识');return rerun(this.service.pool,this.service.queue,id,body.requestId);}
   @Get("backtests/:id/report") async report(@Param("id") id: string) { const result = await this.service.pool.query("SELECT report_json FROM backtest_reports WHERE run_id=$1", [id]); return result.rows[0]?.report_json ?? null; }
+  @Get("backtests/:id/statistics") async statistics(@Param("id") id:string,@Query() q:Record<string,string>) { return statistics(this.service.pool,await this.service.backtest(id),q); }
   @Get("backtests/:id/trades") trades(@Param("id") id:string,@Query() q:Record<string,string>) { return resultRows(this.service.pool,id,"trades",q); }
   @Get("backtests/:id/signals") signals(@Param("id") id:string,@Query() q:Record<string,string>) { return resultRows(this.service.pool,id,"signals",q); }
   @Get("backtests/:id/cas") async runCas(@Param("id") id:string,@Query() q:Record<string,string>) { return runCas(this.service.pool,await this.service.backtest(id),q); }

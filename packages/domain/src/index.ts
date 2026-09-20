@@ -73,7 +73,19 @@ export type TakeProfit =
   | { type: "risk_reward"; ratio: number }
   | { type: "fib_target"; ratio: number }
   | { type: "previous_high" };
-export interface ExitConfig { stopLoss: StopLoss; takeProfit: TakeProfit; maxHoldingBars?: number; closeAtEnd: boolean }
+export interface ProfitLock { enabled: boolean; tiers: Array<{ activationPercent: number; floorPercent: number }> }
+export function validateProfitLock(lock?: ProfitLock): string | undefined {
+  if (lock === undefined) return;
+  if (!lock || typeof lock.enabled !== 'boolean' || !Array.isArray(lock.tiers)) return '动态锁盈配置无效';
+  if (!lock.enabled) return;
+  if (!lock.tiers.length || lock.tiers.length > 50) return '动态锁盈需要 1–50 个档位';
+  let activation = 0, floor = -1;
+  for (const tier of lock.tiers) {
+    if (!tier || !Number.isFinite(tier.activationPercent) || !Number.isFinite(tier.floorPercent) || tier.activationPercent <= activation || tier.floorPercent < 0 || tier.floorPercent <= floor || tier.floorPercent >= tier.activationPercent) return '锁盈激活比例必须递增，保底比例须非负、逐档递增且低于激活比例';
+    activation = tier.activationPercent; floor = tier.floorPercent;
+  }
+}
+export interface ExitConfig { stopLoss: StopLoss; takeProfit: TakeProfit; maxHoldingBars?: number; closeAtEnd: boolean; profitLock?: ProfitLock }
 export interface ExecutionConfig { initialCapital: number; feePercent: number; slippagePercent: number; buyTaxPercent: number; sellTaxPercent: number; maxSlippagePercent?: number; fillMode: "current_bar_close" | "next_bar_open" }
 export interface PositionConfig { mode: "single_entry" | "pyramiding"; maxEntries: number; maxConcurrentPositions: number; allowReentry: boolean; sizing: { type: "fixed_amount" | "fixed_percent" | "risk_percent"; value: number } }
 
@@ -92,9 +104,9 @@ export interface BacktestConfig extends StrategyConfig, DatasetConfig { name: st
 export interface ExecutionOverrides { initialCapital?: number; feePercent?: number; slippagePercent?: number; buyTaxPercent?: number; sellTaxPercent?: number }
 export interface CreateBacktestRequest { name: string; strategyVersionId: string; dataset: DatasetSelection; executionOverrides?: ExecutionOverrides }
 
-export type SignalType = "entry" | "add" | "take_profit" | "stop_loss" | "invalidation" | "timeout" | "end_of_backtest" | "risk_event";
-export interface Signal { time: number; price: number; type: SignalType; reason: Record<string, unknown>; quantity?: number }
-export interface Trade { symbol: SymbolRef; entryTime: number; entryPrice: number; quantity: number; exitTime?: number; exitPrice?: number; grossPnl?: number; fees: number; slippageCost: number; taxCost: number; netPnl?: number; exitReason?: string; holdingBars?: number; adds: Signal[] }
+export type SignalType = "entry" | "add" | "take_profit" | "stop_loss" | "profit_lock" | "invalidation" | "timeout" | "end_of_backtest" | "risk_event";
+export interface Signal { time: number; price: number; type: SignalType; reason: Record<string, unknown>; quantity?: number; tradeNo?: number; eventOrder?: number }
+export interface Trade { symbol: SymbolRef; entryTime: number; entryPrice: number; quantity: number; exitTime?: number; exitPrice?: number; grossPnl?: number; fees: number; slippageCost: number; taxCost: number; netPnl?: number; exitReason?: string; holdingBars?: number; adds: Signal[]; tradeNo?: number; firstEntryPrice?: number; buyAmount?: number; buyFees?: number; buySlippageCost?: number; buyTaxCost?: number }
 export interface EquityPoint { time: number; equity: number; cash: number; unrealized: number }
 export interface BacktestReport { engineVersion?: string; unrealizedPnl?: number; totalNetPnl?: number; finalEquity?: number; openPositions?: Array<{ symbol: SymbolRef; quantity: number; lastPrice: number; netPnl: number; fees: number }> }
 export interface BacktestReport { totalTrades: number; wins: number; losses: number; winRate: number; grossPnl: number; netPnl: number; returnPercent: number; profitFactor: number; maxDrawdown: number; maxDrawdownPercent: number; maxConsecutiveLosses: number; averageHoldingBars: number; dataQuality: { syntheticBars: number; invalidBars: number; riskEvents: number }; bySymbol: Array<{ symbol: SymbolRef; trades: number; netPnl: number; winRate: number }> }

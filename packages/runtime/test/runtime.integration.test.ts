@@ -17,6 +17,7 @@ suite('isolated database recovery integration',()=>{
   await pool.query(readFileSync(new URL('../../../apps/api/migrations/001_init.sql',import.meta.url),'utf8'));
   await pool.query('ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS strategy_template_id uuid; ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS strategy_version_id uuid; ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS dataset_json jsonb;');
   await pool.query(readFileSync(new URL('../../../apps/api/migrations/004_resumable.sql',import.meta.url),'utf8'));
+  await pool.query(readFileSync(new URL('../../../apps/api/migrations/005_trade_analytics.sql',import.meta.url),'utf8'));
   const data=candles(5000);for(let offset=0;offset<data.length;offset+=500){const part=data.slice(offset,offset+500),values=part.flatMap(c=>['sol','a','a','30s','mcap',c.time,c.closeTime,c.open,c.high,c.low,c.close,c.volume,true]);await pool.query(`INSERT INTO meme_kline(chain,ca,pair_id,interval,type,open_time,close_time,open,high,low,close,volume,valid) VALUES ${part.map((_,i)=>'('+Array.from({length:13},(_,j)=>'$'+(i*13+j+1)).join(',')+')').join(',')} ON CONFLICT DO NOTHING`,values);}
  },30000);
  afterAll(async()=>{await pool?.end();});

@@ -1,6 +1,7 @@
 import { BadRequestException } from "@nestjs/common";
 import type { Pool } from "pg";
 import type { DatasetSelection, DatasetConfig, PoolSnapshot } from "@meme/domain";
+import { includesEnd, loadResults } from './results.js';
 
 export const intervals = new Set(["30s","1m","5m","15m","1h","4h","1d"]);
 export function bounds(input: {startTime?:string;endTime?:string}) {
@@ -70,29 +71,24 @@ export function datasetCounts(dataset:DatasetConfig) {
   return {caCount:new Set(dataset.symbols.map(s=>s.chain+":"+s.ca)).size,poolCount:dataset.symbols.length,availablePoolCount:dataset.pools?.filter(p=>!p.noData).length ?? dataset.symbols.length,noDataPoolCount:dataset.pools?.filter(p=>p.noData).length ?? 0};
 }
 export async function resultRows(pool:Pool,id:string,kind:"trades"|"signals",q:Record<string,string>) {
-  const args:unknown[]=[id],where=["run_id=$1"];
-  for (const [param,column] of [["chain","chain"],["ca","ca"],["pairId","pair_id"]] as const) if(q[param]) {args.push(q[param]);where.push(`${column}=$${args.length}`);}
-  const time=kind==="trades"?"entry_time":"time";
-  for(const [param,op] of [["from",">="],["to","<="]] as const) if(q[param]) {const n=Number(q[param]);if(!Number.isFinite(n))throw new BadRequestException("事件时间无效");args.push(n);where.push(`${time}${op}$${args.length}`);}
-  const table=kind==="trades"?"backtest_trades":"backtest_signals";
-  // Preserve the old unpaginated response for existing clients, but new clients always request pages.
-  if (!q.page && !q.pageSize) return (await pool.query(`SELECT * FROM ${table} WHERE ${where.join(" AND ")} ORDER BY ${time},id`,args)).rows;
-  const {page,pageSize}=pageOf(q);
-  const total=Number((await pool.query(`SELECT COUNT(*) FROM ${table} WHERE ${where.join(" AND ")}`,args)).rows[0].count);
-  const rows=(await pool.query(`SELECT * FROM ${table} WHERE ${where.join(" AND ")} ORDER BY ${time},id LIMIT $${args.length+1} OFFSET $${args.length+2}`,[...args,pageSize,(page-1)*pageSize])).rows;
-  return {items:rows,total,page,pageSize};
+  const includeEnd=includesEnd(q),data=await loadResults(pool,id,q),time=kind==='trades'?'entry_time':'time';
+  for(const param of ['from','to'])if(q[param]&&!Number.isFinite(Number(q[param])))throw new BadRequestException('事件时间无效');
+  // Enrich before paging/time filtering, so numbers remain stable across chart windows.
+  const rows=data[kind].filter(r=>(kind==='signals'||includeEnd||!r.excluded_end)&&(!q.from||Number(r[time])>=Number(q.from))&&(!q.to||Number(r[time])<=Number(q.to)));
+  return !q.page&&!q.pageSize?rows:paginate(rows,q);
 }
 export async function runCas(pool:Pool,run:any,q:Record<string,string>,detail=false) {
+  const includeEnd=includesEnd(q);
   const config=run.config_json as DatasetConfig;
   const report=(await pool.query("SELECT report_json FROM backtest_reports WHERE run_id=$1",[run.id])).rows[0]?.report_json;
   const stats=(await pool.query(`SELECT chain,ca,pair_id,COUNT(*) FILTER(WHERE exit_time IS NOT NULL)::int AS trades,COUNT(*)::int AS entries,
     COALESCE(SUM(net_pnl),0) AS realized,COALESCE(SUM(fees+slippage_cost+tax_cost),0) AS costs
-    FROM backtest_trades WHERE run_id=$1 GROUP BY chain,ca,pair_id`,[run.id])).rows;
+    FROM backtest_trades WHERE run_id=$1 AND ($2::boolean OR exit_reason IS DISTINCT FROM 'end_of_backtest') GROUP BY chain,ca,pair_id`,[run.id,includeEnd])).rows;
   const pairs=(config.pools ?? config.symbols ?? []).map(s=>{
     const snapshot="noData" in s ? s as PoolSnapshot : undefined;
     const stat=stats.find(r=>r.chain===s.chain && r.ca===s.ca && r.pair_id===s.pairId);
     const open=report?.openPositions?.find((r:any)=>r.symbol.chain===s.chain && r.symbol.ca===s.ca && r.symbol.pairId===s.pairId);
-    const legacy=report && !report.engineVersion;
+    const legacy=!includeEnd || (report && !report.engineVersion);
     return {...s,startTime:snapshot?.startTime ?? (config.startTime ? Date.parse(config.startTime):null),endTime:snapshot?.endTime ?? (config.endTime ? Date.parse(config.endTime):null),
       noData:snapshot?.noData ?? null,trades:stat?.trades ?? 0,entries:stat?.entries ?? 0,
       realizedPnl:Number(stat?.realized ?? 0),unrealizedPnl:legacy ? null : Number(open?.netPnl ?? 0),fees:Number(stat?.costs ?? 0)};
@@ -100,7 +96,7 @@ export async function runCas(pool:Pool,run:any,q:Record<string,string>,detail=fa
   const map=new Map<string,any>();
   for(const p of pairs) {
     const key=p.chain+":"+p.ca;
-    if(!map.has(key)) map.set(key,{chain:p.chain,ca:p.ca,pools:[],poolCount:0,noDataPoolCount:0,trades:0,entries:0,realizedPnl:0,unrealizedPnl:report && !report.engineVersion ? null:0,fees:0});
+    if(!map.has(key)) map.set(key,{chain:p.chain,ca:p.ca,pools:[],poolCount:0,noDataPoolCount:0,trades:0,entries:0,realizedPnl:0,unrealizedPnl:!includeEnd || (report && !report.engineVersion) ? null:0,fees:0});
     const row=map.get(key);row.pools.push(p);row.poolCount++;row.noDataPoolCount+=p.noData?1:0;
     row.trades+=p.trades;row.entries+=p.entries;row.realizedPnl+=p.realizedPnl;row.fees+=p.fees;
     if(row.unrealizedPnl!==null) row.unrealizedPnl+=p.unrealizedPnl ?? 0;
@@ -111,4 +107,3 @@ export async function runCas(pool:Pool,run:any,q:Record<string,string>,detail=fa
   rows.sort((a,b)=>q.sort==="pnl_asc"?a.realizedPnl-b.realizedPnl:q.sort==="pnl_desc"?b.realizedPnl-a.realizedPnl:(a.chain+":"+a.ca).localeCompare(b.chain+":"+b.ca));
   return {...paginate(rows,q),summary:{...datasetCounts(config),tradedCaCount:all.filter(r=>r.entries>0).length,untradedCaCount:all.filter(r=>!r.entries).length,realizedPnl:all.reduce((s,r)=>s+r.realizedPnl,0)}};
 }
-

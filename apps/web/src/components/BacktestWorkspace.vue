@@ -26,7 +26,7 @@ const selectionBlocked=caSelection.blocked;
 const strategySummary = computed(() => {
   const value = selectedVersion.value?.strategyJson;
   if (!value) return [];
-  return [`Fractal 拉升 ≥ ${value.impulseCondition.minGainPercent}% / 最长 ${value.impulseCondition.maxDurationBars} 根`, `入场条件 ${countActive(value.entryConditionGroup)} 项，失效条件 ${countActive(value.invalidationConditionGroup)} 项`, `${value.positionConfig.mode === "single_entry" ? "单次买入" : `最多 ${value.positionConfig.maxEntries} 次买入`} · 仓位 ${value.positionConfig.sizing.value}${value.positionConfig.sizing.type === "fixed_amount" ? "" : "%"}`, `默认手续费 ${value.executionConfig.feePercent}% · 滑点 ${value.executionConfig.slippagePercent}%`];
+  return [`Fractal 拉升 ≥ ${value.impulseCondition.minGainPercent}% / 最长 ${value.impulseCondition.maxDurationBars} 根`, `入场条件 ${countActive(value.entryConditionGroup)} 项，失效条件 ${countActive(value.invalidationConditionGroup)} 项`, `${value.positionConfig.mode === "single_entry" ? "单次买入" : `最多 ${value.positionConfig.maxEntries} 次买入`} · 仓位 ${value.positionConfig.sizing.value}${value.positionConfig.sizing.type === "fixed_amount" ? "" : "%"}`, `默认手续费 ${value.executionConfig.feePercent}% · 滑点 ${value.executionConfig.slippagePercent}%`,value.exitConfig.profitLock?.enabled?`动态锁盈：${value.exitConfig.profitLock.tiers.map((t:any)=>`${t.activationPercent}% → 保底 ${t.floorPercent}%`).join('；')}（收盘确认，下一根生效）`:'动态锁盈：关闭'];
 });
 
 function countActive(group:any): number { return group?.conditions?.filter((item:any) => item.enabled !== false).reduce((sum:number,item:any) => sum + (item.conditions ? countActive(item) : 1), 0) || 0; }
