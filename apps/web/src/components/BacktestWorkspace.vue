@@ -17,6 +17,7 @@ const selectedVersionId = ref<string>();
 
 const selectedVersion = ref<any>();
 const activeRun = ref<any>();
+const mobileView = ref('history');
 const loading = ref(false);
 let timer: number | undefined;
 const form = ref({ name: "Fib 黄金口袋回测", interval: "30s", valueType: "mcap", startTime: "", endTime: "", initialCapital: undefined as number|undefined, feePercent: undefined as number|undefined, slippagePercent: undefined as number|undefined, buyTaxPercent: undefined as number|undefined, sellTaxPercent: undefined as number|undefined });
@@ -78,7 +79,11 @@ onBeforeUnmount(() => window.clearInterval(timer));
 
 <template>
   <RunDetail v-if="activeRun" :run-id="activeRun.id" @back="activeRun=undefined" />
-  <div v-else class="backtest-layout">
+  <div v-else class="backtest-layout" :class="'mobile-view-'+mobileView">
+    <div class="mobile-workspace-switch" role="group" aria-label="回测工作台视图">
+      <a-button :type="mobileView==='history'?'primary':'default'" :aria-pressed="mobileView==='history'" @click="mobileView='history'">历史任务（{{runs.length}}）</a-button>
+      <a-button :type="mobileView==='create'?'primary':'default'" :aria-pressed="mobileView==='create'" @click="mobileView='create'">创建回测</a-button>
+    </div>
     <section class="launch-panel">
       <header class="panel-header"><div><span class="eyebrow">新任务</span><h2>创建 K 线回测</h2><p>策略规则与运行数据集分开保存，任务会保留完整快照。</p></div><PlayCircleOutlined class="header-icon" /></header>
       <div class="step-block"><div class="step-label"><span>1</span><div><strong>选择策略版本</strong><small>运行后不会跟随模板更新</small></div></div><div class="two-columns"><a-form-item label="策略模板"><a-select v-model:value="selectedTemplateId" :options="templates.map(item=>({value:item.id,label:item.name}))" /></a-form-item><a-form-item label="不可变版本"><a-select v-model:value="selectedVersionId" :options="versions.map(item=>({value:item.id,label:`v${item.version} · ${new Date(item.createdAt).toLocaleString()}`}))" /></a-form-item></div><div v-if="strategySummary.length" class="readonly-summary"><span v-for="item in strategySummary" :key="item">{{ item }}</span></div></div>

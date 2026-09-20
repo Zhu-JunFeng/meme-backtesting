@@ -3,6 +3,7 @@ import { computed, ref } from "vue";
 import { ExperimentOutlined, FundOutlined } from "@ant-design/icons-vue";
 import StrategyWorkspace from "./components/StrategyWorkspace.vue";
 import BacktestWorkspace from "./components/BacktestWorkspace.vue";
+import './responsive.css';
 
 const page = ref<"backtest"|"strategy">("backtest");
 const pageTitle = computed(() => page.value === "strategy" ? "策略配置" : "回测工作台");
@@ -14,9 +15,9 @@ const pageDescription = computed(() => page.value === "strategy" ? "定义指标
     <div class="app-shell">
       <aside class="side-nav">
         <div class="brand"><div class="brand-mark">M</div><div><strong>Meme Lab</strong><span>Backtesting</span></div></div>
-        <nav>
-          <button :class="{active:page==='backtest'}" @click="page='backtest'"><FundOutlined /><span>回测工作台</span></button>
-          <button :class="{active:page==='strategy'}" @click="page='strategy'"><ExperimentOutlined /><span>策略配置</span></button>
+        <nav aria-label="主导航">
+          <button :class="{active:page==='backtest'}" :aria-current="page==='backtest'?'page':undefined" @click="page='backtest'"><FundOutlined /><span>回测工作台</span></button>
+          <button :class="{active:page==='strategy'}" :aria-current="page==='strategy'?'page':undefined" @click="page='strategy'"><ExperimentOutlined /><span>策略配置</span></button>
         </nav>
         <div class="environment"><i></i><div><span>数据服务</span><strong>已连接</strong></div></div>
       </aside>

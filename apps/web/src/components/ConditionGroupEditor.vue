@@ -46,10 +46,10 @@ function isGroup(item: any) { return Array.isArray(item?.conditions); }
           <a-tag v-if="!isGroup(item)" color="default">{{ definitionMap.get(item.type)?.category }}</a-tag>
         </div>
         <a-space size="small">
-          <a-button type="text" size="small" :disabled="index===0" @click="move(index,-1)"><UpOutlined /></a-button>
-          <a-button type="text" size="small" :disabled="index===modelValue.conditions.length-1" @click="move(index,1)"><DownOutlined /></a-button>
-          <a-button type="text" size="small" @click="copy(index)"><CopyOutlined /></a-button>
-          <a-button type="text" danger size="small" @click="remove(index)"><DeleteOutlined /></a-button>
+          <a-button type="text" size="small" :disabled="index===0" aria-label="上移条件" @click="move(index,-1)"><UpOutlined /></a-button>
+          <a-button type="text" size="small" :disabled="index===modelValue.conditions.length-1" aria-label="下移条件" @click="move(index,1)"><DownOutlined /></a-button>
+          <a-button type="text" size="small" aria-label="复制条件" @click="copy(index)"><CopyOutlined /></a-button>
+          <a-button type="text" danger size="small" aria-label="删除条件" @click="remove(index)"><DeleteOutlined /></a-button>
         </a-space>
       </div>
       <ConditionGroupEditor v-if="isGroup(item)" :model-value="item" :definitions="definitions" :category="category" @update:model-value="value => patchItem(index,value)" />

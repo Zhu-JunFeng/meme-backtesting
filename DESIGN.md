@@ -29,6 +29,8 @@ Use a single product sans stack: `Inter, -apple-system, BlinkMacSystemFont, "Seg
 
 Desktop-first app shell with a 224px sidebar and a flexible content canvas. Content width remains fluid for charts and tables. Use 24px page padding, 16px panel gaps and 12px internal control gaps. Below 900px, collapse navigation into a horizontal page switcher and stack primary columns.
 
+Below 680px, keep both navigation labels visible, default the backtest workspace to history with a state-preserving create/history switch, and stack form labels and controls. Use 12px outer and 14px panel padding, 44px primary touch targets, safe-area insets, and container-scrolling data tables (never horizontal scrolling of the whole page). Charts follow viewport height; the drawing toolbar is collapsed by default on phones and remains accessible. Mobile overrides live in `apps/web/src/responsive.css`; desktop behavior and data precision remain unchanged.
+
 ## Components
 
 - Cards use 10px radius, a quiet 1px border and minimal shadow.

@@ -1,0 +1,97 @@
+/* Mobile presentation only: preserve form state, full data and desktop workflows. */
+.mobile-workspace-switch{display:none}
+.app-shell main :where(.ant-spin-nested-loading,.ant-spin-container,.ant-table-wrapper){min-width:0;max-width:100%}
+.app-shell :where(button,summary,a):focus-visible{outline:2px solid #176b5b;outline-offset:3px}
+@media(max-width:900px){
+ .app-shell .side-nav nav button span{display:inline}
+ .app-shell .side-nav nav button{min-height:44px}
+ .app-shell .page-header{gap:12px}
+ .app-shell .scope-badge{flex-shrink:0}
+}
+@media(max-width:680px){
+ .app-shell .side-nav{padding:10px max(12px,env(safe-area-inset-right)) 10px max(12px,env(safe-area-inset-left));flex-wrap:wrap;gap:10px}
+ .app-shell .brand{width:100%;padding:0 4px}
+ .app-shell .brand-mark{width:28px;height:28px;font-size:16px}
+ .app-shell .side-nav nav{width:100%;margin:0;gap:8px}
+ .app-shell .side-nav nav button{flex:1;justify-content:center;font-size:15px;padding:10px 8px}
+ .app-shell main{padding:16px max(12px,env(safe-area-inset-right)) max(24px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left))}
+ .app-shell .page-header{align-items:flex-start;flex-direction:column;margin-bottom:16px}
+ .app-shell .page-header h1{font-size:21px}
+ .app-shell .page-header p{font-size:14px;line-height:1.6}
+ .app-shell .scope-badge{font-size:12px;padding:4px 8px}
+ .app-shell .mobile-workspace-switch{display:flex;gap:8px}
+ .mobile-workspace-switch>.ant-btn{flex:1}
+ .app-shell .mobile-view-history .launch-panel,.app-shell .mobile-view-create .history-panel{display:none}
+ .app-shell .launch-panel,.app-shell .detail,.app-shell .editor-panel{padding:14px;min-width:0}
+ .app-shell .run-list{max-height:none;overflow:visible}
+ .app-shell .run-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;padding:16px 6px}
+ .app-shell .run-row>div:first-child{min-width:0}
+ .app-shell .run-row strong{overflow-wrap:anywhere;font-size:16px;line-height:1.5}
+ .app-shell .run-row small{max-width:none;white-space:normal;line-height:1.5}
+ .app-shell .run-row>.ant-space{grid-column:1/-1;justify-content:flex-end}
+ .app-shell .step-label>span{flex-shrink:0}
+ .app-shell .step-label small,.app-shell .help{line-height:1.6;font-size:13px}
+ .app-shell .readonly-summary{display:block}
+ .app-shell .readonly-summary span{display:block;border:0;padding:3px 0;line-height:1.5}
+ .app-shell .ant-form-item{min-width:0}
+ .app-shell .ant-form-item-row{flex-direction:column}
+ .app-shell .ant-form-item-label{flex:0 0 auto;text-align:left;padding:0 0 6px}
+ .app-shell .ant-form-item-control{width:100%;max-width:100%}
+ .app-shell .ant-form-item-label{white-space:normal}
+ .app-shell .ant-btn:not(.ant-btn-icon-only){min-height:44px;height:auto;white-space:normal}
+ .app-shell .ant-btn-icon-only{min-width:44px;min-height:44px}
+ .app-shell .ant-input,.app-shell .ant-input-number-input,.app-shell .ant-select-selection-search-input{font-size:16px}
+ .app-shell .ant-input,.app-shell .ant-input-number-input{min-height:44px}
+ .app-shell .ant-select-single{height:44px}
+ .app-shell .ant-select-single .ant-select-selector{height:44px!important;align-items:center}
+ .app-shell .ant-select-multiple .ant-select-selector{min-height:44px}
+ .app-shell .ant-input-number{width:100%;max-width:100%}
+ .app-shell .ant-segmented-item-label{min-height:44px;display:flex;align-items:center;justify-content:center;padding:0 9px}
+ .app-shell .ant-radio-button-wrapper{height:44px;line-height:42px}
+ .app-shell .ant-checkbox-wrapper{min-height:44px;align-items:center}
+ .app-shell .ant-table-selection-column .ant-checkbox-wrapper{display:inline-flex;min-width:32px;justify-content:center}
+ .app-shell .ant-pagination{display:flex;flex-wrap:wrap;gap:4px}
+ .app-shell .ant-pagination-item,.app-shell .ant-pagination-prev,.app-shell .ant-pagination-next{min-width:40px;height:40px;line-height:38px;margin:0}
+ .app-shell .ant-pagination-item-link{min-height:40px}
+ .app-shell .ant-table-content{overscroll-behavior-x:contain}
+ .app-shell .ant-table-wrapper::before{content:'左右滑动查看完整表格';display:block;margin:8px 0;color:#53635e;font-size:12px}
+ .app-shell .ant-descriptions-view table{table-layout:fixed}
+ .app-shell .ant-descriptions-item-label,.app-shell .ant-descriptions-item-content{overflow-wrap:anywhere;padding:10px!important}
+ .app-shell .detail header{align-items:flex-start}
+ .app-shell .detail header h2,.app-shell .detail header h3{flex-basis:100%;font-size:18px;line-height:1.5}
+ .app-shell .detail .toolbar{gap:10px}
+ .app-shell .detail .toolbar h3{flex-basis:100%;margin:0}
+ .app-shell .detail .toolbar .ant-input-search,.app-shell .detail .toolbar>.ant-select{width:100%;max-width:100%;min-width:0!important}
+ .app-shell .detail .stats-filter{justify-content:flex-start}
+ .app-shell .detail figure{padding:8px;margin:16px 0}
+ .app-shell .detail figcaption{line-height:1.6}
+ .app-shell .detail figure svg{min-height:100px}
+ .app-shell .selection>span{flex-basis:100%;overflow-wrap:anywhere}
+ .app-shell .filters>.ant-input-search{min-width:0;width:100%;flex-basis:100%}
+ .app-shell .filters>.ant-select{width:100%}
+ .app-shell .template-list{max-height:240px;overflow:auto}
+ .app-shell .template-row{min-width:0}
+ .app-shell .template-name{white-space:normal;overflow-wrap:anywhere}
+ .app-shell .editor-header{gap:16px}
+ .app-shell .editor-header h1{font-size:20px;overflow-wrap:anywhere}
+ .app-shell .summary-panel,.app-shell .config-section{padding:12px}
+ .app-shell .lock-tier{align-items:stretch;gap:8px}
+ .app-shell .lock-tier>.ant-form-item{flex-basis:100%}
+ .app-shell .condition-item{padding:10px}
+ .app-shell .condition-group.nested{padding:8px 0;border-width:1px 0;border-radius:0}
+ .app-shell .group-mode{min-width:0;gap:8px}
+ .app-shell .group-mode>.ant-segmented{max-width:100%}
+ .app-shell .group-mode .ant-segmented-group{flex-wrap:wrap}
+ .app-shell .group-mode>span{flex-basis:100%}
+ .app-shell .item-title{gap:8px}
+ .app-shell .item-head>.ant-space{align-self:flex-end}
+ .app-shell .schema-field label{font-size:14px}
+ .app-shell .schema-field>.ant-switch{align-self:flex-start}
+ .app-shell .measurement{gap:8px;padding:8px 0;font-size:14px;line-height:1.6}
+ .app-shell .tv-chart{height:480px;height:clamp(360px,65svh,580px)}
+ .app-shell .fib-audit{padding:10px}
+ .app-shell .fib-audit summary{padding:10px 0;line-height:1.5}
+ .app-shell .fib-audit dl{grid-template-columns:1fr;gap:4px}
+ .app-shell .fib-audit dd{margin-bottom:10px}
+}
+@media(max-height:500px) and (orientation:landscape){.app-shell .tv-chart{height:360px}}
