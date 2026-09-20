@@ -39,6 +39,11 @@ describe("run detail compatibility",()=>{
  const result=await runCas({query} as any,{id:"run",config_json:{symbols:[{chain:"sol",ca:"a",pairId:"p"}]}},{chain:"sol",ca:"a"},true);
  expect(result.unrealizedPnl).toBeNull();expect(result.pools[0].noData).toBeNull();
  });
+ it('propagates missing historical realized profit instead of silently adding zero',async()=>{
+ const query=vi.fn().mockResolvedValueOnce({rows:[{report_json:{engineVersion:'portfolio-3'}}]}).mockResolvedValueOnce({rows:[{chain:'sol',ca:'a',pair_id:'p',trades:1,entries:1,realized:0,costs:0,missingPnl:1}]});
+ const result=await runCas({query} as any,{id:'run',config_json:{symbols:[{chain:'sol',ca:'a',pairId:'p'}]}},{includeEndOfBacktest:'false'});
+ expect(result.summary.realizedPnl).toBeNull();expect(result.items[0].realizedPnl).toBeNull();
+ });
  it("binds pool scope and applies time/page filters only after stable numbering",async()=>{
  const query=vi.fn().mockResolvedValueOnce({rows:[]}).mockResolvedValueOnce({rows:[{id:'outside',time:99,signal_type:'entry'},{id:'event',time:150,signal_type:'entry'}]}).mockResolvedValueOnce({rows:[{config_json:{}}]});
  const result=await resultRows({query} as any,"run","signals",{chain:"sol",ca:"a",pairId:"p",from:"100",to:"200",page:"1",pageSize:"20"});

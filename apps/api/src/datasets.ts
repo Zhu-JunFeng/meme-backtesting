@@ -81,7 +81,7 @@ export async function runCas(pool:Pool,run:any,q:Record<string,string>,detail=fa
   const includeEnd=includesEnd(q);
   const config=run.config_json as DatasetConfig;
   const report=(await pool.query("SELECT report_json FROM backtest_reports WHERE run_id=$1",[run.id])).rows[0]?.report_json;
-  const stats=(await pool.query(`SELECT chain,ca,pair_id,COUNT(*) FILTER(WHERE exit_time IS NOT NULL)::int AS trades,COUNT(*)::int AS entries,
+  const stats=(await pool.query(`SELECT chain,ca,pair_id,COUNT(*) FILTER(WHERE exit_time IS NOT NULL)::int AS trades,COUNT(*)::int AS entries,COUNT(*) FILTER(WHERE exit_time IS NOT NULL AND net_pnl IS NULL)::int AS "missingPnl",
     COALESCE(SUM(net_pnl),0) AS realized,COALESCE(SUM(fees+slippage_cost+tax_cost),0) AS costs
     FROM backtest_trades WHERE run_id=$1 AND ($2::boolean OR exit_reason IS DISTINCT FROM 'end_of_backtest') GROUP BY chain,ca,pair_id`,[run.id,includeEnd])).rows;
   const pairs=(config.pools ?? config.symbols ?? []).map(s=>{
@@ -91,19 +91,19 @@ export async function runCas(pool:Pool,run:any,q:Record<string,string>,detail=fa
     const legacy=!includeEnd || (report && !report.engineVersion);
     return {...s,startTime:snapshot?.startTime ?? (config.startTime ? Date.parse(config.startTime):null),endTime:snapshot?.endTime ?? (config.endTime ? Date.parse(config.endTime):null),
       noData:snapshot?.noData ?? null,trades:stat?.trades ?? 0,entries:stat?.entries ?? 0,
-      realizedPnl:Number(stat?.realized ?? 0),unrealizedPnl:legacy ? null : Number(open?.netPnl ?? 0),fees:Number(stat?.costs ?? 0)};
+      realizedPnl:stat?.missingPnl>0?null:Number(stat?.realized ?? 0),unrealizedPnl:legacy ? null : Number(open?.netPnl ?? 0),fees:Number(stat?.costs ?? 0)};
   });
   const map=new Map<string,any>();
   for(const p of pairs) {
     const key=p.chain+":"+p.ca;
     if(!map.has(key)) map.set(key,{chain:p.chain,ca:p.ca,pools:[],poolCount:0,noDataPoolCount:0,trades:0,entries:0,realizedPnl:0,unrealizedPnl:!includeEnd || (report && !report.engineVersion) ? null:0,fees:0});
     const row=map.get(key);row.pools.push(p);row.poolCount++;row.noDataPoolCount+=p.noData?1:0;
-    row.trades+=p.trades;row.entries+=p.entries;row.realizedPnl+=p.realizedPnl;row.fees+=p.fees;
+    row.trades+=p.trades;row.entries+=p.entries;row.realizedPnl=row.realizedPnl===null||p.realizedPnl===null?null:row.realizedPnl+p.realizedPnl;row.fees+=p.fees;
     if(row.unrealizedPnl!==null) row.unrealizedPnl+=p.unrealizedPnl ?? 0;
   }
   const all=[...map.values()];
   if(detail) return all.find(r=>r.chain===q.chain && r.ca===q.ca) ?? null;
   const rows=all.filter(r=>(!q.chain || r.chain===q.chain) && (!q.ca || r.ca.includes(q.ca)));
-  rows.sort((a,b)=>q.sort==="pnl_asc"?a.realizedPnl-b.realizedPnl:q.sort==="pnl_desc"?b.realizedPnl-a.realizedPnl:(a.chain+":"+a.ca).localeCompare(b.chain+":"+b.ca));
-  return {...paginate(rows,q),summary:{...datasetCounts(config),tradedCaCount:all.filter(r=>r.entries>0).length,untradedCaCount:all.filter(r=>!r.entries).length,realizedPnl:all.reduce((s,r)=>s+r.realizedPnl,0)}};
+  rows.sort((a,b)=>['pnl_asc','pnl_desc'].includes(q.sort)&&(a.realizedPnl===null||b.realizedPnl===null)?Number(a.realizedPnl===null)-Number(b.realizedPnl===null):q.sort==="pnl_asc"?a.realizedPnl-b.realizedPnl:q.sort==="pnl_desc"?b.realizedPnl-a.realizedPnl:(a.chain+":"+a.ca).localeCompare(b.chain+":"+b.ca));
+  return {...paginate(rows,q),summary:{...datasetCounts(config),tradedCaCount:all.filter(r=>r.entries>0).length,untradedCaCount:all.filter(r=>!r.entries).length,realizedPnl:all.some(r=>r.realizedPnl===null)?null:all.reduce((s,r)=>s+r.realizedPnl,0)}};
 }
