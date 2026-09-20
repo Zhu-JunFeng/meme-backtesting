@@ -1,7 +1,6 @@
 name: Rolling Fib coordinator
 on:
-  schedule:
-    - cron: '*/5 * * * *'
+  # Production systemd timer owns scheduling; keep manual diagnostic fallback.
   workflow_dispatch:
 permissions:
   contents: read

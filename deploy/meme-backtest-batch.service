@@ -1,0 +1,11 @@
+[Unit]
+Description=Advance approved Meme backtests in rolling waves of 50
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/meme-backtesting/advance-batch.sh
+TimeoutStartSec=0
+StandardOutput=journal
+StandardError=journal

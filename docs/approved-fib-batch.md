@@ -27,7 +27,9 @@
 - `export`：导出全部组合的轻量成绩和保留任务详细结果；内部 CLI 的 `--csv` 输出轻量排名。
 
 内部 CLI：`BACKTEST_CLI=1 node apps/api/dist/batch-cli.js <command>`；写操作要求 `--yes` 和生产队列。
-**Rolling Fib coordinator** 每约 5 分钟调用 `advance`，GitHub 调度可能延迟；数据库与工作流锁防止并发提交。全部完成后调度工作流自动禁用；若未来需再次启用，先手动启用该工作流。发布重启不丢失清单或已提交任务。
+生产服务器的 **meme-backtest-batch.timer** 在上次检查结束约 60 秒后调用 `advance`，不依赖 GitHub 定时触发。发布自动安装并启用，服务器重启后自动恢复。数据库锁防止并发提交，本机文件锁保证发布替换容器前等待协调结束。未启动、暂停及已完成批次只读返回，不再提交任务，不自动恢复暂停。
+
+`systemctl status meme-backtest-batch.timer` 查看定时器，`journalctl -u meme-backtest-batch.service -n 100` 查看协调结果。外部 Docker/数据库暂时不可用时，下次自动检查；业务校验或容量失败仍按既有规则暂停并记录原因。GitHub **Rolling Fib coordinator** 仅保留手动诊断入口。
 
 每轮空间预算采用已完成同链任务最大结果体积 × 本轮数量 × 3，另保留 **2 GiB**。读取实际 PostgreSQL 数据卷可用空间；不足则暂停，不绕过检查。
 删除后只执行常规 `VACUUM (ANALYZE)` 以复用表内空间，不执行 `VACUUM FULL`。普通删除不保证立即向操作系统归还文件空间。

@@ -13,6 +13,10 @@ docker run --rm --network host --env-file deploy/.env -v "$PWD:/app" -w /app pos
 docker build -f deploy/Dockerfile.api -t meme-backtesting-api .
 docker build -f deploy/Dockerfile.worker -t meme-backtesting-worker .
 docker build -f deploy/Dockerfile.web -t meme-backtesting-web .
+# Wait for any in-flight coordinator transaction before replacing the API.
+# The timer remains enabled; ticks during this critical section safely skip.
+exec 9>/run/lock/meme-backtest-batch.lock
+flock -w 900 9
 # Close admission before the final legacy check; jobs may have arrived during image builds.
 if docker inspect meme-backtesting-api >/dev/null 2>&1; then docker stop --time 90 meme-backtesting-api; fi
 legacy=$(legacy_count)
@@ -28,3 +32,7 @@ done
 docker run -d --name meme-backtesting-api --restart unless-stopped --network host --env-file deploy/.env -e NODE_ENV=production -e BACKTEST_QUEUE_PREFIX=meme-production-v3 meme-backtesting-api:latest
 docker run -d --name meme-backtesting-worker --restart unless-stopped --stop-timeout 90 --network host --env-file deploy/.env -e NODE_ENV=production -e BACKTEST_QUEUE_PREFIX=meme-production-v3 meme-backtesting-worker:latest
 docker run -d --name meme-backtesting-web --restart unless-stopped --network host meme-backtesting-web:latest
+sh deploy/install-batch-timer.sh
+flock -u 9
+# Start a first check now instead of waiting for the timer after deployment.
+systemctl start --no-block meme-backtest-batch.service

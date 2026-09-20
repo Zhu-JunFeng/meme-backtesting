@@ -42,6 +42,10 @@ jobs:
           set -eu
           command="$1"
           case "$command" in preview|pilot|start|advance|pause|status|export) ;; *) exit 1;; esac
+          if [ "$command" = status ]; then
+            systemctl status meme-backtest-batch.timer --no-pager >&2 || true
+            journalctl -u meme-backtest-batch.service -n 12 --no-pager >&2 || true
+          fi
           # Measure the actual PostgreSQL data volume, not an unrelated host filesystem.
           pg_container=$(docker ps --format '{{.Names}} {{.Image}}' | awk 'tolower($2) ~ /postgres|timescale/ {print $1}')
           [ "$(printf '%s\n' "$pg_container" | wc -l)" -eq 1 ] && [ -n "$pg_container" ] || { echo '无法唯一识别数据库容器，禁止估算容量' >&2; exit 1; }

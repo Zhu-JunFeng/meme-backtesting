@@ -1,0 +1,11 @@
+[Unit]
+Description=Check approved Meme batch progress every minute
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=meme-backtest-batch.service
+
+[Install]
+WantedBy=timers.target
