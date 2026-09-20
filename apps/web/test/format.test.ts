@@ -1,6 +1,8 @@
 import {describe,it,expect} from 'vitest';
-import {marketValue,changePercent,duration} from '../src/format';
+import {marketValue,changePercent,duration,formatNumber,preciseValue,signedValue,valueTone} from '../src/format';
 describe('chart presentation',()=>{
+ it('uses centralized decimals and preserves tiny price/quantity only when requested',()=>{expect(formatNumber(1234.567)).toBe('1,234.57');expect(formatNumber(1)).toBe('1.00');expect(formatNumber(-.001)).toBe('0.00');expect(preciseValue(.00000123456)).toBe('0.00000123456');expect(formatNumber(NaN)).toBe('不可用');expect(formatNumber(null)).toBe('不可用');expect(signedValue(1.5)).toBe('+1.50');expect(signedValue(-1.5)).toBe('-1.50');});
+ it('colors signed results and adverse drawdown, leaving zero and missing neutral',()=>{expect(valueTone(1)).toBe('value-positive');expect(valueTone(-1)).toBe('value-negative');expect(valueTone(1,true)).toBe('value-negative');expect(valueTone(0)).toBe('value-neutral');expect(valueTone(null)).toBe('value-neutral');});
  it('formats market cap in K/M without changing price data',()=>{expect(marketValue(999)).toBe('999.00');expect(marketValue(1000)).toBe('1.00K');expect(marketValue(12500)).toBe('12.50K');expect(marketValue(1000000)).toBe('1.00M');expect(marketValue(1e9)).toBe('1000.00M');});
  it('compares cursor price against the selected buy, never weighted average',()=>{expect(changePercent(150,100)).toBe(50);expect(changePercent(80,100)).toBeCloseTo(-20);expect(changePercent(150,0)).toBeNull();expect(changePercent(NaN,100)).toBeNull();});
  it('shows elapsed wall-clock holding duration and unknown states',()=>{expect(duration(90061000)).toBe('1天 1小时 1分 1秒');expect(duration(null)).toBe('不可用');expect(duration(0)).toBe('0秒');});

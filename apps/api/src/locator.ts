@@ -3,15 +3,16 @@ import type { Pool } from 'pg';
 import type { BacktestConfig } from '@meme/domain';
 import { intervalMs } from '@meme/engine';
 import { tradeFib } from './fib.js';
+import { loadResults, selectResults } from './results.js';
 export async function locate(pool:Pool,run:any,q:Record<string,string>){
  const config=run.config_json as BacktestConfig;
  const symbol=config.symbols.find(s=>s.chain===q.chain && s.ca===q.ca && s.pairId===q.pairId);
  if(!symbol)throw new BadRequestException('交易池不属于该任务');
- const params=[run.id,symbol.chain,symbol.ca,symbol.pairId];let trade:any,event:any;
- if(q.eventId)event=(await pool.query('SELECT * FROM backtest_signals WHERE run_id=$1 AND chain=$2 AND ca=$3 AND pair_id=$4 AND id=$5',[...params,q.eventId])).rows[0];
- else trade=(await pool.query(`SELECT * FROM backtest_trades WHERE run_id=$1 AND chain=$2 AND ca=$3 AND pair_id=$4 ${q.tradeId?'AND id=$5':''} ORDER BY entry_time,id LIMIT 1`,q.tradeId?[...params,q.tradeId]:params)).rows[0];
- if((q.eventId && !event)||(q.tradeId && !trade))throw new NotFoundException('交易或事件不存在');
- if(!trade && !event)return {symbol,empty:true};
+ const original=await loadResults(pool,run.id,q),data=selectResults(original,q);let trade:any,event:any;
+ if(q.eventId && !original.signals.some(s=>String(s.id)===q.eventId) || q.tradeId && !original.trades.some(t=>String(t.id)===q.tradeId))throw new NotFoundException('交易或事件不存在');
+ if(q.eventId)event=data.signals.find(s=>String(s.id)===q.eventId);
+ if(!event)trade=data.trades.find(t=>String(t.id)===q.tradeId) ?? data.trades[0];
+ if(!trade && !event)return {symbol,empty:true,hiddenUnassociated:data.hiddenUnassociated};
  const step=intervalMs(config.interval),start=Number(event?.time ?? trade.entry_time),end=Number(event?.time ?? trade.exit_time ?? start);
  const snap=config.pools?.find(p=>p.chain===symbol.chain && p.ca===symbol.ca && p.pairId===symbol.pairId);
  let from=Math.max(snap?.startTime ?? 0,start-100*step),to=Math.min(snap?.endTime ?? Number.MAX_SAFE_INTEGER,end+100*step);
@@ -23,7 +24,7 @@ export async function locate(pool:Pool,run:any,q:Record<string,string>){
  const rows=(await pool.query(`WITH bars AS (SELECT (b->>'time')::bigint t FROM backtest_input_chunks c CROSS JOIN LATERAL jsonb_array_elements(c.candles_json) b WHERE c.run_id=$1 AND c.pool_key=$2) SELECT (SELECT min(t) FROM (SELECT t FROM bars WHERE t<$3 ORDER BY t DESC LIMIT 100) x) AS before,(SELECT max(t) FROM (SELECT t FROM bars WHERE t>$4 ORDER BY t LIMIT 100) x) AS after`,[run.id,`${symbol.chain}:${symbol.ca}:${symbol.pairId}`,start,end])).rows;
  from=Number(rows[0].before ?? start);to=Number(rows[0].after ?? end);
  }
- const events=(await pool.query('SELECT * FROM backtest_signals WHERE run_id=$1 AND chain=$2 AND ca=$3 AND pair_id=$4 AND time BETWEEN $5 AND $6 ORDER BY time,id',[...params,start,end])).rows;
+ const events=data.signals.filter(s=>Number(s.time)>=start&&Number(s.time)<=end);
  const fib=await tradeFib(pool,run,q,trade?.id,event?.id);
  let fibFrom=from,fibTo=to;
  if(fib.status==='available'){

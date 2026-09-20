@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import {formatNumber,valueTone} from '../format';
 defineProps<{fib:any;isMcap:boolean}>();
 const utc=(t:number)=>new Date(t).toISOString().replace('T',' ').replace('.000Z',' UTC');
 const raw=(n:number)=>Number(n).toString();
@@ -12,9 +13,9 @@ const raw=(n:number)=>Number(n).toString();
    <dl><dt>Swing Low</dt><dd>{{raw(fib.impulse.low)}} · 索引 {{fib.impulse.lowIndex}} · {{fib.low?utc(fib.low.time):'时间不可用'}} {{fib.low?.synthetic?'（补齐 K 线）':''}}</dd>
     <dt>Swing High</dt><dd>{{raw(fib.impulse.high)}} · 索引 {{fib.impulse.highIndex}} · {{fib.high?utc(fib.high.time):'时间不可用'}} {{fib.high?.synthetic?'（补齐 K 线）':''}}</dd>
     <dt>高点确认</dt><dd>索引 {{fib.impulse.confirmedAtIndex}} · {{fib.confirmed?utc(fib.confirmed.time):'时间不可用'}} {{fib.confirmed?.synthetic?'（补齐 K 线）':''}}</dd>
-    <dt>拉升</dt><dd>{{((fib.impulse.high/fib.impulse.low-1)*100).toFixed(2)}}% · {{fib.impulse.highIndex-fib.impulse.lowIndex}} 根</dd></dl>
+    <dt>拉升</dt><dd><span :class="valueTone((fib.impulse.high/fib.impulse.low-1)*100)">{{formatNumber((fib.impulse.high/fib.impulse.low-1)*100,{signed:true})}}%</span> · {{fib.impulse.highIndex-fib.impulse.lowIndex}} 根</dd></dl>
    <div class="fib-tables"><table><caption>Fib 档位与配置用途（不等同于独立触发原因）</caption><thead><tr><th>比例</th><th>{{isMcap?'市值':'价格'}}</th><th>配置关系</th></tr></thead><tbody><tr v-for="line in fib.levels" :key="line.ratio"><td>{{line.ratio}}</td><td>{{raw(line.value)}}</td><td>{{line.uses.join('；') || '标准参考位'}}</td></tr><tr v-for="line in fib.thresholds" :key="line.label"><td>实际阈值</td><td>{{raw(line.value)}}</td><td>{{line.label}}</td></tr></tbody></table>
-   <table><caption>原始买入与加仓</caption><thead><tr><th>事件 / 时间</th><th>原始成交值</th><th>实际回撤比例</th></tr></thead><tbody><tr v-for="(buy,index) in fib.buys" :key="index"><td>{{buy.label}} · {{utc(buy.time)}}</td><td>{{raw(buy.value)}}</td><td>{{buy.ratio.toFixed(6)}}（{{(buy.ratio*100).toFixed(2)}}%）</td></tr></tbody></table></div>
+   <table><caption>原始买入与加仓</caption><thead><tr><th>事件 / 时间</th><th>原始成交值</th><th>实际回撤比例</th></tr></thead><tbody><tr v-for="(buy,index) in fib.buys" :key="index"><td>{{buy.label}} · {{utc(buy.time)}}</td><td>{{raw(buy.value)}}</td><td>{{buy.ratio.toFixed(6)}}（{{formatNumber(buy.ratio*100)}}%）</td></tr></tbody></table></div>
    <details><summary>入场条件组原始配置（all 全部 / any 任一 / at_least 至少 N 项）</summary><pre>{{JSON.stringify(fib.conditionGroup,null,2)}}</pre></details>
   </template>
  </details>

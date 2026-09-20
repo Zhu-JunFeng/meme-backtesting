@@ -9,6 +9,21 @@ const key=(r:any)=>JSON.stringify([r.chain,r.ca,r.pair_id]);
 const present=(v:any)=>v!==null && v!==undefined && Number.isFinite(Number(v));
 const same=(a:any,b:any)=>present(a)&&present(b)&&Math.abs(Number(a)-Number(b))<=1e-9*Math.max(1,Math.abs(Number(a)),Math.abs(Number(b)));
 const exits=new Set(['take_profit','stop_loss','profit_lock','invalidation','timeout','end_of_backtest']);
+export function signalTypes(q:Record<string,string>):string[]{
+ if(q.signalTypes!==undefined&&typeof q.signalTypes!=='string')throw new BadRequestException('交易信号筛选必须为逗号分隔的文本');
+ const types=[...new Set((q.signalTypes ?? '').split(',').map(s=>s.trim()).filter(Boolean))];
+ if(types.some(t=>!['entry','add',...exits].includes(t)))throw new BadRequestException('不支持的交易信号筛选');
+ return types;
+}
+/** Filter whole trades after stable association/numbering, before paging or chart windows. */
+export function selectResults(data:{trades:any[];signals:any[]},q:Record<string,string>){
+ const includeEnd=includesEnd(q),types=signalTypes(q),byTrade=new Map<string,Set<string>>();
+ for(const s of data.signals)if(s.trade_id!=null){const id=String(s.trade_id);if(!byTrade.has(id))byTrade.set(id,new Set());byTrade.get(id)!.add(s.signal_type);}
+ const trades=data.trades.filter(t=>(includeEnd || !t.excluded_end)&&(!types.length || types.some(type=>exits.has(type)?t.exit_reason===type:byTrade.get(String(t.id))?.has(type))));
+ const ids=new Set(trades.map(t=>String(t.id)));
+ const signals=data.signals.filter(s=>s.trade_id!=null?ids.has(String(s.trade_id)):!types.length&&(s.signal_type==='risk_event'||includeEnd));
+ return {trades,signals,hiddenUnassociated:!includeEnd||types.length?data.signals.filter(s=>s.trade_id==null&&s.signal_type!=='risk_event').length:0};
+}
 
 /** Read-time enrichment only. Never persist guesses into immutable historical results. */
 export function enrichResults(rawTrades:any[],rawSignals:any[],config:any) {
@@ -78,10 +93,10 @@ export function filteredStatistics(trades:any[],signals:any[],capital:number,sta
  let balance=capital,peak=capital,drawdown=0,drawdownPercent=0;
  const first=trades.reduce((n,t)=>Math.min(n,Number(t.entry_time)),start);const curve=[{time:Number.isFinite(first)?first:start,equity:capital}];
  for(const [time,pnl]of [...buckets].sort((a,b)=>a[0]-b[0])){balance+=pnl;peak=Math.max(peak,balance);drawdown=Math.max(drawdown,peak-balance);drawdownPercent=Math.max(drawdownPercent,peak>0?(peak-balance)/peak*100:0);curve.push({time,equity:balance});}
- const counts=new Map<string,number>();for(const s of signals)if(includeEnd || !s.excluded_end)counts.set(s.signal_type,(counts.get(s.signal_type)??0)+1);
+ const counts=new Map<string,number>();for(const s of signals)if(includeEnd || !s.excluded_end && (s.trade_id!=null || s.signal_type==='risk_event'))counts.set(s.signal_type,(counts.get(s.signal_type)??0)+1);
  return {summary:{netPnl:missingPnl?null:net,totalNetPnl:missingPnl?null:net,unrealizedPnl:null,totalTrades:selected.length,winRate:selected.length&&!missingPnl?wins/selected.length:null,returnPercent:capital>0&&!missingPnl?net/capital*100:null,finalEquity:missingPnl?null:balance,maxDrawdown:missingPnl?null:drawdown,maxDrawdownPercent:missingPnl?null:drawdownPercent},curve:missingPnl?[]:curve,missingPnl,
   excluded:{count:excluded.length,netPnl:excluded.some(t=>!present(t.net_pnl))?null:excluded.reduce((n,t)=>n+Number(t.net_pnl),0)},
-  exitReasons:[...reasons.values()].map(r=>({...r,netPnl:r.missingPnl?null:r.netPnl,share:r.count/selected.length,winRate:r.missingPnl?null:r.wins/r.count})),signalCounts:[...counts].map(([type,count])=>({type,count})),unassociatedSignals:signals.filter(s=>!s.association_available&&s.signal_type!=='risk_event').length};
+  exitReasons:[...reasons.values()].map(r=>({...r,netPnl:r.missingPnl?null:r.netPnl,share:r.count/selected.length,winRate:r.missingPnl?null:r.wins/r.count})),signalCounts:[...counts].map(([type,count])=>({type,count})),unassociatedSignals:signals.filter(s=>s.trade_id==null&&s.signal_type!=='risk_event').length};
 }
 
 export async function statistics(pool:Pool,run:any,q:Record<string,string>){

@@ -1,7 +1,7 @@
 import { BadRequestException } from "@nestjs/common";
 import type { Pool } from "pg";
 import type { DatasetSelection, DatasetConfig, PoolSnapshot } from "@meme/domain";
-import { includesEnd, loadResults } from './results.js';
+import { includesEnd, loadResults, selectResults, signalTypes } from './results.js';
 
 export const intervals = new Set(["30s","1m","5m","15m","1h","4h","1d"]);
 export function bounds(input: {startTime?:string;endTime?:string}) {
@@ -71,32 +71,37 @@ export function datasetCounts(dataset:DatasetConfig) {
   return {caCount:new Set(dataset.symbols.map(s=>s.chain+":"+s.ca)).size,poolCount:dataset.symbols.length,availablePoolCount:dataset.pools?.filter(p=>!p.noData).length ?? dataset.symbols.length,noDataPoolCount:dataset.pools?.filter(p=>p.noData).length ?? 0};
 }
 export async function resultRows(pool:Pool,id:string,kind:"trades"|"signals",q:Record<string,string>) {
-  const includeEnd=includesEnd(q),data=await loadResults(pool,id,q),time=kind==='trades'?'entry_time':'time';
+  const data=selectResults(await loadResults(pool,id,q),q),time=kind==='trades'?'entry_time':'time';
   for(const param of ['from','to'])if(q[param]&&!Number.isFinite(Number(q[param])))throw new BadRequestException('事件时间无效');
   // Enrich before paging/time filtering, so numbers remain stable across chart windows.
-  const rows=data[kind].filter(r=>(kind==='signals'||includeEnd||!r.excluded_end)&&(!q.from||Number(r[time])>=Number(q.from))&&(!q.to||Number(r[time])<=Number(q.to)));
-  return !q.page&&!q.pageSize?rows:paginate(rows,q);
+  const rows=data[kind].filter(r=>(!q.from||Number(r[time])>=Number(q.from))&&(!q.to||Number(r[time])<=Number(q.to)));
+  return !q.page&&!q.pageSize?rows:{...paginate(rows,q),hiddenUnassociated:data.hiddenUnassociated};
 }
 export async function runCas(pool:Pool,run:any,q:Record<string,string>,detail=false) {
-  const includeEnd=includesEnd(q);
+  const includeEnd=includesEnd(q),types=signalTypes(q);
   const config=run.config_json as DatasetConfig;
   const report=(await pool.query("SELECT report_json FROM backtest_reports WHERE run_id=$1",[run.id])).rows[0]?.report_json;
-  const stats=(await pool.query(`SELECT chain,ca,pair_id,COUNT(*) FILTER(WHERE exit_time IS NOT NULL)::int AS trades,COUNT(*)::int AS entries,COUNT(*) FILTER(WHERE exit_time IS NOT NULL AND net_pnl IS NULL)::int AS "missingPnl",
+  let stats:any[];
+  if(types.length){
+    const data=selectResults(await loadResults(pool,run.id),q),map=new Map<string,any>();
+    for(const t of data.trades){const key=JSON.stringify([t.chain,t.ca,t.pair_id]);if(!map.has(key))map.set(key,{chain:t.chain,ca:t.ca,pair_id:t.pair_id,trades:0,entries:0,missingPnl:0,realized:0,costs:0});const s=map.get(key);s.entries++;if(t.exit_time!=null){s.trades++;s.missingPnl+=t.net_pnl==null?1:0;s.realized+=Number(t.net_pnl ?? 0);}s.costs+=Number(t.fees??0)+Number(t.slippage_cost??0)+Number(t.tax_cost??0);}
+    stats=[...map.values()];
+  }else stats=(await pool.query(`SELECT chain,ca,pair_id,COUNT(*) FILTER(WHERE exit_time IS NOT NULL)::int AS trades,COUNT(*)::int AS entries,COUNT(*) FILTER(WHERE exit_time IS NOT NULL AND net_pnl IS NULL)::int AS "missingPnl",
     COALESCE(SUM(net_pnl),0) AS realized,COALESCE(SUM(fees+slippage_cost+tax_cost),0) AS costs
     FROM backtest_trades WHERE run_id=$1 AND ($2::boolean OR exit_reason IS DISTINCT FROM 'end_of_backtest') GROUP BY chain,ca,pair_id`,[run.id,includeEnd])).rows;
   const pairs=(config.pools ?? config.symbols ?? []).map(s=>{
     const snapshot="noData" in s ? s as PoolSnapshot : undefined;
     const stat=stats.find(r=>r.chain===s.chain && r.ca===s.ca && r.pair_id===s.pairId);
     const open=report?.openPositions?.find((r:any)=>r.symbol.chain===s.chain && r.symbol.ca===s.ca && r.symbol.pairId===s.pairId);
-    const legacy=!includeEnd || (report && !report.engineVersion);
+    const legacy=types.length>0 || !includeEnd || (report && !report.engineVersion);
     return {...s,startTime:snapshot?.startTime ?? (config.startTime ? Date.parse(config.startTime):null),endTime:snapshot?.endTime ?? (config.endTime ? Date.parse(config.endTime):null),
       noData:snapshot?.noData ?? null,trades:stat?.trades ?? 0,entries:stat?.entries ?? 0,
       realizedPnl:stat?.missingPnl>0?null:Number(stat?.realized ?? 0),unrealizedPnl:legacy ? null : Number(open?.netPnl ?? 0),fees:Number(stat?.costs ?? 0)};
   });
   const map=new Map<string,any>();
-  for(const p of pairs) {
+  for(const p of pairs.filter(p=>!types.length||p.entries>0)) {
     const key=p.chain+":"+p.ca;
-    if(!map.has(key)) map.set(key,{chain:p.chain,ca:p.ca,pools:[],poolCount:0,noDataPoolCount:0,trades:0,entries:0,realizedPnl:0,unrealizedPnl:!includeEnd || (report && !report.engineVersion) ? null:0,fees:0});
+    if(!map.has(key)) map.set(key,{chain:p.chain,ca:p.ca,pools:[],poolCount:0,noDataPoolCount:0,trades:0,entries:0,realizedPnl:0,unrealizedPnl:types.length || !includeEnd || (report && !report.engineVersion) ? null:0,fees:0});
     const row=map.get(key);row.pools.push(p);row.poolCount++;row.noDataPoolCount+=p.noData?1:0;
     row.trades+=p.trades;row.entries+=p.entries;row.realizedPnl=row.realizedPnl===null||p.realizedPnl===null?null:row.realizedPnl+p.realizedPnl;row.fees+=p.fees;
     if(row.unrealizedPnl!==null) row.unrealizedPnl+=p.unrealizedPnl ?? 0;

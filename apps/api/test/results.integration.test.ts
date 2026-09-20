@@ -24,7 +24,15 @@ const url=process.env.TEST_DATABASE_URL;
   expect(all.summary.netPnl).toBe(10);expect(filtered.summary.netPnl).toBe(30);expect(filtered.excluded).toEqual({count:1,netPnl:-20});expect(filtered.summary.winRate).toBe(1);expect(filtered.curve.at(-1)?.equity).toBe(1030);
   const cas:any=await runCas(pool,run,{includeEndOfBacktest:'false'});expect(cas.total).toBe(2);expect(cas.summary.untradedCaCount).toBe(1);expect(cas.summary.realizedPnl).toBe(filtered.summary.netPnl);
   const trades=await resultRows(pool,id,'trades',{includeEndOfBacktest:'false',page:'1'});expect(trades.total).toBe(1);expect(trades.items[0].trade_no).toBe(2);
-  const signals=await resultRows(pool,id,'signals',{includeEndOfBacktest:'false',page:'1'});expect(signals.total).toBe(4);expect(signals.items.filter((s:any)=>s.excluded_end)).toHaveLength(2);
+  const signals=await resultRows(pool,id,'signals',{includeEndOfBacktest:'false',page:'1'});expect(signals.total).toBe(2);expect(signals.items.filter((s:any)=>s.excluded_end)).toHaveLength(0);
   expect((await statistics(pool,run,{})).original).toEqual(all.original);expect((await loadResults(pool,id)).trades).toHaveLength(2);
+ });
+ it('signal unions filter CA, pools, paged trades and complete event pairs, not top statistics',async()=>{
+  const q={signalTypes:'take_profit,add',includeEndOfBacktest:'false',page:'1',pageSize:'1'};
+  const cas:any=await runCas(pool,run,q);expect(cas.total).toBe(1);expect(cas.items[0].ca).toBe('a');expect(cas.items[0].realizedPnl).toBe(30);
+  const events:any=await resultRows(pool,id,'signals',q);expect(events.total).toBe(2);expect(events.items[0].event_label).toBe('买2');
+  const detail:any=await runCas(pool,run,{...q,chain:'sol',ca:'a'},true);expect(detail.pools[0].trades).toBe(1);
+  expect((await statistics(pool,run,{signalTypes:'stop_loss'})).summary.totalTrades).toBe(2);
+  const empty:any=await runCas(pool,run,{includeEndOfBacktest:'false',signalTypes:'end_of_backtest'});expect(empty.total).toBe(0);
  });
 });
