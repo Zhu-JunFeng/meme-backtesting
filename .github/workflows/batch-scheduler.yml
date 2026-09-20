@@ -1,0 +1,27 @@
+name: Rolling Fib coordinator
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: fib-batch-coordinator
+  cancel-in-progress: false
+jobs:
+  advance:
+    uses: ./.github/workflows/batch.yml
+    with:
+      command: advance
+    secrets: inherit
+  finish:
+    needs: advance
+    if: needs.advance.outputs.state == 'completed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stop scheduling after the final top ten per chain is retained
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh workflow disable batch-scheduler.yml --repo "$REPOSITORY"
