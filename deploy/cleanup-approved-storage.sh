@@ -25,7 +25,17 @@ set -- fa334cc49529 c6abf638d6ff a90ca0efef22 \
   3787a665b0af 30c044ec4794 23a313cc8f4e \
   fa2aae200681 670498e93b01 8fc49b6b3590 \
   c8bad95e337e 4a998d5ae0ff 16f44a3c0bc5 \
-  d9e2e2f17f7b 0a295e54edf4 738de7a13161
+  d9e2e2f17f7b 0a295e54edf4 738de7a13161 \
+  06db8eea2675 c54dbf7b44f6 ead22b4e4e96 \
+  d84894d74832 e5a34bedba99 9f0911a5f301 \
+  6a810c07d46b 30d2f7a596c7 a9187b53fd7e \
+  66df394c1ce4 bc8a5aaf0b6a 2fd3e3c42d0e \
+  2abf64a906ae 30720477a4f5 880d78251b35 \
+  978cc6a41acc 97b310068a89 e08949188dfb \
+  466b81e72b2e f51318fb2fa2 6a04d873f4eb \
+  957c875fb9d4 df5099811ea7 94b4d7e1c456 \
+  3ecaf2f2ebd2 20a1516142b4 d6fc98135cff \
+  122e62d6eac2 191f5a5a78e5 0e3721a45b9f
 
 # Validate the entire allowlist before deleting anything.
 for id do
@@ -36,7 +46,9 @@ for id do
   docker image inspect -f '{{.Id}} {{.Created}}' "$id"
 done
 for id do
-  if docker image inspect "$id" >/dev/null 2>&1; then docker image rm --no-prune "$id"; fi
+  # Docker also removes this image's unused, untagged ancestors, stopping at
+  # shared/referenced/tagged layers. Never force removal or prune globally.
+  if docker image inspect "$id" >/dev/null 2>&1; then docker image rm "$id"; fi
 done
 
 core=/var/lib/systemd/coredump/core.node.0.09bcb0d477c544b99d1c09add0a2479f.15112.1789890802000000.zst

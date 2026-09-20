@@ -39,6 +39,7 @@ jobs:
             audit|'') ;;
             cleanup-approved)
               sh /tmp/meme-cleanup-approved-storage.sh
+              exit 0
               ;;
             trim-journal-100m)
               journalctl --disk-usage
