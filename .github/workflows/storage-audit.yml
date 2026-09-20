@@ -1,0 +1,56 @@
+name: Production storage audit
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Read-only disk and database inventory
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/audit_key
+          chmod 600 ~/.ssh/audit_key
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/audit_key "$DEPLOY_USER@$DEPLOY_HOST" 'sh -s' > storage-audit.txt <<'REMOTE'
+          set -eu
+          date -Is
+          df -hT
+          docker system df -v
+          docker ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+          journalctl --disk-usage
+          du -x -h --max-depth=1 /var /opt /root /tmp /home 2>/dev/null | sort -h
+          du -x -h --max-depth=1 /var/lib /var/log /var/cache 2>/dev/null | sort -h
+          docker ps -aq | while read -r id; do
+            log=$(docker inspect -f '{{.LogPath}}' "$id")
+            if [ -n "$log" ] && [ -f "$log" ]; then du -h "$log"; fi
+          done
+          docker exec -i meme-backtesting-api node --input-type=module <<'JS'
+          import pg from 'pg';
+          const pool=new pg.Pool({connectionString:process.env.DATABASE_URL});
+          try {
+            await pool.query('SET default_transaction_read_only=on');
+            for (const [label,sql] of [
+              ['database',`SELECT pg_size_pretty(pg_database_size(current_database())) AS size`],
+              ['largest_tables',`SELECT relname,pg_size_pretty(pg_total_relation_size(relid)) total,pg_size_pretty(pg_table_size(relid)) data,pg_size_pretty(pg_indexes_size(relid)) indexes,n_live_tup,n_dead_tup,last_autovacuum,last_vacuum FROM pg_stat_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 25`],
+              ['batch',`SELECT batch_id,status,wave,last_error FROM backtest_batch_control`],
+              ['batch_ledger',`SELECT batch_id,state,count(*) FROM backtest_batch_items GROUP BY 1,2`],
+              ['pruned_residual_runs',`SELECT count(*) FROM backtest_batch_items i JOIN backtest_runs r ON r.id=i.run_id WHERE i.state='pruned'`],
+              ['batch_live_runs',`SELECT r.status,count(*) FROM backtest_runs r WHERE config_json->'batch'->>'id'='fib-grid-20260920-v1' GROUP BY 1`]
+            ]) console.log(label,JSON.stringify((await pool.query(sql)).rows));
+          } finally {await pool.end();}
+          JS
+          REMOTE
+          cat storage-audit.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: storage-audit-${{ github.run_id }}
+          path: storage-audit.txt
