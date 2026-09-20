@@ -72,6 +72,13 @@ function archiveTemplate() {
   if (!template.value) return;
   Modal.confirm({ title: "归档这个策略模板？", content: "历史版本和回测结果仍会保留。", okText: "归档", cancelText: "取消", async onOk() { await api.patch(`/strategy-templates/${template.value.id}`, { status: "archived" }); await refreshTemplates(); await loadTemplate(); } });
 }
+async function restoreTemplate() {
+  try {
+    await api.patch(`/strategy-templates/${template.value.id}`, { status: "active" });
+    await refreshTemplates(); await loadTemplate();
+    message.success("策略已恢复启用，版本和历史结果未改变");
+  } catch (error:any) { message.error(error.response?.data?.message || "恢复失败，请重试"); }
+}
 function setPositionMode(mode: string) { strategy.value.positionConfig.mode = mode; if (mode === "single_entry") strategy.value.positionConfig.maxEntries = 1; }
 function setStopType(type: string) { strategy.value.exitConfig.stopLoss = type === "percent" ? { type, value: 10 } : type === "fib_level" ? { type, ratio: .886, bufferPercent: 0 } : { type, bufferPercent: 0 }; }
 function setTargetType(type: string) { strategy.value.exitConfig.takeProfit = type === "percent" ? { type, value: 20 } : type === "risk_reward" ? { type, ratio: 2 } : type === "fib_target" ? { type, ratio: .382 } : { type }; }
@@ -116,7 +123,8 @@ onMounted(async () => { definitions.value = (await api.get("/condition-definitio
           <a-space wrap>
             <a-select v-model:value="selectedVersionId" style="width:130px" :options="versions.map(item => ({value:item.id,label:`历史 v${item.version}`}))" />
             <a-button @click="openClone"><CopyOutlined />复制</a-button>
-            <a-button @click="archiveTemplate"><InboxOutlined />归档</a-button>
+            <a-button v-if="template.status==='archived'" @click="restoreTemplate">恢复启用</a-button>
+            <a-button v-else @click="archiveTemplate"><InboxOutlined />归档</a-button>
             <a-button type="primary" :loading="saving" @click="saveVersion"><SaveOutlined />保存新版本</a-button>
           </a-space>
         </header>

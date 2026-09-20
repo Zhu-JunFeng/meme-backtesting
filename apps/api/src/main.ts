@@ -1,4 +1,5 @@
 import "reflect-metadata";
+import { marketCas, resolveDataset, datasetCounts, resultRows, runCas } from "./datasets.js";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { NestFactory } from "@nestjs/core";
@@ -17,7 +18,7 @@ const isGroup = (value: Condition | ConditionGroup): value is ConditionGroup => 
 const checksum = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
 @Injectable()
-class AppService {
+export class AppService {
   readonly pool = new Pool({ connectionString: process.env.DATABASE_URL ?? "postgresql://postgres@localhost:5432/backtesting" });
   readonly queue = new Queue("backtest", { connection: { host: process.env.REDIS_HOST ?? "localhost", port: Number(process.env.REDIS_PORT ?? 6379), password: process.env.REDIS_PASSWORD } });
 
@@ -27,8 +28,19 @@ class AppService {
   }
 
   async candles(query: Record<string, string>) {
+    if (query.runId) {
+      const config = (await this.backtest(query.runId)).config_json as BacktestConfig;
+      const symbol = config.symbols.find(s=>s.chain===query.chain && s.ca===query.ca && s.pairId===query.pairId);
+      if (!symbol) throw new BadRequestException("交易池不属于该任务");
+      const snapshot=config.pools?.find(s=>s.chain===symbol.chain && s.ca===symbol.ca && s.pairId===symbol.pairId);
+      if(snapshot?.noData) return [];
+      query={...query,interval:config.interval,type:config.valueType,
+        from:String(Math.max(Number(query.from)||0,snapshot?.startTime ?? (config.startTime ? Date.parse(config.startTime):0))),
+        to:String(Math.min(Number(query.to)||Date.now(),snapshot?.endTime ?? (config.endTime ? Date.parse(config.endTime):Date.now())))};
+    }
     const params = [query.chain, query.ca, query.pairId, query.interval ?? "30s", query.type ?? "mcap", query.from ? Number(query.from) : 0, query.to ? Number(query.to) : Date.now()];
-    const { rows } = await this.pool.query('SELECT open_time AS time, close_time AS "closeTime", open, high, low, close, volume FROM public.meme_kline WHERE chain=$1 AND ca=$2 AND pair_id=$3 AND interval=$4 AND type=$5 AND valid IS DISTINCT FROM false AND open_time BETWEEN $6 AND $7 ORDER BY open_time', params);
+    const limit=Math.min(5000,Math.max(1,Number(query.limit)||5000));
+    const { rows } = await this.pool.query('SELECT * FROM (SELECT open_time AS time, close_time AS "closeTime", open, high, low, close, volume FROM public.meme_kline WHERE chain=$1 AND ca=$2 AND pair_id=$3 AND interval=$4 AND type=$5 AND valid IS DISTINCT FROM false AND open_time BETWEEN $6 AND $7 ORDER BY open_time DESC LIMIT $8) candles ORDER BY time', [...params,limit]);
     return rows.map((row: Record<string, unknown>) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, typeof value === "string" && /^\d+(\.\d+)?$/.test(value) ? Number(value) : value])));
   }
 
@@ -72,7 +84,7 @@ class AppService {
     if (!impulseDefinition || !ajv.compile(impulseDefinition.parameterSchema)(strategy.impulseCondition)) throw new BadRequestException("拉升识别参数无效");
     validateItem(strategy.entryConditionGroup, "入场条件");
     validateItem(strategy.invalidationConditionGroup, "失效条件");
-    if (strategy.addConditionGroup?.enabled !== false) validateItem(strategy.addConditionGroup!, "加仓条件");
+    if (strategy.addConditionGroup && strategy.addConditionGroup.enabled !== false) validateItem(strategy.addConditionGroup!, "加仓条件");
     if (!asNumber(strategy.executionConfig?.initialCapital) || strategy.executionConfig.initialCapital <= 0) throw new BadRequestException("初始资金必须大于 0");
     for (const key of ["feePercent", "slippagePercent", "buyTaxPercent", "sellTaxPercent"] as const) if (!asNumber(strategy.executionConfig[key]) || strategy.executionConfig[key] < 0) throw new BadRequestException(`${key} 必须是非负数`);
     if (strategy.executionConfig.fillMode !== "current_bar_close") throw new BadRequestException("首期仅支持当前 K 线收盘成交");
@@ -152,18 +164,10 @@ class AppService {
     return this.createTemplate({ name: body.name?.trim() || `${source.templateName} 副本`, description: body.description ?? source.templateDescription, status: "draft", strategyJson: source.strategyJson });
   }
 
-  validateDataset(dataset: DatasetConfig) {
-    if (!dataset?.symbols?.length) throw new BadRequestException("至少选择一个项目");
-    if (!periods.has(dataset.interval)) throw new BadRequestException("K 线周期无效");
-    if (!["price", "mcap"].includes(dataset.valueType)) throw new BadRequestException("K 线类型无效");
-    const start = Date.parse(dataset.startTime);
-    const end = Date.parse(dataset.endTime);
-    if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) throw new BadRequestException("回测时间范围无效");
-  }
 
   async createBacktest(request: CreateBacktestRequest) {
     if (!request.name?.trim() || !request.strategyVersionId) throw new BadRequestException("任务名称和策略版本不能为空");
-    this.validateDataset(request.dataset);
+    const dataset = await resolveDataset(this.pool, request.dataset);
     const version = await this.version(request.strategyVersionId);
     const strategy = structuredClone(version.strategyJson) as StrategyConfig;
     const overrides = request.executionOverrides ?? {};
@@ -172,13 +176,10 @@ class AppService {
       if (!allowedOverrides.has(key)) throw new BadRequestException(`${key} 不是允许的运行覆盖项`);
       if (!asNumber(value) || Number(value) < 0) throw new BadRequestException(`${key} 覆盖值必须是非负数`);
     }
-    const availability = await Promise.all(request.dataset.symbols.map(symbol => this.pool.query("SELECT 1 FROM public.meme_kline WHERE chain=$1 AND ca=$2 AND pair_id=$3 AND interval=$4 AND type=$5 AND valid IS DISTINCT FROM false AND open_time BETWEEN $6 AND $7 LIMIT 1", [symbol.chain, symbol.ca, symbol.pairId, request.dataset.interval, request.dataset.valueType, Date.parse(request.dataset.startTime), Date.parse(request.dataset.endTime)])));
-    const unavailableIndex = availability.findIndex(result => !result.rowCount);
-    if (unavailableIndex >= 0) throw new BadRequestException(`所选项目 ${request.dataset.symbols[unavailableIndex].ca} 在该周期、类型和时间范围内没有有效 K 线`);
     strategy.executionConfig = { ...strategy.executionConfig, ...overrides };
     await this.validateStrategy(strategy);
-    const config: BacktestConfig = { name: request.name.trim(), strategyTemplateId: version.templateId, strategyVersionId: version.id, ...request.dataset, ...strategy };
-    const { rows } = await this.pool.query("INSERT INTO backtest_runs(name,status,strategy_template_id,strategy_version_id,dataset_json,config_json,progress) VALUES($1,'pending',$2,$3,$4,$5,0) RETURNING id,status,progress", [config.name, version.templateId, version.id, JSON.stringify(request.dataset), JSON.stringify(config)]);
+    const config: BacktestConfig = { name: request.name.trim(), strategyTemplateId: version.templateId, strategyVersionId: version.id, ...dataset, ...strategy };
+    const { rows } = await this.pool.query("INSERT INTO backtest_runs(name,status,strategy_template_id,strategy_version_id,dataset_json,config_json,progress) VALUES($1,'pending',$2,$3,$4,$5,0) RETURNING id,status,progress", [config.name, version.templateId, version.id, JSON.stringify(dataset), JSON.stringify(config)]);
     try { await this.queue.add("run", { runId: rows[0].id }, { jobId: rows[0].id, removeOnComplete: 100, removeOnFail: 100 }); }
     catch (error) { await this.pool.query("UPDATE backtest_runs SET status='failed',error_message=$2,finished_at=now() WHERE id=$1", [rows[0].id, `队列提交失败：${String(error)}`]); throw new ConflictException("任务已保存，但提交执行队列失败"); }
     return rows[0];
@@ -200,6 +201,9 @@ const periods = new Set(["30s", "1m", "5m", "15m", "1h", "4h", "1d"]);
 @Controller("api")
 class AppController {
   constructor(@Inject(AppService) private readonly service: AppService) {}
+  @Get("market/cas") cas(@Query() query: Record<string,string>) { return marketCas(this.service.pool,query); }
+  @Post("market/dataset-preview") async preview(@Body() body: CreateBacktestRequest["dataset"]) { const dataset=await resolveDataset(this.service.pool,body); return {dataset,...datasetCounts(dataset)}; }
+  @Get("market/chains") async chains() { return (await this.service.pool.query("SELECT DISTINCT chain FROM public.meme_kline ORDER BY chain")).rows.map(r=>r.chain); }
   @Get("market/projects") projects() { return this.service.projects(); }
   @Get("market/candles") candles(@Query() query: Record<string,string>) { return this.service.candles(query); }
   @Get("condition-definitions") definitions() { return this.service.conditionDefinitions(); }
@@ -217,13 +221,16 @@ class AppController {
   @Post("backtests") create(@Body() body: CreateBacktestRequest) { return this.service.createBacktest(body); }
   @Post("backtests/:id/cancel") async cancel(@Param("id") id: string) { await this.service.pool.query("UPDATE backtest_runs SET status='cancelled', finished_at=now() WHERE id=$1 AND status IN ('pending','running')", [id]); return this.service.backtest(id); }
   @Get("backtests/:id/report") async report(@Param("id") id: string) { const result = await this.service.pool.query("SELECT report_json FROM backtest_reports WHERE run_id=$1", [id]); return result.rows[0]?.report_json ?? null; }
-  @Get("backtests/:id/trades") async trades(@Param("id") id: string) { return (await this.service.pool.query("SELECT * FROM backtest_trades WHERE run_id=$1 ORDER BY entry_time", [id])).rows; }
-  @Get("backtests/:id/signals") async signals(@Param("id") id: string) { return (await this.service.pool.query("SELECT * FROM backtest_signals WHERE run_id=$1 ORDER BY time", [id])).rows; }
+  @Get("backtests/:id/trades") trades(@Param("id") id:string,@Query() q:Record<string,string>) { return resultRows(this.service.pool,id,"trades",q); }
+  @Get("backtests/:id/signals") signals(@Param("id") id:string,@Query() q:Record<string,string>) { return resultRows(this.service.pool,id,"signals",q); }
+  @Get("backtests/:id/cas") async runCas(@Param("id") id:string,@Query() q:Record<string,string>) { return runCas(this.service.pool,await this.service.backtest(id),q); }
+  @Get("backtests/:id/ca") async runCa(@Param("id") id:string,@Query() q:Record<string,string>) { return runCas(this.service.pool,await this.service.backtest(id),q,true); }
+  @Get("backtests/:id/equity") async equity(@Param("id") id:string) { return (await this.service.pool.query("SELECT time,equity,cash,unrealized FROM (SELECT *,ROW_NUMBER() OVER(ORDER BY time) AS rn,COUNT(*) OVER() AS total FROM backtest_equity_curve WHERE run_id=$1) points WHERE rn=1 OR rn=total OR rn % GREATEST(total/2000,1)=0 ORDER BY time",[id])).rows; }
   @Get("tv/config") config() { return { supports_search: false, supports_group_request: false, supports_marks: false, supports_timescale_marks: false, supported_resolutions: ["30S","1","5","15","60","240","D"] }; }
   @Get("tv/time") time() { return Math.floor(Date.now() / 1000); }
-  @Get("tv/symbols") symbols(@Query("symbol") symbol: string) { const [exchange, ca, pairId, type] = (symbol ?? "").split(":"); return { name: symbol, ticker: symbol, description: `${exchange} ${ca}`, type: "crypto", session: "24x7", timezone: "Etc/UTC", exchange, minmov: 1, pricescale: 1000000, has_intraday: true, supported_resolutions: ["30S","1","5","15","60","240","D"], volume_precision: 4, data_status: "endofday", pairId, valueType: type }; }
-  @Get("tv/history") async history(@Query() query: Record<string,string>) { const [chain, ca, pairId, type] = (query.symbol ?? "").split(":"); const resolution: Record<string,string> = { "30S": "30s", "1": "1m", "5": "5m", "15": "15m", "60": "1h", "240": "4h", "D": "1d" }; const rows = await this.service.candles({ chain, ca, pairId, interval: resolution[query.resolution] ?? "30s", type: type ?? "mcap", from: String(Number(query.from) * 1000), to: String(Number(query.to) * 1000) }); if (!rows.length) return { s: "no_data" }; return { s: "ok", t: rows.map((row:any) => Math.floor(row.time / 1000)), o: rows.map((row:any) => row.open), h: rows.map((row:any) => row.high), l: rows.map((row:any) => row.low), c: rows.map((row:any) => row.close), v: rows.map((row:any) => row.volume) }; }
+  @Get("tv/symbols") symbols(@Query("symbol") symbol: string) { const [exchange, ca, pairId, type] = (symbol ?? "").split(":"); return { name: symbol, ticker: symbol, description: `${exchange} ${ca}`, type: "crypto", session: "24x7", timezone: "Etc/UTC", exchange, minmov: 1, pricescale: 1000000, has_intraday: true, has_seconds: true, seconds_multipliers: ["30"], supported_resolutions: ["30S","1","5","15","60","240","D"], volume_precision: 4, data_status: "endofday", pairId, valueType: type }; }
+  @Get("tv/history") async history(@Query() query: Record<string,string>) { const [chain, ca, pairId, type] = (query.symbol ?? "").split(":"); const resolution: Record<string,string> = { "30S": "30s", "1": "1m", "5": "5m", "15": "15m", "60": "1h", "240": "4h", "D": "1d" }; const rows = await this.service.candles({ chain, ca, pairId, interval: resolution[query.resolution] ?? "30s", type: type ?? "mcap", runId:query.runId, from: query.countBack ? "0" : String(Number(query.from) * 1000), to: String(Number(query.to) * 1000 - 1), limit:query.countBack }); if (!rows.length) return { s: "no_data" }; return { s: "ok", t: rows.map((row:any) => Math.floor(row.time / 1000)), o: rows.map((row:any) => row.open), h: rows.map((row:any) => row.high), l: rows.map((row:any) => row.low), c: rows.map((row:any) => row.close), v: rows.map((row:any) => row.volume) }; }
 }
 
 @Module({ controllers: [AppController], providers: [AppService] }) class AppModule {}
-NestFactory.create(AppModule).then(app => { app.enableCors(); app.listen(Number(process.env.PORT ?? 3000)); });
+if (process.env.NODE_ENV !== "test") NestFactory.create(AppModule).then(app => { app.enableCors(); app.listen(Number(process.env.PORT ?? 3000)); });

@@ -15,12 +15,17 @@ export interface Candle {
 }
 
 export interface SymbolRef { chain: string; ca: string; pairId: string }
+export interface CaRef { chain: string; ca: string }
+export interface PoolSnapshot extends SymbolRef { startTime: number | null; endTime: number | null; noData: boolean }
+export interface DatasetSelection { symbols?: SymbolRef[]; cas?: CaRef[]; interval: Interval; valueType: ValueType; startTime?: string; endTime?: string; filters?: Record<string, unknown> }
 export interface DatasetConfig {
   symbols: SymbolRef[];
   interval: Interval;
   valueType: ValueType;
-  startTime: string;
-  endTime: string;
+  startTime?: string;
+  endTime?: string;
+  pools?: PoolSnapshot[];
+  selection?: DatasetSelection;
   trendInterval?: Interval;
   entryInterval?: Interval;
 }
@@ -85,12 +90,13 @@ export interface StrategyConfig {
 
 export interface BacktestConfig extends StrategyConfig, DatasetConfig { name: string; strategyTemplateId?: string | null; strategyVersionId?: string | null }
 export interface ExecutionOverrides { initialCapital?: number; feePercent?: number; slippagePercent?: number; buyTaxPercent?: number; sellTaxPercent?: number }
-export interface CreateBacktestRequest { name: string; strategyVersionId: string; dataset: DatasetConfig; executionOverrides?: ExecutionOverrides }
+export interface CreateBacktestRequest { name: string; strategyVersionId: string; dataset: DatasetSelection; executionOverrides?: ExecutionOverrides }
 
 export type SignalType = "entry" | "add" | "take_profit" | "stop_loss" | "invalidation" | "timeout" | "end_of_backtest" | "risk_event";
 export interface Signal { time: number; price: number; type: SignalType; reason: Record<string, unknown>; quantity?: number }
 export interface Trade { symbol: SymbolRef; entryTime: number; entryPrice: number; quantity: number; exitTime?: number; exitPrice?: number; grossPnl?: number; fees: number; slippageCost: number; taxCost: number; netPnl?: number; exitReason?: string; holdingBars?: number; adds: Signal[] }
 export interface EquityPoint { time: number; equity: number; cash: number; unrealized: number }
+export interface BacktestReport { engineVersion?: string; unrealizedPnl?: number; totalNetPnl?: number; finalEquity?: number; openPositions?: Array<{ symbol: SymbolRef; quantity: number; lastPrice: number; netPnl: number; fees: number }> }
 export interface BacktestReport { totalTrades: number; wins: number; losses: number; winRate: number; grossPnl: number; netPnl: number; returnPercent: number; profitFactor: number; maxDrawdown: number; maxDrawdownPercent: number; maxConsecutiveLosses: number; averageHoldingBars: number; dataQuality: { syntheticBars: number; invalidBars: number; riskEvents: number }; bySymbol: Array<{ symbol: SymbolRef; trades: number; netPnl: number; winRate: number }> }
 
 export interface ConditionDefinition {

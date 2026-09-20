@@ -1,6 +1,7 @@
 import type { BacktestConfig, BacktestReport, Candle, Condition, ConditionGroup, EquityPoint, ImpulseConfig, Signal, SymbolRef, Trade } from "@meme/domain";
 
 const finite = (n: number) => Number.isFinite(n);
+const symbolKey = (s: SymbolRef) => `${s.chain}:${s.ca}:${s.pairId}`;
 const periodSeconds: Record<string, number> = { "30s": 30, "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400 };
 const average = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : undefined;
 
@@ -11,7 +12,7 @@ export function normalizeCandles(input: Candle[], interval: keyof typeof periodS
   let syntheticBars = 0;
   let invalidBars = 0;
   for (const original of sorted) {
-    const invalid = ![original.open, original.high, original.low, original.close, original.volume].every(finite) || original.high < Math.max(original.open, original.close) || original.low > Math.min(original.open, original.close) || original.high < original.low || original.volume < 0;
+    const invalid = original.valid === false || ![original.open, original.high, original.low, original.close, original.volume].every(finite) || original.low <= 0 || original.high < Math.max(original.open, original.close) || original.low > Math.min(original.open, original.close) || original.high < original.low || original.volume < 0;
     if (invalid) { invalidBars++; continue; }
     if (out.length) {
       let next = out[out.length - 1].time + step;
@@ -201,7 +202,7 @@ function consecutiveLosses(trades: Trade[]) {
   return max;
 }
 
-export function runBacktest(config: BacktestConfig, inputs: SymbolInput[], onProgress?: (value: number) => void): BacktestResult {
+function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgress?: (value: number) => void): Generator<number, BacktestResult, void> {
   const initialCapital = config.executionConfig.initialCapital;
   let cash = initialCapital;
   let peak = cash;
@@ -211,7 +212,7 @@ export function runBacktest(config: BacktestConfig, inputs: SymbolInput[], onPro
   let invalidBars = 0;
   let riskEvents = 0;
   let processed = 0;
-  const totalBars = Math.max(1, inputs.reduce((sum, input) => sum + input.candles.length, 0));
+  let nextYield = 0;
   const trades: Trade[] = [];
   const signals: Array<Signal & { symbol: SymbolRef }> = [];
   const equityByTime = new Map<number, EquityPoint>();
@@ -222,7 +223,8 @@ export function runBacktest(config: BacktestConfig, inputs: SymbolInput[], onPro
     const provisionalStop = existing ? stopPrice(config, existing) : candle.close * .9;
     const riskDistance = Math.max(Number.EPSILON, candle.close - provisionalStop);
     const amount = sizing.type === "fixed_amount" ? sizing.value : sizing.type === "fixed_percent" ? cash * sizing.value / 100 : Math.min(cash, cash * sizing.value / 100 * candle.close / riskDistance);
-    const cappedAmount = Math.max(0, Math.min(cash, amount));
+    const costs = (config.executionConfig.feePercent + config.executionConfig.slippagePercent + config.executionConfig.buyTaxPercent) / 100;
+    const cappedAmount = Math.max(0, Math.min(cash / (1 + costs), amount));
     if (!cappedAmount) return;
     const quantity = cappedAmount / candle.close;
     const entryFee = cappedAmount * config.executionConfig.feePercent / 100;
@@ -242,114 +244,138 @@ export function runBacktest(config: BacktestConfig, inputs: SymbolInput[], onPro
       signals.push({ symbol, ...signal });
     } else {
       const trade: Trade = { symbol, entryTime: candle.time, entryPrice: candle.close, quantity, fees: entryFee, slippageCost: entrySlip, taxCost: entryTax, adds: [] };
-      activeTrades.set(`${symbol.chain}:${symbol.pairId}`, { trade, entryIndex: index, entries: 1, impulse });
+      activeTrades.set(symbolKey(symbol), { trade, entryIndex: index, entries: 1, impulse });
       signals.push({ symbol, time: candle.time, price: candle.close, type: "entry", quantity, reason: { impulse, conditionGroup: config.entryConditionGroup } });
     }
   };
 
-  for (const input of inputs) {
-    const normalized = normalizeCandles(input.candles, config.interval);
-    syntheticBars += normalized.syntheticBars;
-    invalidBars += normalized.invalidBars;
-    const candles = normalized.candles;
-    const key = `${input.symbol.chain}:${input.symbol.pairId}`;
-    let entryWasMet = false;
-    let addWasMet = false;
-    for (let index = 0; index < candles.length; index++) {
-      const candle = candles[index];
-      const history = candles.slice(0, index + 1);
-      const impulse = detectImpulse(history, config.impulseCondition);
-      let active = activeTrades.get(key);
-      if (active) {
-        const stop = stopPrice(config, active);
-        const target = targetPrice(config, active, stop);
-        const invalidated = evaluateConditionGroup(config.invalidationConditionGroup, history, active.impulse);
-        let exit: { price: number; type: Signal["type"] } | undefined;
-        if (candle.open <= stop || candle.low <= stop) exit = { price: candle.open <= stop ? candle.open : stop, type: "stop_loss" };
-        else if (invalidated) exit = { price: candle.close, type: "invalidation" };
-        else if (target > active.trade.entryPrice && (candle.open >= target || candle.high >= target)) exit = { price: candle.open >= target ? candle.open : target, type: "take_profit" };
-        else if (config.exitConfig.maxHoldingBars && index - active.entryIndex >= config.exitConfig.maxHoldingBars) exit = { price: candle.close, type: "timeout" };
-        if (exit) {
-          const trade = active.trade;
-          const proceeds = trade.quantity * exit.price;
-          const exitFee = proceeds * config.executionConfig.feePercent / 100;
-          const exitSlip = proceeds * config.executionConfig.slippagePercent / 100;
-          const exitTax = proceeds * config.executionConfig.sellTaxPercent / 100;
-          trade.fees += exitFee;
-          trade.slippageCost += exitSlip;
-          trade.taxCost += exitTax;
-          trade.exitTime = candle.time;
-          trade.exitPrice = exit.price;
-          trade.grossPnl = (exit.price - trade.entryPrice) * trade.quantity;
-          trade.netPnl = trade.grossPnl - trade.fees - trade.slippageCost - trade.taxCost;
-          trade.exitReason = exit.type;
-          trade.holdingBars = index - active.entryIndex;
-          cash += proceeds - exitFee - exitSlip - exitTax;
-          signals.push({ symbol: input.symbol, time: candle.time, price: exit.price, type: exit.type, quantity: trade.quantity, reason: { priority: exit.type, stop, target } });
-          trades.push(trade);
-          activeTrades.delete(key);
-          active = undefined;
-          entryWasMet = true;
-        }
-      }
+  const states = [...new Map(inputs.map(input => [symbolKey(input.symbol), input])).values()]
+    .sort((a,b) => symbolKey(a.symbol) < symbolKey(b.symbol) ? -1 : 1)
+    .map(input => {
+      const normalized = normalizeCandles(input.candles, config.interval);
+      syntheticBars += normalized.syntheticBars; invalidBars += normalized.invalidBars;
+      return { ...input, candles: normalized.candles, index: 0, entryWasMet: false, addWasMet: false, traded: false, lastPrice: 0 };
+    });
+  const normalizedTotal = Math.max(1, states.reduce((sum,s) => sum+s.candles.length,0));
+  const byKey = new Map(states.map(s => [symbolKey(s.symbol),s]));
+  const close = (state: typeof states[number], candle: Candle, price: number, type: Signal["type"], reason: Record<string,unknown>) => {
+    const key = symbolKey(state.symbol), active = activeTrades.get(key);
+    if (!active) return;
+    const trade = active.trade, proceeds = trade.quantity * price;
+    const fee = proceeds * config.executionConfig.feePercent / 100;
+    const slip = proceeds * config.executionConfig.slippagePercent / 100;
+    const tax = proceeds * config.executionConfig.sellTaxPercent / 100;
+    trade.fees += fee; trade.slippageCost += slip; trade.taxCost += tax;
+    trade.exitTime = candle.time; trade.exitPrice = price;
+    trade.grossPnl = (price - trade.entryPrice) * trade.quantity;
+    trade.netPnl = trade.grossPnl - trade.fees - trade.slippageCost - trade.taxCost;
+    trade.exitReason = type; trade.holdingBars = state.index - active.entryIndex;
+    cash += proceeds - fee - slip - tax;
+    signals.push({symbol:state.symbol,time:candle.time,price,type,quantity:trade.quantity,reason});
+    trades.push(trade); activeTrades.delete(key); state.traded = true; state.entryWasMet = true;
+  };
 
+  // A k-way merge retains independent per-pool indicator history and one shared account.
+  while (true) {
+    let time = Infinity;
+    for (const state of states) time = Math.min(time, state.candles[state.index]?.time ?? Infinity);
+    if (!Number.isFinite(time)) break;
+    const batch = states.filter(state => state.candles[state.index]?.time === time);
+    const contexts = batch.map(state => {
+      const candle = state.candles[state.index];
+      state.lastPrice = candle.close;
+      const history = state.candles.slice(0,state.index+1);
+      return {state,candle,history,impulse:detectImpulse(history,config.impulseCondition)};
+    });
+    // Exit priority within each pool remains stop > invalidation > target > timeout > end.
+    for (const {state,candle,history} of contexts) {
+      const active = activeTrades.get(symbolKey(state.symbol));
+      if (!active) continue;
+      const stop = stopPrice(config,active), target = targetPrice(config,active,stop);
+      let exit: {price:number;type:Signal["type"]} | undefined;
+      if (candle.open <= stop || candle.low <= stop) exit = {price:candle.open <= stop ? candle.open : stop,type:"stop_loss"};
+      else if (evaluateConditionGroup(config.invalidationConditionGroup,history,active.impulse)) exit = {price:candle.close,type:"invalidation"};
+      else if (target > active.trade.entryPrice && (candle.open >= target || candle.high >= target)) exit = {price:candle.open >= target ? candle.open : target,type:"take_profit"};
+      else if (config.exitConfig.maxHoldingBars && state.index-active.entryIndex >= config.exitConfig.maxHoldingBars) exit = {price:candle.close,type:"timeout"};
+      else if (config.exitConfig.closeAtEnd && state.index === state.candles.length-1) exit = {price:candle.close,type:"end_of_backtest"};
+      if (exit) close(state,candle,exit.price,exit.type,{priority:exit.type,stop,target});
+    }
+    for (const {state,candle,history,impulse} of contexts) {
+      const active = activeTrades.get(symbolKey(state.symbol));
       if (active) {
-        const addNow = evaluateConditionGroup(config.addConditionGroup ?? config.entryConditionGroup, history, active.impulse);
-        if (config.positionConfig.mode === "pyramiding" && active.entries < config.positionConfig.maxEntries && addNow && !addWasMet) enter(input.symbol, candle, index, active.impulse, active);
-        addWasMet = addNow;
+        const addNow = evaluateConditionGroup(config.addConditionGroup ?? config.entryConditionGroup,history,active.impulse);
+        if (config.positionConfig.mode === "pyramiding" && active.entries < config.positionConfig.maxEntries && addNow && !state.addWasMet)
+          enter(state.symbol,candle,state.index,active.impulse,active);
+        state.addWasMet = addNow;
       } else {
-        const entryNow = !!impulse && evaluateConditionGroup(config.entryConditionGroup, history, impulse);
-        const alreadyTraded = trades.some(trade => trade.symbol.chain === input.symbol.chain && trade.symbol.pairId === input.symbol.pairId);
-        if (entryNow && !entryWasMet && (config.positionConfig.allowReentry || !alreadyTraded) && activeTrades.size < config.positionConfig.maxConcurrentPositions) enter(input.symbol, candle, index, impulse!);
-        entryWasMet = entryNow;
-        addWasMet = false;
+        const entryNow = !!impulse && evaluateConditionGroup(config.entryConditionGroup,history,impulse);
+        if (entryNow && !state.entryWasMet && (config.positionConfig.allowReentry || !state.traded) && activeTrades.size < config.positionConfig.maxConcurrentPositions)
+          enter(state.symbol,candle,state.index,impulse!);
+        state.entryWasMet = entryNow; state.addWasMet = false;
       }
-
-      const openValue = [...activeTrades.values()].reduce((sum, item) => sum + item.trade.entryPrice * item.trade.quantity, 0);
-      const unrealized = [...activeTrades.values()].reduce((sum, item) => sum + (candle.close - item.trade.entryPrice) * item.trade.quantity, 0);
-      const equityValue = cash + openValue + unrealized;
-      peak = Math.max(peak, equityValue);
-      const drawdown = peak - equityValue;
-      maxDrawdown = Math.max(maxDrawdown, drawdown);
-      maxDrawdownPercent = Math.max(maxDrawdownPercent, peak ? drawdown / peak * 100 : 0);
-      equityByTime.set(candle.time, { time: candle.time, equity: equityValue, cash, unrealized });
-      processed++;
-      onProgress?.(Math.min(1, processed / totalBars));
+      // Preserve the prior rule allowing a first entry on the last bar, then close it.
+      if (config.exitConfig.closeAtEnd && state.index === state.candles.length-1)
+        close(state,candle,candle.close,"end_of_backtest",{closeAtEnd:true});
+      state.index++; processed++;
     }
-    const open = activeTrades.get(key);
-    if (open && config.exitConfig.closeAtEnd && candles.length) {
-      const last = candles.at(-1)!;
-      const proceeds = open.trade.quantity * last.close;
-      const exitFee = proceeds * config.executionConfig.feePercent / 100;
-      const exitSlip = proceeds * config.executionConfig.slippagePercent / 100;
-      const exitTax = proceeds * config.executionConfig.sellTaxPercent / 100;
-      open.trade.fees += exitFee;
-      open.trade.slippageCost += exitSlip;
-      open.trade.taxCost += exitTax;
-      open.trade.exitTime = last.time;
-      open.trade.exitPrice = last.close;
-      open.trade.grossPnl = (last.close - open.trade.entryPrice) * open.trade.quantity;
-      open.trade.netPnl = open.trade.grossPnl - open.trade.fees - open.trade.slippageCost - open.trade.taxCost;
-      open.trade.exitReason = "end_of_backtest";
-      open.trade.holdingBars = candles.length - 1 - open.entryIndex;
-      cash += proceeds - exitFee - exitSlip - exitTax;
-      signals.push({ symbol: input.symbol, time: last.time, price: last.close, type: "end_of_backtest", quantity: open.trade.quantity, reason: { closeAtEnd: true } });
-      trades.push(open.trade);
-      activeTrades.delete(key);
+    let openValue = 0, unrealized = 0;
+    for (const [key,active] of activeTrades) {
+      const price = byKey.get(key)!.lastPrice;
+      openValue += price * active.trade.quantity;
+      unrealized += (price-active.trade.entryPrice)*active.trade.quantity;
     }
+    const equityValue = cash + openValue;
+    peak = Math.max(peak,equityValue);
+    maxDrawdown = Math.max(maxDrawdown,peak-equityValue);
+    maxDrawdownPercent = Math.max(maxDrawdownPercent,peak ? (peak-equityValue)/peak*100 : 0);
+    equityByTime.set(time,{time,equity:equityValue,cash,unrealized});
+    onProgress?.(processed/normalizedTotal);
+    if (processed >= nextYield) { nextYield=processed+512; yield processed/normalizedTotal; }
   }
-
-  if (activeTrades.size) riskEvents += activeTrades.size;
-  const wins = trades.filter(trade => (trade.netPnl ?? 0) > 0);
-  const losses = trades.filter(trade => (trade.netPnl ?? 0) <= 0);
-  const netPnl = trades.reduce((sum, trade) => sum + (trade.netPnl ?? 0), 0);
-  const grossProfit = wins.reduce((sum, trade) => sum + (trade.netPnl ?? 0), 0);
-  const grossLoss = Math.abs(losses.reduce((sum, trade) => sum + (trade.netPnl ?? 0), 0));
-  const ids = [...new Set(trades.map(trade => `${trade.symbol.chain}:${trade.symbol.ca}:${trade.symbol.pairId}`))];
-  const bySymbol = ids.map(id => {
-    const symbolTrades = trades.filter(trade => `${trade.symbol.chain}:${trade.symbol.ca}:${trade.symbol.pairId}` === id);
-    return { symbol: symbolTrades[0].symbol, trades: symbolTrades.length, netPnl: symbolTrades.reduce((sum, trade) => sum + (trade.netPnl ?? 0), 0), winRate: symbolTrades.filter(trade => (trade.netPnl ?? 0) > 0).length / symbolTrades.length };
+  const openPositions = [...activeTrades].map(([key,{trade}]) => {
+    const lastPrice = byKey.get(key)!.lastPrice;
+    const fees = trade.fees + trade.slippageCost + trade.taxCost;
+    return {symbol:trade.symbol,quantity:trade.quantity,lastPrice,fees,netPnl:(lastPrice-trade.entryPrice)*trade.quantity-fees};
   });
-  const report: BacktestReport = { totalTrades: trades.length, wins: wins.length, losses: losses.length, winRate: trades.length ? wins.length / trades.length : 0, grossPnl: trades.reduce((sum, trade) => sum + (trade.grossPnl ?? 0), 0), netPnl, returnPercent: initialCapital ? netPnl / initialCapital * 100 : 0, profitFactor: grossLoss ? grossProfit / grossLoss : grossProfit ? Infinity : 0, maxDrawdown, maxDrawdownPercent, maxConsecutiveLosses: consecutiveLosses(trades), averageHoldingBars: trades.length ? trades.reduce((sum, trade) => sum + (trade.holdingBars ?? 0), 0) / trades.length : 0, dataQuality: { syntheticBars, invalidBars, riskEvents }, bySymbol };
-  return { report, trades, signals, equity: [...equityByTime.values()].sort((a, b) => a.time - b.time) };
+  for (const [key,{trade}] of activeTrades) {
+    const state = byKey.get(key)!;
+    signals.push({symbol:trade.symbol,time:state.candles.at(-1)!.time,price:state.lastPrice,type:"risk_event",quantity:trade.quantity,reason:{message:"数据结束时仍持仓，浮动盈亏不含未来卖出成本"}});
+  }
+  riskEvents += activeTrades.size;
+  const wins = trades.filter(t => (t.netPnl ?? 0)>0), losses = trades.filter(t => (t.netPnl ?? 0)<=0);
+  const netPnl = trades.reduce((sum,t)=>sum+(t.netPnl ?? 0),0);
+  const unrealizedPnl = openPositions.reduce((sum,p)=>sum+p.netPnl,0);
+  const grossProfit = wins.reduce((sum,t)=>sum+(t.netPnl ?? 0),0);
+  const grossLoss = Math.abs(losses.reduce((sum,t)=>sum+(t.netPnl ?? 0),0));
+  const bySymbol = states.map(state => {
+    const closed = trades.filter(t=>symbolKey(t.symbol)===symbolKey(state.symbol));
+    return {symbol:state.symbol,trades:closed.length,netPnl:closed.reduce((sum,t)=>sum+(t.netPnl ?? 0),0),winRate:closed.length ? closed.filter(t=>(t.netPnl ?? 0)>0).length/closed.length : 0};
+  });
+  const equity = [...equityByTime.values()];
+  const report: BacktestReport = {
+    engineVersion:"portfolio-2",openPositions,unrealizedPnl,totalNetPnl:netPnl+unrealizedPnl,
+    finalEquity:equity.at(-1)?.equity ?? initialCapital,
+    totalTrades:trades.length,wins:wins.length,losses:losses.length,winRate:trades.length ? wins.length/trades.length : 0,
+    grossPnl:trades.reduce((sum,t)=>sum+(t.grossPnl ?? 0),0),netPnl,returnPercent:(netPnl+unrealizedPnl)/initialCapital*100,
+    profitFactor:grossLoss ? grossProfit/grossLoss : grossProfit ? Infinity : 0,
+    maxDrawdown,maxDrawdownPercent,maxConsecutiveLosses:consecutiveLosses(trades),
+    averageHoldingBars:trades.length ? trades.reduce((sum,t)=>sum+(t.holdingBars ?? 0),0)/trades.length : 0,
+    dataQuality:{syntheticBars,invalidBars,riskEvents},bySymbol
+  };
+  return {report,trades:[...trades,...[...activeTrades.values()].map(a=>a.trade)],signals,equity};
+}
+
+export function runBacktest(config: BacktestConfig, inputs: SymbolInput[], onProgress?: (value:number)=>void): BacktestResult {
+  const steps=backtestSteps(config,inputs,onProgress);
+  let step=steps.next();
+  while(!step.done) step=steps.next();
+  return step.value;
+}
+
+// Let BullMQ renew its lock and flush throttled progress while large portfolios run.
+export async function runBacktestAsync(config: BacktestConfig, inputs: SymbolInput[], onProgress?: (value:number)=>void): Promise<BacktestResult> {
+  const steps=backtestSteps(config,inputs,onProgress);
+  let step=steps.next();
+  while(!step.done) { await new Promise(resolve=>setTimeout(resolve,0)); step=steps.next(); }
+  return step.value;
 }

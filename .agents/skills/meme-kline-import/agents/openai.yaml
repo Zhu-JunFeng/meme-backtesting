@@ -1,0 +1,6 @@
+interface:
+  display_name: "Meme K线导入"
+  short_description: "从信号明细批量抓取并写入 XXYY 市值和价格 K 线"
+  default_prompt: "Use $meme-kline-import to preview and import K-line data from this signal workbook."
+policy:
+  allow_implicit_invocation: true
