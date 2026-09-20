@@ -32,7 +32,7 @@ jobs:
             log=$(docker inspect -f '{{.LogPath}}' "$id")
             if [ -n "$log" ] && [ -f "$log" ]; then du -h "$log"; fi
           done
-          docker exec -i meme-backtesting-api node --input-type=module <<'JS'
+          docker exec -i -w /app/apps/api meme-backtesting-api node --input-type=module <<'JS'
           import pg from 'pg';
           const pool=new pg.Pool({connectionString:process.env.DATABASE_URL});
           try {
