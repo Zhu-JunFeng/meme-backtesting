@@ -3,10 +3,10 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: 'audit只读；trim-journal-100m永久删除旧系统日志并设置100MiB上限'
+        description: 'audit只读；trim-journal-100m清理日志；cleanup-approved仅清理已审核的旧镜像及转储'
         type: choice
         default: audit
-        options: [audit, trim-journal-100m]
+        options: [audit, trim-journal-100m, cleanup-approved]
 permissions:
   contents: read
 jobs:
@@ -30,10 +30,16 @@ jobs:
           if [ "$OPERATION" = trim-journal-100m ]; then
             scp -i ~/.ssh/audit_key deploy/journald-storage.conf "$DEPLOY_USER@$DEPLOY_HOST:/tmp/meme-journald-storage.conf"
           fi
+          if [ "$OPERATION" = cleanup-approved ]; then
+            scp -i ~/.ssh/audit_key deploy/cleanup-approved-storage.sh "$DEPLOY_USER@$DEPLOY_HOST:/tmp/meme-cleanup-approved-storage.sh"
+          fi
           ssh -i ~/.ssh/audit_key "$DEPLOY_USER@$DEPLOY_HOST" "sh -s -- '$OPERATION'" > storage-audit.txt <<'REMOTE'
           set -eu
           case "$1" in
             audit|'') ;;
+            cleanup-approved)
+              sh /tmp/meme-cleanup-approved-storage.sh
+              ;;
             trim-journal-100m)
               journalctl --disk-usage
               df -h /
