@@ -12,6 +12,20 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: meme_runtime_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:test@127.0.0.1:5432/meme_runtime_test
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -24,7 +38,8 @@ jobs:
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm --filter @meme/domain build
       - run: pnpm --filter @meme/engine build
-      - run: pnpm --filter @meme/engine test
+      - run: pnpm --filter @meme/runtime build
+      - run: pnpm test
       - run: pnpm --filter @meme/api build
       - run: pnpm --filter @meme/worker build
       - run: pnpm --filter @meme/web build
@@ -63,4 +78,4 @@ jobs:
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
         run: |
           printf 'DATABASE_URL=%s\nREDIS_HOST=127.0.0.1\nREDIS_PORT=6379\nREDIS_PASSWORD=%s\nPORT=3000\n' "$DATABASE_URL" "$REDIS_PASSWORD" | ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" "cat > '$DEPLOY_PATH/deploy/.env'"
-          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" "cd '$DEPLOY_PATH' && docker run --rm --network host --env-file deploy/.env -v \"\$PWD:/app\" -w /app postgres:18-alpine sh -lc 'for migration in apps/api/migrations/*.sql; do psql \"\$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"\$migration\"; done' && docker build -f deploy/Dockerfile.api -t meme-backtesting-api . && docker build -f deploy/Dockerfile.worker -t meme-backtesting-worker . && docker build -f deploy/Dockerfile.web -t meme-backtesting-web . && docker rm -f meme-backtesting-api meme-backtesting-worker meme-backtesting-web 2>/dev/null || true; docker run -d --name meme-backtesting-api --restart unless-stopped --network host --env-file deploy/.env meme-backtesting-api:latest; docker run -d --name meme-backtesting-worker --restart unless-stopped --network host --env-file deploy/.env meme-backtesting-worker:latest; docker run -d --name meme-backtesting-web --restart unless-stopped --network host meme-backtesting-web:latest"
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" "cd '$DEPLOY_PATH' && sh deploy/release.sh"

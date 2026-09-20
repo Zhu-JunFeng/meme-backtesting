@@ -1,4 +1,5 @@
 import type { BacktestConfig, BacktestReport, Candle, Condition, ConditionGroup, EquityPoint, ImpulseConfig, Signal, SymbolRef, Trade } from "@meme/domain";
+export * from './resumable.js';
 
 const finite = (n: number) => Number.isFinite(n);
 const symbolKey = (s: SymbolRef) => `${s.chain}:${s.ca}:${s.pairId}`;
@@ -180,14 +181,14 @@ export interface SymbolInput { symbol: SymbolRef; candles: Candle[] }
 export interface BacktestResult { report: BacktestReport; trades: Trade[]; signals: Array<Signal & { symbol: SymbolRef }>; equity: EquityPoint[] }
 interface ActiveTrade { trade: Trade; entryIndex: number; entries: number; impulse: Impulse }
 
-function stopPrice(config: BacktestConfig, active: ActiveTrade) {
+export function stopPrice(config: BacktestConfig, active: ActiveTrade) {
   const stop = config.exitConfig.stopLoss;
   if (stop.type === "percent") return active.trade.entryPrice * (1 - stop.value / 100);
   if (stop.type === "swing_low") return active.impulse.low * (1 - stop.bufferPercent / 100);
   return (active.impulse.high - (active.impulse.high - active.impulse.low) * stop.ratio) * (1 - (stop.bufferPercent ?? 0) / 100);
 }
 
-function targetPrice(config: BacktestConfig, active: ActiveTrade, stop: number) {
+export function targetPrice(config: BacktestConfig, active: ActiveTrade, stop: number) {
   const target = config.exitConfig.takeProfit;
   if (target.type === "percent") return active.trade.entryPrice * (1 + target.value / 100);
   if (target.type === "risk_reward") return active.trade.entryPrice + Math.max(0, active.trade.entryPrice - stop) * target.ratio;

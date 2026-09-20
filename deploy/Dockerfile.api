@@ -6,6 +6,7 @@ COPY apps ./apps
 COPY packages ./packages
 COPY scripts ./scripts
 RUN pnpm install --frozen-lockfile --ignore-scripts
-RUN pnpm --filter @meme/domain build && pnpm --filter @meme/engine build && pnpm --filter @meme/api build
+RUN pnpm --filter @meme/api... build
 EXPOSE 3000
-CMD ["pnpm", "--filter", "@meme/api", "dev"]
+ENV NODE_ENV=production
+CMD ["node", "apps/api/dist/main.js"]

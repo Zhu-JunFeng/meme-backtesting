@@ -6,6 +6,7 @@ import { api } from "../api";
 import { useCaSelection } from "../composables/useCaSelection";
 import CaSelector from "./CaSelector.vue";
 import RunDetail from "./RunDetail.vue";
+import RunActions from "./RunActions.vue";
 
 const templates = ref<any[]>([]);
 const versions = ref<any[]>([]);
@@ -30,7 +31,7 @@ const strategySummary = computed(() => {
 
 function countActive(group:any): number { return group?.conditions?.filter((item:any) => item.enabled !== false).reduce((sum:number,item:any) => sum + (item.conditions ? countActive(item) : 1), 0) || 0; }
 function statusColor(status:string) { return status === "completed" ? "green" : status === "failed" ? "red" : status === "running" ? "blue" : status === "cancelled" ? "default" : "gold"; }
-function statusText(status:string) { return ({pending:"等待中",running:"运行中",completed:"已完成",failed:"失败",cancelled:"已取消"} as any)[status] || status; }
+function statusText(status:string) { return ({pending:"等待中",running:"运行中",completed:"已完成",failed:"失败",stopped:"已停止",stopping:"停止中",cancelled:"已取消"} as any)[status] || status; }
 
 async function refreshRuns() { try { runs.value = (await api.get("/backtests")).data; } catch { message.error("任务列表加载失败，请稍后刷新"); } }
 async function loadVersions() {
@@ -86,7 +87,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
       <footer class="launch-footer"><a-input v-model:value="form.name" placeholder="任务名称" /><a-button type="primary" size="large" :loading="loading" :disabled="selectionBlocked || !selectedCas.length" @click="create"><PlayCircleOutlined />执行回测</a-button></footer>
     </section>
 
-    <section class="history-panel"><div class="history-heading"><div><span class="eyebrow">运行记录</span><h2>历史任务</h2></div><ClockCircleOutlined /></div><div v-if="runs.length" class="run-list"><button v-for="run in runs" :key="run.id" class="run-row" :class="{active:activeRun?.id===run.id}" @click="openRun(run)"><div><strong>{{ run.name }}</strong><small>{{ run.strategyName ? `${run.strategyName} · v${run.strategyVersion}` : '旧版配置快照' }}</small></div><div class="run-status"><a-tag :color="statusColor(run.status)">{{ statusText(run.status) }}</a-tag><span v-if="['pending','running'].includes(run.status)">{{ Math.round(Number(run.progress)*100) }}%</span></div></button></div><a-empty v-else description="还没有回测任务" /></section>
+    <section class="history-panel"><div class="history-heading"><div><span class="eyebrow">运行记录</span><h2>历史任务</h2></div><ClockCircleOutlined /></div><div v-if="runs.length" class="run-list"><div v-for="run in runs" :key="run.id" class="run-row" :class="{active:activeRun?.id===run.id}" role="button" tabindex="0" @keydown.enter.self="openRun(run)" @click="openRun(run)"><div><strong>{{ run.name }}</strong><small>{{ run.strategyName ? `${run.strategyName} · v${run.strategyVersion}` : '旧版配置快照' }}</small></div><div class="run-status"><a-tag :color="statusColor(run.status)">{{ statusText(run.status) }}</a-tag><span v-if="['pending','running'].includes(run.status)">{{ Math.round(Number(run.progress)*100) }}%</span></div><RunActions :run="run" @changed="refreshRuns" /></div></div><a-empty v-else description="还没有回测任务" /></section>
 
 
   </div>

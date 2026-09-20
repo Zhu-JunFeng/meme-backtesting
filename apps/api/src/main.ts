@@ -1,4 +1,5 @@
 import "reflect-metadata";
+import { locate } from './locator.js';
 import { marketCas, resolveDataset, datasetCounts, resultRows, runCas } from "./datasets.js";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -6,6 +7,7 @@ import { NestFactory } from "@nestjs/core";
 import { Module, Controller, Get, Post, Patch, Param, Body, Query, Injectable, NotFoundException, BadRequestException, ConflictException, Inject } from "@nestjs/common";
 import { Pool, type PoolClient } from "pg";
 import { Queue } from "bullmq";
+import { createQueue, queuePrefix, RUNTIME_VERSION, enqueue, reconcile, actions, stopRun, retryRun, rerun } from '@meme/runtime';
 import type { BacktestConfig, Condition, ConditionDefinition, ConditionGroup, CreateBacktestRequest, DatasetConfig, StrategyConfig } from "@meme/domain";
 
 type Validator = ((value: unknown) => boolean) & { errors?: unknown };
@@ -20,7 +22,11 @@ const checksum = (value: unknown) => createHash("sha256").update(JSON.stringify(
 @Injectable()
 export class AppService {
   readonly pool = new Pool({ connectionString: process.env.DATABASE_URL ?? "postgresql://postgres@localhost:5432/backtesting" });
-  readonly queue = new Queue("backtest", { connection: { host: process.env.REDIS_HOST ?? "localhost", port: Number(process.env.REDIS_PORT ?? 6379), password: process.env.REDIS_PASSWORD } });
+  readonly queue = createQueue();
+  private recoveryTimer?:ReturnType<typeof setInterval>;
+  private reconciling=false;
+  onModuleInit(){this.recoveryTimer=setInterval(async()=>{if(this.reconciling)return;this.reconciling=true;try{await reconcile(this.pool,this.queue);}catch(e){console.error('任务协调失败',String(e));}finally{this.reconciling=false;}},5000);}
+  async onModuleDestroy(){clearInterval(this.recoveryTimer);await this.queue.close();await this.pool.end();}
 
   async projects() {
     const { rows } = await this.pool.query('SELECT chain,ca,pair_id AS "pairId",MIN(open_time) AS "minTime",MAX(open_time) AS "maxTime",array_agg(DISTINCT interval ORDER BY interval) AS intervals,array_agg(DISTINCT type ORDER BY type) AS types FROM public.meme_kline WHERE valid IS DISTINCT FROM false GROUP BY chain,ca,pair_id ORDER BY chain,ca');
@@ -29,7 +35,8 @@ export class AppService {
 
   async candles(query: Record<string, string>) {
     if (query.runId) {
-      const config = (await this.backtest(query.runId)).config_json as BacktestConfig;
+      const run=await this.backtest(query.runId);
+      const config = run.config_json as BacktestConfig;
       const symbol = config.symbols.find(s=>s.chain===query.chain && s.ca===query.ca && s.pairId===query.pairId);
       if (!symbol) throw new BadRequestException("交易池不属于该任务");
       const snapshot=config.pools?.find(s=>s.chain===symbol.chain && s.ca===symbol.ca && s.pairId===symbol.pairId);
@@ -37,6 +44,7 @@ export class AppService {
       query={...query,interval:config.interval,type:config.valueType,
         from:String(Math.max(Number(query.from)||0,snapshot?.startTime ?? (config.startTime ? Date.parse(config.startTime):0))),
         to:String(Math.min(Number(query.to)||Date.now(),snapshot?.endTime ?? (config.endTime ? Date.parse(config.endTime):Date.now())))};
+      if(run.input_ready){const rows=(await this.pool.query(`SELECT b FROM backtest_input_chunks c CROSS JOIN LATERAL jsonb_array_elements(c.candles_json) b WHERE c.run_id=$1 AND c.pool_key=$2 AND (b->>'time')::bigint BETWEEN $3 AND $4 ORDER BY (b->>'time')::bigint DESC LIMIT $5`,[run.id,`${symbol.chain}:${symbol.ca}:${symbol.pairId}`,Number(query.from),Number(query.to),Math.min(5000,Math.max(1,Number(query.limit)||5000))])).rows;return rows.reverse().map(r=>r.b);}
     }
     const params = [query.chain, query.ca, query.pairId, query.interval ?? "30s", query.type ?? "mcap", query.from ? Number(query.from) : 0, query.to ? Number(query.to) : Date.now()];
     const limit=Math.min(5000,Math.max(1,Number(query.limit)||5000));
@@ -179,20 +187,20 @@ export class AppService {
     strategy.executionConfig = { ...strategy.executionConfig, ...overrides };
     await this.validateStrategy(strategy);
     const config: BacktestConfig = { name: request.name.trim(), strategyTemplateId: version.templateId, strategyVersionId: version.id, ...dataset, ...strategy };
-    const { rows } = await this.pool.query("INSERT INTO backtest_runs(name,status,strategy_template_id,strategy_version_id,dataset_json,config_json,progress) VALUES($1,'pending',$2,$3,$4,$5,0) RETURNING id,status,progress", [config.name, version.templateId, version.id, JSON.stringify(dataset), JSON.stringify(config)]);
-    try { await this.queue.add("run", { runId: rows[0].id }, { jobId: rows[0].id, removeOnComplete: 100, removeOnFail: 100 }); }
+    const { rows } = await this.pool.query("INSERT INTO backtest_runs(name,status,strategy_template_id,strategy_version_id,dataset_json,config_json,progress,runtime_version,queue_scope,phase) VALUES($1,'pending',$2,$3,$4,$5,0,$6,$7,'freezing') RETURNING id,status,progress,dispatch_no", [config.name, version.templateId, version.id, JSON.stringify(dataset), JSON.stringify(config),RUNTIME_VERSION,queuePrefix()]);
+    try { await enqueue(this.queue,rows[0]); }
     catch (error) { await this.pool.query("UPDATE backtest_runs SET status='failed',error_message=$2,finished_at=now() WHERE id=$1", [rows[0].id, `队列提交失败：${String(error)}`]); throw new ConflictException("任务已保存，但提交执行队列失败"); }
     return rows[0];
   }
 
   async listBacktests() {
-    return (await this.pool.query('SELECT r.id,r.name,r.status,r.progress,r.created_at AS "createdAt",r.finished_at AS "finishedAt",r.strategy_version_id AS "strategyVersionId",t.name AS "strategyName",v.version AS "strategyVersion" FROM backtest_runs r LEFT JOIN backtest_strategy_templates t ON t.id=r.strategy_template_id LEFT JOIN backtest_strategy_versions v ON v.id=r.strategy_version_id ORDER BY r.created_at DESC')).rows;
+    return (await this.pool.query('SELECT r.id,r.name,r.status,r.progress,r.phase,r.runtime_version,r.queue_scope,r.heartbeat_at,r.checkpoint_at,r.recovery_count,r.created_at AS "createdAt",r.finished_at AS "finishedAt",r.strategy_version_id AS "strategyVersionId",t.name AS "strategyName",v.version AS "strategyVersion" FROM backtest_runs r LEFT JOIN backtest_strategy_templates t ON t.id=r.strategy_template_id LEFT JOIN backtest_strategy_versions v ON v.id=r.strategy_version_id ORDER BY r.created_at DESC')).rows.map(r=>({...r,actions:actions(r)}));
   }
 
   async backtest(id: string) {
     const result = await this.pool.query('SELECT r.*,t.name AS strategy_name,v.version AS strategy_version FROM backtest_runs r LEFT JOIN backtest_strategy_templates t ON t.id=r.strategy_template_id LEFT JOIN backtest_strategy_versions v ON v.id=r.strategy_version_id WHERE r.id=$1', [id]);
     if (!result.rowCount) throw new NotFoundException("回测任务不存在");
-    return result.rows[0];
+    return {...result.rows[0],actions:actions(result.rows[0])};
   }
 }
 
@@ -219,13 +227,17 @@ class AppController {
   @Get("backtests") list() { return this.service.listBacktests(); }
   @Get("backtests/:id") one(@Param("id") id: string) { return this.service.backtest(id); }
   @Post("backtests") create(@Body() body: CreateBacktestRequest) { return this.service.createBacktest(body); }
-  @Post("backtests/:id/cancel") async cancel(@Param("id") id: string) { await this.service.pool.query("UPDATE backtest_runs SET status='cancelled', finished_at=now() WHERE id=$1 AND status IN ('pending','running')", [id]); return this.service.backtest(id); }
+  @Post("backtests/:id/stop") async stop(@Param("id") id:string){const run=await this.service.backtest(id);if(run.runtime_version!==RUNTIME_VERSION || run.queue_scope!==queuePrefix())throw new ConflictException('旧执行器或其他环境的任务不能在此安全停止，请先盘点执行器');await stopRun(this.service.pool,id);return this.service.backtest(id);}
+  @Post("backtests/:id/cancel") cancel(@Param("id") id:string){return this.stop(id);}
+  @Post("backtests/:id/retry") async retry(@Param("id") id:string){const run=await this.service.backtest(id);if(!run.actions.retry && !['pending','running'].includes(run.status))throw new ConflictException('该任务不支持断点重试，请重新回测');await retryRun(this.service.pool,this.service.queue,id);return this.service.backtest(id);}
+  @Post("backtests/:id/rerun") async rerun(@Param("id") id:string,@Body() body:{requestId:string}){if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body?.requestId ?? ''))throw new BadRequestException('需要 requestId 作为幂等标识');return rerun(this.service.pool,this.service.queue,id,body.requestId);}
   @Get("backtests/:id/report") async report(@Param("id") id: string) { const result = await this.service.pool.query("SELECT report_json FROM backtest_reports WHERE run_id=$1", [id]); return result.rows[0]?.report_json ?? null; }
   @Get("backtests/:id/trades") trades(@Param("id") id:string,@Query() q:Record<string,string>) { return resultRows(this.service.pool,id,"trades",q); }
   @Get("backtests/:id/signals") signals(@Param("id") id:string,@Query() q:Record<string,string>) { return resultRows(this.service.pool,id,"signals",q); }
   @Get("backtests/:id/cas") async runCas(@Param("id") id:string,@Query() q:Record<string,string>) { return runCas(this.service.pool,await this.service.backtest(id),q); }
   @Get("backtests/:id/ca") async runCa(@Param("id") id:string,@Query() q:Record<string,string>) { return runCas(this.service.pool,await this.service.backtest(id),q,true); }
   @Get("backtests/:id/equity") async equity(@Param("id") id:string) { return (await this.service.pool.query("SELECT time,equity,cash,unrealized FROM (SELECT *,ROW_NUMBER() OVER(ORDER BY time) AS rn,COUNT(*) OVER() AS total FROM backtest_equity_curve WHERE run_id=$1) points WHERE rn=1 OR rn=total OR rn % GREATEST(total/2000,1)=0 ORDER BY time",[id])).rows; }
+  @Get('backtests/:id/locate') async locate(@Param('id') id:string,@Query() q:Record<string,string>){return locate(this.service.pool,await this.service.backtest(id),q);}
   @Get("tv/config") config() { return { supports_search: false, supports_group_request: false, supports_marks: false, supports_timescale_marks: false, supported_resolutions: ["30S","1","5","15","60","240","D"] }; }
   @Get("tv/time") time() { return Math.floor(Date.now() / 1000); }
   @Get("tv/symbols") symbols(@Query("symbol") symbol: string) { const [exchange, ca, pairId, type] = (symbol ?? "").split(":"); return { name: symbol, ticker: symbol, description: `${exchange} ${ca}`, type: "crypto", session: "24x7", timezone: "Etc/UTC", exchange, minmov: 1, pricescale: 1000000, has_intraday: true, has_seconds: true, seconds_multipliers: ["30"], supported_resolutions: ["30S","1","5","15","60","240","D"], volume_precision: 4, data_status: "endofday", pairId, valueType: type }; }
@@ -233,4 +245,4 @@ class AppController {
 }
 
 @Module({ controllers: [AppController], providers: [AppService] }) class AppModule {}
-if (process.env.NODE_ENV !== "test") NestFactory.create(AppModule).then(app => { app.enableCors(); app.listen(Number(process.env.PORT ?? 3000)); });
+if (process.env.NODE_ENV !== "test") NestFactory.create(AppModule).then(app => { app.enableCors();app.enableShutdownHooks(); app.listen(Number(process.env.PORT ?? 3000)); });

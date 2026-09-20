@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
-const props=defineProps<{symbol:string;interval:string;runId?:string;startTime?:number|null;endTime?:number|null}>();
+const props=defineProps<{symbol:string;interval:string;runId?:string;startTime?:number|null;endTime?:number|null;anchor?:{from?:number;to?:number;start?:number;end?:number;empty?:boolean}}>();
+const fetching=ref(false);let focused:any,focusEpoch=0;
 const container=ref<HTMLDivElement>(),error=ref("");let widget:any,version=0,markerVersion=0;
 let controller=new AbortController(),rangeTimer:number|undefined;
 const resolutions:Record<string,string>={"30s":"30S","1m":"1","5m":"5","15m":"15","1h":"60","4h":"240","1d":"D"};
@@ -39,12 +40,24 @@ async function loadMarkers(chart:any,v:number) {
  }catch(e:any){if(v===version && e.name!=="AbortError")error.value="事件标注加载失败，可切换交易池重试";}
 }
 function reset(){version++;markerVersion++;controller.abort();controller=new AbortController();window.clearTimeout(rangeTimer);widget?.remove();widget=undefined;}
-function mountChart(){
+async function mountChart(){
  reset();const v=version,symbol=props.symbol,step=seconds[props.interval] || 30;error.value="";
  if(!container.value)return;
  const tv=(window as any).TradingView;
  if(!tv){error.value="未找到 TradingView charting_library，请检查本地组件资源";return;}
  try{
+ const anchor=focused ?? props.anchor;
+ const initial:any[]=[];
+ if(anchor && !anchor.empty && anchor.from!==undefined){
+  fetching.value=true;let to=Math.floor(anchor.to/1000)+step;
+  for(;;){const x=await get('/api/tv/history',{symbol,resolution:resolutions[props.interval],runId:props.runId,from:Math.floor(anchor.from/1000),to});if(v!==version)return;if(!x.t?.length)break;
+   initial.unshift(...x.t.map((t:number,i:number)=>({time:t*1000,open:x.o[i],high:x.h[i],low:x.l[i],close:x.c[i],volume:x.v[i]})));
+   if(x.t.length<5000 || x.t[0]*1000<=anchor.from)break;to=x.t[0];
+  }
+  if(!initial.length)error.value='买卖点附近缺少原始 K 线，无法显示对应行情；不会补造。';
+  else if([anchor.start,anchor.end].some(t=>t!==undefined && !initial.some(b=>b.time===t)))error.value='部分事件对应原始 K 线缺失；保留事件记录，不补造行情。';
+  fetching.value=false;
+ }
  const localWidget=new tv.widget({container:container.value,library_path:"/charting_library/",symbol,interval:resolutions[props.interval],timezone:"Etc/UTC",theme:"Light",autosize:true,
  disabled_features:["header_symbol_search","header_resolutions","header_compare","timeframes_toolbar","use_localstorage_for_settings","legend_inplace_edit","symbol_search_hot_key","show_interval_dialog_on_key_press"],
  datafeed:{
@@ -55,6 +68,7 @@ function mountChart(){
   },
   resolveSymbol:(_s:any,cb:any,onError:any)=>get("/api/tv/symbols",{symbol}).then(data=>{if(v===version)cb({...data,supported_resolutions:[resolutions[props.interval]]});}).catch(onError),
   getBars:(_info:any,_resolution:string,range:any,onResult:any,onError:any)=>{
+   if(range.firstDataRequest && anchor && !anchor.empty){setTimeout(()=>{if(v===version)onResult(initial,{noData:!initial.length});},0);return;}
    let from=range.from,to=range.to;
    if(range.firstDataRequest && props.endTime!==null && props.endTime!==undefined){to=Math.floor(props.endTime/1000)+step;from=to-step*Math.max(300,range.countBack || 300);}
    get("/api/tv/history",{symbol,resolution:resolutions[props.interval],runId:props.runId,from,to,countBack:Math.min(5000,Math.max(range.countBack || 300,Math.ceil((to-from)/step)))})
@@ -69,19 +83,19 @@ function mountChart(){
   if(v!==version)return;const chart=localWidget.activeChart();
   chart.onVisibleRangeChanged().subscribe(null,()=>{window.clearTimeout(rangeTimer);rangeTimer=window.setTimeout(()=>loadMarkers(chart,v),200);});
   loadMarkers(chart,v);
-  if(props.endTime!==null && props.endTime!==undefined)chart.setVisibleRange({from:Math.max((props.startTime ?? 0)/1000,props.endTime/1000-step*200),to:props.endTime/1000+step}).catch(()=>{});
+  if(anchor && !anchor.empty)chart.setVisibleRange({from:anchor.from/1000,to:anchor.to/1000+step}).then(()=>loadMarkers(chart,v)).catch(()=>{});
+  else if(props.endTime!==null && props.endTime!==undefined)chart.setVisibleRange({from:Math.max((props.startTime ?? 0)/1000,props.endTime/1000-step*200),to:props.endTime/1000+step}).catch(()=>{});
  });
- }catch(e:any){error.value="图表初始化失败："+String(e.message || e);}
+ }catch(e:any){if(v===version && e.name!=='AbortError')error.value="图表初始化失败："+String(e.message || e);}finally{if(v===version)fetching.value=false;}
 }
 async function focusEvent(event:any){
- if(!widget)return;const chart=widget.activeChart(),step=seconds[props.interval] || 30;
+ const v=version,request=++focusEpoch;
  try {
-  await chart.setVisibleRange({from:Number(event.time)/1000-step*30,to:Number(event.time)/1000+step*30});
-  await loadMarkers(chart,version);
+  const [chain,ca,pairId]=props.symbol.split(':');const data=await get(`/api/backtests/${props.runId}/locate`,{chain,ca,pairId,eventId:event.id});if(v!==version || request!==focusEpoch)return;focused=data;await mountChart();
  } catch { error.value="图表尚未完成加载，稍后再点击事件定位"; }
 }
 defineExpose({focusEvent});
-onMounted(mountChart);watch(()=>[props.symbol,props.interval,props.runId],mountChart);onBeforeUnmount(reset);
+onMounted(mountChart);watch(()=>[props.symbol,props.interval,props.runId,props.anchor],()=>{focused=undefined;void mountChart();});onBeforeUnmount(reset);
 </script>
 <template><a-alert v-if="error" :message="error" type="warning" show-icon><template #action><a-button @click="mountChart">重新加载</a-button></template></a-alert><div ref="container" class="tv-chart" /></template>
 <style scoped>.tv-chart{height:580px;width:100%;background:#fff;border:1px solid #dfe6e3;border-radius:8px;overflow:hidden}</style>
