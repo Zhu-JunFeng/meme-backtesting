@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { eventLabels as labels, marketValue, changePercent } from '../format';
-const props=defineProps<{symbol:string;interval:string;runId?:string;startTime?:number|null;endTime?:number|null;includeEndOfBacktest?:boolean;anchor?:{from?:number;to?:number;start?:number;end?:number;empty?:boolean}}>();
+import FibAudit from './FibAudit.vue';
+const props=defineProps<{symbol:string;interval:string;runId?:string;startTime?:number|null;endTime?:number|null;includeEndOfBacktest?:boolean;anchor?:{from?:number;to?:number;start?:number;end?:number;empty?:boolean;fib?:any;fibFrom?:number;fibTo?:number}}>();
+const showFib=ref(true),fibView=ref('full'),fib=ref<any>();let fibIds:any[]=[],fibEpoch=0;
 const selectedBuy=ref<any>(),cursorValue=ref<number>(),selectedEvent=ref<any>();
 const isMcap=computed(()=>props.symbol.endsWith(':mcap'));
 const movement=computed(()=>changePercent(cursorValue.value!,Number(selectedBuy.value?.price)));
@@ -58,25 +60,52 @@ async function loadMarkers(chart:any,v:number) {
  }
  }catch(e:any){if(v===version && e.name!=="AbortError")error.value="事件标注加载失败，可切换交易池重试";}
 }
-function reset(){clearSelection();ready=false;version++;markerVersion++;controller.abort();controller=new AbortController();window.clearTimeout(rangeTimer);widget?.remove();widget=undefined;shapeMap.clear();markMap.clear();}
+function reset(){clearSelection();fibEpoch++;fibIds=[];ready=false;version++;markerVersion++;controller.abort();controller=new AbortController();window.clearTimeout(rangeTimer);widget?.remove();widget=undefined;shapeMap.clear();markMap.clear();}
+let loadedTimes=new Set<number>();
+async function drawFib(chart:any,v:number){
+ const request=++fibEpoch;for(const id of fibIds)try{chart.removeEntity(id);}catch{}fibIds=[];
+ const f=fib.value;if(!showFib.value||f?.status!=='available')return;
+ const anchor=focused ?? props.anchor,end=f.exitTime ?? anchor?.fibTo ?? anchor?.to;
+ const create=async(points:any[],shape:string,text:string,overrides:any={})=>{
+  if(v!==version||request!==fibEpoch)return;
+  const options={shape,text,lock:true,disableSave:true,disableUndo:true,disableSelection:true,overrides};
+  const id=points.length===1?await chart.createShape(points[0],options):await chart.createMultipointShape(points,options);
+  if(v!==version||request!==fibEpoch){try{chart.removeEntity(id);}catch{}return;}fibIds.push(id);
+ };
+ const point=(time:number,price:number)=>({time:time/1000,price});
+ // TradingView snaps missing-bar anchors to neighbouring bars: never pass a missing timestamp as a real pivot.
+ const hasLow=loadedTimes.has(f.low.time),hasHigh=loadedTimes.has(f.high.time);
+ if(hasLow&&hasHigh)await create([point(f.low.time,f.low.value),point(f.high.time,f.high.value)],'trend_line',`拉升 ${((f.high.value/f.low.value-1)*100).toFixed(2)}% · ${f.high.index-f.low.index} 根`,{linecolor:'#176b5b',textcolor:'#176b5b',linewidth:2,fontsize:11,showLabel:true});
+ for(const [name,p] of [['Swing Low',f.low],['Swing High',f.high]] as const)if(loadedTimes.has(p.time))await create([point(p.time,p.value)],'text',`${name} ${displayValue(p.value)}\n${new Date(p.time).toISOString()}${p.synthetic?' · 补齐 K 线':''}`,{color:'#176b5b',fontsize:12});
+ if(loadedTimes.has(f.confirmed.time))await create([point(f.confirmed.time,f.high.value)],'vertical_line',`Pivot 确认 ${new Date(f.confirmed.time).toISOString()}`,{linecolor:'#65766e',linestyle:2,showLabel:true});
+ const start=hasHigh?f.high.time:f.entryTime;
+ if(!loadedTimes.has(start))return;
+ const zoneKeys=new Set<string>();for(const z of f.zones){const key=`${z.lower}:${z.upper}`;if(zoneKeys.has(key))continue;zoneKeys.add(key);await create([point(start,z.upper),point(end,z.lower)],'rectangle','',{color:'#176b5b',backgroundColor:'#176b5b',fillBackground:true,transparency:92,linewidth:1});}
+ for(const [index,line] of f.levels.entries())await create([point(start,line.value)],'horizontal_line',`Fib ${line.ratio} · ${displayValue(line.value)}`,{linecolor:line.uses.length?'#176b5b':'#7b8580',textcolor:'#31483f',fontsize:11,horzLabelsAlign:index%2?'right':'left',vertLabelsAlign:'top',linewidth:1,linestyle:line.uses.length?0:2,showLabel:true,showPrice:false});
+ for(const [index,line] of f.thresholds.entries())await create([point(start,line.value)],'horizontal_line',`${line.label.includes('止损')?'止损':'失效'} · ${displayValue(line.value)}`,{linecolor:'#b42318',textcolor:'#b42318',fontsize:11,horzLabelsAlign:index%2?'right':'left',vertLabelsAlign:'bottom',linestyle:2,showLabel:true,showPrice:false});
+}
 async function mountChart(){
  reset();const v=version,symbol=props.symbol,step=seconds[props.interval] || 30;error.value="";
  if(!container.value)return;
  const tv=(window as any).TradingView;
  if(!tv){error.value="未找到 TradingView charting_library，请检查本地组件资源";return;}
  try{
- const anchor=focused ?? props.anchor;
+ const original=focused ?? props.anchor;fib.value=original?.fib;
+ const dataAnchor=original?.fib?.status==='available'?{...original,from:original.fibFrom,to:original.fibTo}:original;
+ const anchor=fibView.value==='full'?dataAnchor:original;
  const initial:any[]=[];
- if(anchor && !anchor.empty && anchor.from!==undefined){
-  fetching.value=true;let to=Math.floor(anchor.to/1000)+step;
-  for(;;){const x=await get('/api/tv/history',{symbol,resolution:resolutions[props.interval],runId:props.runId,from:Math.floor(anchor.from/1000),to});if(v!==version)return;if(!x.t?.length)break;
+ if(dataAnchor && !dataAnchor.empty && dataAnchor.from!==undefined){
+  fetching.value=true;let to=Math.floor(dataAnchor.to/1000)+step;
+  for(;;){const x=await get('/api/tv/history',{symbol,resolution:resolutions[props.interval],runId:props.runId,from:Math.floor(dataAnchor.from/1000),to});if(v!==version)return;if(!x.t?.length)break;
    initial.unshift(...x.t.map((t:number,i:number)=>({time:t*1000,open:x.o[i],high:x.h[i],low:x.l[i],close:x.c[i],volume:x.v[i]})));
-   if(x.t.length<5000 || x.t[0]*1000<=anchor.from)break;to=x.t[0];
+   if(x.t.length<5000 || x.t[0]*1000<=dataAnchor.from)break;to=x.t[0];
   }
   if(!initial.length)error.value='买卖点附近缺少原始 K 线，无法显示对应行情；不会补造。';
-  else if([anchor.start,anchor.end].some(t=>t!==undefined && !initial.some(b=>b.time===t)))error.value='部分事件对应原始 K 线缺失；保留事件记录，不补造行情。';
+  else if([dataAnchor.start,dataAnchor.end].some(t=>t!==undefined && !initial.some(b=>b.time===t)))error.value='部分事件对应原始 K 线缺失；保留事件记录，不补造行情。';
   fetching.value=false;
  }
+ loadedTimes=new Set(initial.map(b=>b.time));
+ if(fib.value?.status==='available' && [fib.value.low,fib.value.high,fib.value.confirmed].some(p=>p.synthetic || !loadedTimes.has(p.time)))error.value='部分 Fib 锚点对应补齐或缺失 K 线，未在相邻真实 K 线上冒画锚点；准确时间和值见 Fib 核验明细。';
  const localWidget=new tv.widget({container:container.value,library_path:"/charting_library/",symbol,interval:resolutions[props.interval],timezone:"Etc/UTC",theme:"Light",autosize:true,
  enabled_features:['two_character_bar_marks_labels'],
  custom_formatters:{priceFormatterFactory:()=>isMcap.value?{format:(value:number)=>marketValue(value)}:null},
@@ -108,6 +137,7 @@ async function mountChart(){
   if(selectedBuy.value)void drawReference();
   chart.onVisibleRangeChanged().subscribe(null,()=>{window.clearTimeout(rangeTimer);rangeTimer=window.setTimeout(()=>loadMarkers(chart,v),200);});
   loadMarkers(chart,v);
+  void drawFib(chart,v).catch(()=>{if(v===version)error.value='Fib 绘图失败，请重新加载；核验明细仍可查看';});
   if(anchor && !anchor.empty)chart.setVisibleRange({from:anchor.from/1000,to:anchor.to/1000+step}).then(()=>loadMarkers(chart,v)).catch(()=>{});
   else if(props.endTime!==null && props.endTime!==undefined)chart.setVisibleRange({from:Math.max((props.startTime ?? 0)/1000,props.endTime/1000-step*200),to:props.endTime/1000+step}).catch(()=>{});
  });
@@ -117,11 +147,13 @@ async function focusEvent(event:any){
  const v=version,request=++focusEpoch;
  try {
   const [chain,ca,pairId]=props.symbol.split(':');const data=await get(`/api/backtests/${props.runId}/locate`,{chain,ca,pairId,eventId:event.id});if(v!==version || request!==focusEpoch)return;focused=data;const mountingVersion=version+1;await mountChart();if(request===focusEpoch && version===mountingVersion)selectEvent(event);
- } catch { error.value="图表尚未完成加载，稍后再点击事件定位"; }
+ } catch { if(v===version && request===focusEpoch)error.value="图表尚未完成加载，稍后再点击事件定位"; }
 }
 defineExpose({focusEvent});
 onMounted(mountChart);watch(()=>[props.symbol,props.interval,props.runId,props.anchor],()=>{focused=undefined;void mountChart();});onBeforeUnmount(reset);
 watch(()=>props.includeEndOfBacktest,()=>{if(ready)widget.activeChart().refreshMarks();});
+watch(showFib,()=>{if(ready)void drawFib(widget.activeChart(),version).catch(()=>{error.value='Fib 绘图失败，请重新加载';});});
+watch(fibView,()=>{if(!ready)return;const a=focused ?? props.anchor;if(!a||a.empty)return;const full=fibView.value==='full'&&a.fib?.status==='available';const from=full?a.fibFrom:a.from,to=full?a.fibTo:a.to;if(from!=null&&to!=null)void widget.activeChart().setVisibleRange({from:from/1000,to:to/1000+(seconds[props.interval]||30)}).catch(()=>{error.value='视野切换失败，请重新加载';});});
 </script>
-<template><a-alert v-if="error" :message="error" type="warning" show-icon><template #action><a-button @click="mountChart">重新加载</a-button></template></a-alert><div class="measurement"><template v-if="selectedBuy"><strong>{{selectedBuy.event_label || '买入'}} {{displayValue(Number(selectedBuy.price))}}</strong><span>光标{{isMcap?'市值':'价格'}}：{{cursorValue==null?'—':displayValue(cursorValue)}}</span><strong :class="movement!=null&&movement<0?'negative':'positive'">{{movement==null?'移动鼠标查看涨跌幅':(movement>=0?'+':'')+movement.toFixed(2)+'%'}}</strong><span>不含交易成本</span><a-button size="small" @click="clearSelection">取消选择</a-button></template><span v-else>点击买入或加仓标记，再移动鼠标，比较光标{{isMcap?'市值':'价格'}}与该买入点的涨跌幅。</span></div><p v-if="selectedEvent" class="event-detail"><a-tooltip :title="JSON.stringify(selectedEvent.reason_json)">{{eventSummary(selectedEvent)}} ⓘ</a-tooltip></p><div ref="container" class="tv-chart" /></template>
+<template><div v-if="fib" class="measurement"><a-radio-group v-model:value="fibView" size="small"><a-radio-button value="full">完整 Fib</a-radio-button><a-radio-button value="trade">买卖区间</a-radio-button></a-radio-group><a-switch v-model:checked="showFib" size="small" :disabled="fib.status!=='available'" /> 显示 Fib <span>0 = 高点 · 1 = 低点 · 时间 UTC</span></div><a-alert v-if="error" :message="error" type="warning" show-icon><template #action><a-button @click="mountChart">重新加载</a-button></template></a-alert><div class="measurement"><template v-if="selectedBuy"><strong>{{selectedBuy.event_label || '买入'}} {{displayValue(Number(selectedBuy.price))}}</strong><span>光标{{isMcap?'市值':'价格'}}：{{cursorValue==null?'—':displayValue(cursorValue)}}</span><strong :class="movement!=null&&movement<0?'negative':'positive'">{{movement==null?'移动鼠标查看涨跌幅':(movement>=0?'+':'')+movement.toFixed(2)+'%'}}</strong><span>不含交易成本</span><a-button size="small" @click="clearSelection">取消选择</a-button></template><span v-else>点击买入或加仓标记，再移动鼠标，比较光标{{isMcap?'市值':'价格'}}与该买入点的涨跌幅。</span></div><p v-if="selectedEvent" class="event-detail"><a-tooltip :title="JSON.stringify(selectedEvent.reason_json)">{{eventSummary(selectedEvent)}} ⓘ</a-tooltip></p><div ref="container" class="tv-chart" /><FibAudit :fib="fib" :is-mcap="isMcap" /></template>
 <style scoped>.measurement{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-height:40px;color:#43544d}.positive{color:#176b5b}.negative{color:#b42318}.event-detail{overflow-wrap:anywhere;color:#43544d}.tv-chart{height:580px;width:100%;background:#fff;border:1px solid #dfe6e3;border-radius:8px;overflow:hidden}</style>

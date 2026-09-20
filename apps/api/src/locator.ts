@@ -2,6 +2,7 @@ import { BadRequestException, NotFoundException } from '@nestjs/common';
 import type { Pool } from 'pg';
 import type { BacktestConfig } from '@meme/domain';
 import { intervalMs } from '@meme/engine';
+import { tradeFib } from './fib.js';
 export async function locate(pool:Pool,run:any,q:Record<string,string>){
  const config=run.config_json as BacktestConfig;
  const symbol=config.symbols.find(s=>s.chain===q.chain && s.ca===q.ca && s.pairId===q.pairId);
@@ -23,5 +24,15 @@ export async function locate(pool:Pool,run:any,q:Record<string,string>){
  from=Number(rows[0].before ?? start);to=Number(rows[0].after ?? end);
  }
  const events=(await pool.query('SELECT * FROM backtest_signals WHERE run_id=$1 AND chain=$2 AND ca=$3 AND pair_id=$4 AND time BETWEEN $5 AND $6 ORDER BY time,id',[...params,start,end])).rows;
- return {symbol,tradeId:trade?.id,eventId:event?.id,from,to,start,end,events,interval:config.interval,valueType:config.valueType,empty:false};
+ const fib=await tradeFib(pool,run,q,trade?.id,event?.id);
+ let fibFrom=from,fibTo=to;
+ if(fib.status==='available'){
+  fibFrom=Math.max(snap?.startTime ?? 0,fib.low.time-100*step);
+  fibTo=Math.min(snap?.endTime ?? to,(fib.exitTime ?? snap?.endTime ?? to)+100*step);
+  if(run.input_ready){
+   const bounds=(await pool.query(`WITH bars AS (SELECT (b->>'time')::bigint t FROM backtest_input_chunks c CROSS JOIN LATERAL jsonb_array_elements(c.candles_json) b WHERE c.run_id=$1 AND c.pool_key=$2) SELECT (SELECT min(t) FROM (SELECT t FROM bars WHERE t<$3 ORDER BY t DESC LIMIT 100) x) AS before,(SELECT max(t) FROM (SELECT t FROM bars WHERE t>$4 ORDER BY t LIMIT 100) x) AS after, min(t) AS first,max(t) AS last FROM bars`,[run.id,`${symbol.chain}:${symbol.ca}:${symbol.pairId}`,fib.low.time,fib.exitTime ?? fib.entryTime])).rows[0];
+   fibFrom=Number(bounds.before ?? bounds.first ?? fib.low.time);fibTo=Number(fib.exitTime==null?bounds.last ?? to:bounds.after ?? bounds.last ?? to);
+  }
+ }
+ return {symbol,tradeId:trade?.id,eventId:event?.id,from,to,start,end,events,fib,fibFrom,fibTo,interval:config.interval,valueType:config.valueType,empty:false};
 }

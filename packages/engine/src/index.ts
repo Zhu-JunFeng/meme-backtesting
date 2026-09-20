@@ -29,7 +29,7 @@ export function normalizeCandles(input: Candle[], interval: keyof typeof periodS
   return { candles: out, syntheticBars, invalidBars };
 }
 
-export interface Impulse { low: number; high: number; lowIndex: number; highIndex: number; confirmedAtIndex: number; gainPercent: number; averageVolume: number }
+export interface Impulse { low: number; high: number; lowIndex: number; highIndex: number; confirmedAtIndex: number; gainPercent: number; averageVolume: number; lowTime?:number; highTime?:number; confirmedTime?:number; lowSynthetic?:boolean; highSynthetic?:boolean; confirmedSynthetic?:boolean }
 
 function isPivot(candles: Candle[], index: number, left: number, right: number, side: "low" | "high") {
   if (index < left || index + right >= candles.length) return false;
@@ -62,7 +62,9 @@ export function detectImpulse(candles: Candle[], config: ImpulseConfig): Impulse
         const baseline = average(candles.slice(Math.max(0, lowIndex - Math.max(5, config.leftBars * 2)), lowIndex).map(c => c.volume));
         if (baseline === undefined || impulseVolume < baseline * (config.volumeExpansionRatio ?? 1.5)) continue;
       }
-      return { low, high, lowIndex, highIndex, confirmedAtIndex: highIndex + config.rightBars, gainPercent, averageVolume: impulseVolume };
+      return { low, high, lowIndex, highIndex, confirmedAtIndex: highIndex + config.rightBars, gainPercent, averageVolume: impulseVolume,
+        lowTime:candles[lowIndex].time,highTime:candles[highIndex].time,confirmedTime:candles[highIndex+config.rightBars].time,
+        lowSynthetic:!!candles[lowIndex].synthetic,highSynthetic:!!candles[highIndex].synthetic,confirmedSynthetic:!!candles[highIndex+config.rightBars].synthetic };
     }
   }
   return undefined;

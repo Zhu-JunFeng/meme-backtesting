@@ -1,4 +1,5 @@
 import {it,expect,vi} from 'vitest';
+vi.mock('../src/fib.js',()=>({tradeFib:vi.fn(async()=>({status:'unavailable',reason:'test'}))}));
 import {locate} from '../src/locator.js';
 const run={id:'run',config_json:{symbols:[{chain:'sol',ca:'ca',pairId:'pair'}],interval:'30s',valueType:'mcap',pools:[{chain:'sol',ca:'ca',pairId:'pair',startTime:0,endTime:9000000}]}};
 it.each([['30s','mcap'],['1m','price']])('locates first trade with locked %s/%s and real candle neighbours',async(interval,type)=>{

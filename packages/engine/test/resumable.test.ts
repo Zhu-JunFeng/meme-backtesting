@@ -12,6 +12,11 @@ function execute(config:BacktestConfig,inputs:{symbol:SymbolRef;candles:Candle[]
 }
 const variants:Condition[]=[{type:'ema_reclaim',period:9},{type:'rsi_recovery',period:14,oversold:50,recovery:40},{type:'obv_confirmation',lookbackBars:10,minChangePercent:0},{type:'volume_contraction',period:6,maxRatio:2},{type:'bullish_volume_confirmation',period:6,minRatio:1},{type:'candle_pattern',patterns:['hammer','pin_bar','long_lower_wick','bullish_engulfing']},{type:'percent_retracement',minPercent:5,maxPercent:50}];
 describe('resumable reference parity',()=>{
+ it('persists exact pivot times including synthetic flags after history eviction and restore',()=>{
+  const config=configuration(),raw=candles(800),normalized=normalizeCandles(raw,config.interval).candles;
+  const result=execute(config,[{symbol:symbols[0],candles:raw}],true),entries=result.signals.filter(s=>s.type==='entry');expect(entries.length).toBeGreaterThan(0);
+  for(const signal of entries){const i=signal.reason.impulse as any;expect(i.lowTime).toBe(normalized[i.lowIndex].time);expect(i.highTime).toBe(normalized[i.highIndex].time);expect(i.confirmedTime).toBe(normalized[i.confirmedAtIndex].time);expect(i.confirmedTime).toBeLessThanOrEqual(signal.time);expect(i.lowSynthetic).toBe(!!normalized[i.lowIndex].synthetic);}
+ });
  for(const extra of [undefined,...variants])it(`matches reference: ${extra?.type ?? 'fib'}`,()=>{
   const c=configuration();if(extra)c.entryConditionGroup.conditions.push(extra);
   c.addConditionGroup={mode:'any',conditions:[{type:'bullish_volume_confirmation',period:3,minRatio:.9}]};

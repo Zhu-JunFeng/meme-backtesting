@@ -97,7 +97,9 @@ export class ResumableEngine {
       let volume=0;for(let j=lo;j<=hi;j++)volume+=s.history[j-s.offset].volume;
       const averageVolume=volume/(hi-lo+1);
       if(cfg.requireVolumeExpansion){const begin=Math.max(0,lo-Math.max(5,cfg.leftBars*2));let baseline=0;for(let j=begin;j<lo;j++)baseline+=s.history[j-s.offset].volume;if(lo===begin || averageVolume<baseline/(lo-begin)*(cfg.volumeExpansionRatio ?? 1.5))continue;}
-      return {low,high,lowIndex:lo,highIndex:hi,confirmedAtIndex:hi+cfg.rightBars,gainPercent,averageVolume};
+      return {low,high,lowIndex:lo,highIndex:hi,confirmedAtIndex:hi+cfg.rightBars,gainPercent,averageVolume,
+        lowTime:s.history[lo-s.offset].time,highTime:s.history[hi-s.offset].time,confirmedTime:s.history[hi+cfg.rightBars-s.offset].time,
+        lowSynthetic:!!s.history[lo-s.offset].synthetic,highSynthetic:!!s.history[hi-s.offset].synthetic,confirmedSynthetic:!!s.history[hi+cfg.rightBars-s.offset].synthetic};
      }
     }
   }
