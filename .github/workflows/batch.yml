@@ -1,0 +1,42 @@
+name: Approved Fib batch
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: '固定已批准的 1730 个任务；submit 必须先通过先导门禁'
+        required: true
+        type: choice
+        options: [preview, pilot, submit, status, export]
+concurrency:
+  group: approved-fib-batch
+  cancel-in-progress: false
+jobs:
+  batch:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Execute approved batch CLI
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          COMMAND: ${{ inputs.command }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/batch_key
+          chmod 600 ~/.ssh/batch_key
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/batch_key "$DEPLOY_USER@$DEPLOY_HOST" "sh -s -- '$COMMAND'" > batch-result.json <<'REMOTE'
+          set -eu
+          command="$1"
+          case "$command" in preview|pilot|submit|status|export) ;; *) exit 1;; esac
+          # Measure the actual PostgreSQL data volume, not an unrelated host filesystem.
+          pg_container=$(docker ps --format '{{.Names}} {{.Image}}' | awk 'tolower($2) ~ /postgres|timescale/ {print $1}')
+          [ "$(printf '%s\n' "$pg_container" | wc -l)" -eq 1 ] && [ -n "$pg_container" ] || { echo '无法唯一识别数据库容器，禁止估算容量' >&2; exit 1; }
+          free=$(docker exec "$pg_container" sh -c 'df -Pk "${PGDATA:-/var/lib/postgresql/data}"' | awk 'NR==2 {printf "%.0f",$4*1024}')
+          docker exec -e BACKTEST_CLI=1 -e BATCH_FREE_BYTES="$free" meme-backtesting-api node apps/api/dist/batch-cli.js "$command" --yes
+          REMOTE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: batch-${{ inputs.command }}-${{ github.run_id }}
+          path: batch-result.json

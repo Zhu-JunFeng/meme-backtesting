@@ -2,6 +2,7 @@ import { Pool, type PoolClient } from 'pg';
 import type { BacktestConfig, Candle, SymbolRef } from '@meme/domain';
 import { ResumableEngine, intervalMs, poolKey, validCandle, type EngineBatch, type EngineCheckpoint, type Tick } from '@meme/engine';
 import { configHash, fenced, heartbeat, LostLease, queuePrefix, RUNTIME_VERSION } from './index.js';
+import { inputOwner, validateInputSource } from './input.js';
 
 const CHUNK=256;
 type Cursor={chunk:number;offset:number;previous?:Candle};
@@ -71,7 +72,7 @@ export async function executeRun(pool:Pool,id:string,shutdown:()=>boolean){
  const save=async(report?:ReturnType<ResumableEngine['finish']>)=>{
   if(!engine)return;const c=await pool.connect();try{await c.query('BEGIN');const status=await fenced(c,id,epoch);
    if(report && status!=='stopping')engine.finalizeOpenPositions();
-   const batch=engine.drain();const state:Saved={engine:engine.checkpoint(),readers:Object.fromEntries(readers.map(r=>[r.key,r.cursor])),inputVersion:id};
+   const batch=engine.drain();const state:Saved={engine:engine.checkpoint(),readers:Object.fromEntries(readers.map(r=>[r.key,r.cursor])),inputVersion:inputOwner(run)};
    await c.query('INSERT INTO backtest_result_batches(run_id,batch_no,execution_epoch) VALUES($1,$2,$3)',[id,++batchNo,epoch]);await writeBatch(c,id,batch);
    await c.query('INSERT INTO backtest_checkpoints(run_id,batch_no,config_checksum,state_json) VALUES($1,$2,$3,$4) ON CONFLICT(run_id) DO UPDATE SET batch_no=excluded.batch_no,config_checksum=excluded.config_checksum,state_json=excluded.state_json,created_at=now()',[id,batchNo,configHash(config),JSON.stringify(state)]);
    if(report && status!=='stopping')await c.query('INSERT INTO backtest_reports(run_id,report_json) VALUES($1,$2)',[id,JSON.stringify(report)]);
@@ -80,15 +81,16 @@ export async function executeRun(pool:Pool,id:string,shutdown:()=>boolean){
   }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
  };
  try{
+  await validateInputSource(pool,run);
   if(!run.input_ready)await freeze(pool,id,epoch,config,check);
   check();const saved=(await pool.query('SELECT * FROM backtest_checkpoints WHERE run_id=$1',[id])).rows[0];
-  if(saved && (saved.config_checksum!==configHash(config) || saved.state_json.inputVersion!==id))throw new Error('配置或输入版本不匹配，拒绝恢复');
-  const manifest=(await pool.query('SELECT * FROM backtest_input_pools WHERE run_id=$1 ORDER BY pool_key',[id])).rows;
+  if(saved && (saved.config_checksum!==configHash(config) || saved.state_json.inputVersion!==inputOwner(run)))throw new Error('配置或输入版本不匹配，拒绝恢复');
+  const manifest=(await pool.query('SELECT * FROM backtest_input_pools WHERE run_id=$1 ORDER BY pool_key',[inputOwner(run)])).rows;
   const expectedKeys=new Set(config.symbols.map(poolKey));if(manifest.length!==expectedKeys.size || manifest.some(r=>!expectedKeys.has(r.pool_key)))throw new Error('冻结输入清单不完整，拒绝恢复');
   total=Math.max(1,manifest.reduce((n,r)=>n+Number(r.normalized_count),0));
   engine=new ResumableEngine(config,saved?.state_json.engine);batchNo=saved?.batch_no ?? 0;
   if(!saved)engine.s.invalidBars=manifest.reduce((n,r)=>n+r.invalid_count,0);
-  readers=manifest.map(r=>new FrozenReader(pool,id,r.pool_key,r.chunk_count,intervalMs(config.interval),saved?.state_json.readers[r.pool_key]));
+  readers=manifest.map(r=>new FrozenReader(pool,inputOwner(run),r.pool_key,r.chunk_count,intervalMs(config.interval),saved?.state_json.readers[r.pool_key]));
   const symbols=new Map(manifest.map(r=>[r.pool_key,r.symbol_json as SymbolRef]));
   const heads=await Promise.all(readers.map(r=>r.peek()));let lastSave=Date.now(),lastYield=Date.now(),lastProgress=0;
   for(;;){check();let time=Infinity;for(const h of heads)if(h)time=Math.min(time,h.candle.time);if(!Number.isFinite(time))break;

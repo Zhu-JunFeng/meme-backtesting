@@ -1,3 +1,4 @@
+import { inputOwner } from "@meme/runtime";
 import "reflect-metadata";
 import { locate } from './locator.js';
 import { statistics } from './results.js';
@@ -46,7 +47,7 @@ export class AppService {
       query={...query,interval:config.interval,type:config.valueType,
         from:String(Math.max(Number(query.from)||0,snapshot?.startTime ?? (config.startTime ? Date.parse(config.startTime):0))),
         to:String(Math.min(Number(query.to)||Date.now(),snapshot?.endTime ?? (config.endTime ? Date.parse(config.endTime):Date.now())))};
-      if(run.input_ready){const rows=(await this.pool.query(`SELECT b FROM backtest_input_chunks c CROSS JOIN LATERAL jsonb_array_elements(c.candles_json) b WHERE c.run_id=$1 AND c.pool_key=$2 AND (b->>'time')::bigint BETWEEN $3 AND $4 ORDER BY (b->>'time')::bigint DESC LIMIT $5`,[run.id,`${symbol.chain}:${symbol.ca}:${symbol.pairId}`,Number(query.from),Number(query.to),Math.min(5000,Math.max(1,Number(query.limit)||5000))])).rows;return rows.reverse().map(r=>r.b);}
+      if(run.input_ready){const rows=(await this.pool.query(`SELECT b FROM backtest_input_chunks c CROSS JOIN LATERAL jsonb_array_elements(c.candles_json) b WHERE c.run_id=$1 AND c.pool_key=$2 AND (b->>'time')::bigint BETWEEN $3 AND $4 ORDER BY (b->>'time')::bigint DESC LIMIT $5`,[inputOwner(run),`${symbol.chain}:${symbol.ca}:${symbol.pairId}`,Number(query.from),Number(query.to),Math.min(5000,Math.max(1,Number(query.limit)||5000))])).rows;return rows.reverse().map(r=>r.b);}
     }
     const params = [query.chain, query.ca, query.pairId, query.interval ?? "30s", query.type ?? "mcap", query.from ? Number(query.from) : 0, query.to ? Number(query.to) : Date.now()];
     const limit=Math.min(5000,Math.max(1,Number(query.limit)||5000));
@@ -249,4 +250,4 @@ class AppController {
 }
 
 @Module({ controllers: [AppController], providers: [AppService] }) class AppModule {}
-if (process.env.NODE_ENV !== "test") NestFactory.create(AppModule).then(app => { app.enableCors();app.enableShutdownHooks(); app.listen(Number(process.env.PORT ?? 3000)); });
+if (process.env.NODE_ENV !== "test" && process.env.BACKTEST_CLI !== '1') NestFactory.create(AppModule).then(app => { app.enableCors();app.enableShutdownHooks(); app.listen(Number(process.env.PORT ?? 3000)); });

@@ -18,11 +18,23 @@ suite('isolated database recovery integration',()=>{
   await pool.query('ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS strategy_template_id uuid; ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS strategy_version_id uuid; ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS dataset_json jsonb;');
   await pool.query(readFileSync(new URL('../../../apps/api/migrations/004_resumable.sql',import.meta.url),'utf8'));
   await pool.query(readFileSync(new URL('../../../apps/api/migrations/005_trade_analytics.sql',import.meta.url),'utf8'));
+  await pool.query(readFileSync(new URL('../../../apps/api/migrations/006_shared_input.sql',import.meta.url),'utf8'));
   const data=candles(5000);for(let offset=0;offset<data.length;offset+=500){const part=data.slice(offset,offset+500),values=part.flatMap(c=>['sol','a','a','30s','mcap',c.time,c.closeTime,c.open,c.high,c.low,c.close,c.volume,true]);await pool.query(`INSERT INTO meme_kline(chain,ca,pair_id,interval,type,open_time,close_time,open,high,low,close,volume,valid) VALUES ${part.map((_,i)=>'('+Array.from({length:13},(_,j)=>'$'+(i*13+j+1)).join(',')+')').join(',')} ON CONFLICT DO NOTHING`,values);}
  },30000);
  afterAll(async()=>{await pool?.end();});
  async function make(){return (await pool.query("INSERT INTO backtest_runs(name,status,config_json,runtime_version,queue_scope,phase) VALUES('integration','pending',$1,$2,$3,'freezing') RETURNING id",[JSON.stringify(config),RUNTIME_VERSION,queuePrefix()])).rows[0].id as string;}
  async function outputs(id:string){return {report:(await pool.query('SELECT report_json FROM backtest_reports WHERE run_id=$1',[id])).rows[0]?.report_json,signals:(await pool.query('SELECT chain,ca,pair_id,time,price,signal_type,reason_json,quantity FROM backtest_signals WHERE run_id=$1 ORDER BY id',[id])).rows,trades:(await pool.query('SELECT chain,ca,pair_id,entry_time,entry_price,quantity,exit_time,exit_price,net_pnl FROM backtest_trades WHERE run_id=$1 ORDER BY id',[id])).rows,equity:(await pool.query('SELECT time,equity,cash,unrealized FROM backtest_equity_curve WHERE run_id=$1 ORDER BY time',[id])).rows};}
+ it('shared input resumes identically and cannot be mutated, deleted or rebound',async()=>{
+  const source=await make();await executeRun(pool,source,()=>false);const expected=await outputs(source);
+  const shared=(await pool.query("INSERT INTO backtest_runs(name,status,config_json,input_source_run_id,input_ready,runtime_version,queue_scope,phase) VALUES('shared','pending',$1,$2,true,$3,$4,'computing') RETURNING id",[JSON.stringify(config),source,RUNTIME_VERSION,queuePrefix()])).rows[0].id;
+  await expect(pool.query('DELETE FROM backtest_input_chunks WHERE run_id=$1',[source])).rejects.toThrow('共享冻结输入');
+  await expect(pool.query('DELETE FROM backtest_runs WHERE id=$1',[source])).rejects.toThrow();
+  await expect(pool.query('UPDATE backtest_runs SET input_source_run_id=NULL WHERE id=$1',[shared])).rejects.toThrow('来源不可修改');
+  let checks=0;await executeRun(pool,shared,()=>++checks>100);await executeRun(pool,shared,()=>false);
+  expect(await outputs(shared)).toEqual(expected);expect((await pool.query('SELECT count(*) n FROM backtest_input_chunks WHERE run_id=$1',[shared])).rows[0].n).toBe('0');
+  const state=(await pool.query('SELECT state_json FROM backtest_checkpoints WHERE run_id=$1',[shared])).rows[0].state_json;expect(state.inputVersion).toBe(source);
+  await expect(pool.query("INSERT INTO backtest_runs(name,status,config_json,input_source_run_id,input_ready) VALUES('wrong','pending',$1,$2,true)",[JSON.stringify({...config,interval:'1m'}),source])).rejects.toThrow('数据集不一致');
+ },30000);
  it('checkpoint resume equals uninterrupted execution; input UPSERT cannot change it',async()=>{
   const baseline=await make();await executeRun(pool,baseline,()=>false);const expected=await outputs(baseline);
   const id=await make();let checks=0;await executeRun(pool,id,()=>++checks>110);
