@@ -38,6 +38,7 @@ jobs:
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm --filter @meme/domain build
       - run: pnpm --filter @meme/engine build
+      - run: pnpm test:research
       - run: pnpm --filter @meme/runtime build
       - run: pnpm test
       - run: pnpm --filter @meme/api build

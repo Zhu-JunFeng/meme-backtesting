@@ -5,6 +5,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
+    "test:research": "node --test scripts/offline-strategy-research.test.mjs",
     "dev:api": "pnpm --filter @meme/api dev",
     "dev:web": "pnpm --filter @meme/web dev",
     "dev:worker": "pnpm --filter @meme/worker dev",
