@@ -1,5 +1,7 @@
 import type { BacktestConfig, BacktestReport, Candle, Condition, ConditionGroup, EquityPoint, ImpulseConfig, Signal, SymbolRef, Trade } from "@meme/domain";
 export * from './resumable.js';
+export * from './invalidation.js';
+import { describeInvalidation } from './invalidation.js';
 
 const finite = (n: number) => Number.isFinite(n);
 const symbolKey = (s: SymbolRef) => `${s.chain}:${s.ca}:${s.pairId}`;
@@ -301,7 +303,7 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
       else if (target > active.trade.entryPrice && (candle.open >= target || candle.high >= target)) exit = {price:candle.open >= target ? candle.open : target,type:"take_profit"};
       else if (config.exitConfig.maxHoldingBars && state.index-active.entryIndex >= config.exitConfig.maxHoldingBars) exit = {price:candle.close,type:"timeout"};
       else if (config.exitConfig.closeAtEnd && state.index === state.candles.length-1) exit = {price:candle.close,type:"end_of_backtest"};
-      if (exit) close(state,candle,exit.price,exit.type,{priority:exit.type,stop,target});
+      if (exit) close(state,candle,exit.price,exit.type,{priority:exit.type,stop,target,...(exit.type==='invalidation'?{invalidation:describeInvalidation(config.invalidationConditionGroup,history,active.impulse)}:{})});
     }
     for (const {state,candle,history,impulse} of contexts) {
       const active = activeTrades.get(symbolKey(state.symbol));

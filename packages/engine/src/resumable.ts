@@ -1,6 +1,7 @@
 import type { BacktestConfig, BacktestReport, Candle, Condition, ConditionGroup, EquityPoint, Signal, SymbolRef, Trade } from '@meme/domain';
 import { evaluateCondition, stopPrice, targetPrice, type Impulse } from './index.js';
 import { validateProfitLock } from '@meme/domain';
+import { describeInvalidation } from './invalidation.js';
 
 export const ENGINE_VERSION = 'portfolio-4';
 export const CHECKPOINT_VERSION = 3;
@@ -162,7 +163,7 @@ export class ResumableEngine {
       else if(target>s.active.trade.entryPrice && (c.open>=target || c.high>=target))exit={price:c.open>=target?c.open:target,type:'take_profit'};
       else if(this.config.exitConfig.maxHoldingBars && s.index-s.active.entryIndex>=this.config.exitConfig.maxHoldingBars)exit={price:c.close,type:'timeout'};
       else if(last && this.config.exitConfig.closeAtEnd)exit={price:c.close,type:'end_of_backtest'};
-      if(exit)this.close(s,c,exit.price,exit.type,{priority:exit.type,stop,target,...(exit.type==='profit_lock'?{tier:(s.active.lockPriceTier ?? 0)+1,thresholds:this.config.exitConfig.profitLock?.tiers[s.active.lockPriceTier ?? 0],cost:s.active.lockCost,lockPrice:s.active.lockPrice}: {})});
+      if(exit)this.close(s,c,exit.price,exit.type,{priority:exit.type,stop,target,...(exit.type==='invalidation'?{invalidation:describeInvalidation(this.config.invalidationConditionGroup,s.history,s.active.impulse,condition=>this.group({mode:'all',conditions:[condition]},s,s.active!.impulse))}:{}),...(exit.type==='profit_lock'?{tier:(s.active.lockPriceTier ?? 0)+1,thresholds:this.config.exitConfig.profitLock?.tiers[s.active.lockPriceTier ?? 0],cost:s.active.lockCost,lockPrice:s.active.lockPrice}: {})});
     }
     let positions=this.s.states.filter(s=>s.active).length;
     for(const {s,candle:c,last} of contexts){

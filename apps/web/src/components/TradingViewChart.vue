@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { eventLabels as labels, marketValue, changePercent, formatNumber, preciseValue, signedValue, valueTone } from '../format';
+import { eventLabels as labels, marketValue, changePercent, formatNumber, preciseValue, signedValue, valueTone, exitLabel, invalidationEvidence } from '../format';
 import FibAudit from './FibAudit.vue';
 import { partitionMarkers } from '../chartMarkers';
 const props=defineProps<{symbol:string;interval:string;runId?:string;startTime?:number|null;endTime?:number|null;includeEndOfBacktest?:boolean;signalTypes?:string;anchor?:{tradeId?:string;from?:number;to?:number;start?:number;end?:number;empty?:boolean;fib?:any;fibFrom?:number;fibTo?:number}}>();
@@ -33,8 +33,8 @@ function scheduleMarkers(v:number){
 }
 const resolutions:Record<string,string>={"30s":"30S","1m":"1","5m":"5","15m":"15","1h":"60","4h":"240","1d":"D"};
 const seconds:Record<string,number>={"30s":30,"1m":60,"5m":300,"15m":900,"1h":3600,"4h":14400,"1d":86400};
-const markText=(m:any)=>`${m.event_label ?? ''} ${labels[m.signal_type] || m.signal_type} · ${isMcap.value?"市值":"价格"} ${displayValue(Number(m.price))} · 数量 ${preciseValue(m.quantity)}${props.includeEndOfBacktest===false && m.excluded_end?' · 不计入当前统计':''}\n${JSON.stringify(m.reason_json)}`;
-const eventSummary=(m:any)=>`${m.event_label ?? ''} ${labels[m.signal_type] || m.signal_type} · ${new Date(Number(m.time)).toLocaleString()} · ${isMcap.value?'市值':'价格'} ${displayValue(Number(m.price))} · 数量 ${preciseValue(m.quantity)} · ${m.reason_json?.message || labels[m.reason_json?.priority] || '策略条件满足'}${props.includeEndOfBacktest===false && m.excluded_end?' · 不计入当前统计':''}`;
+const markText=(m:any)=>`${m.event_label ?? ''} ${exitLabel(m)} · ${isMcap.value?"市值":"价格"} ${displayValue(Number(m.price))} · 数量 ${preciseValue(m.quantity)}${props.includeEndOfBacktest===false && m.excluded_end?' · 不计入当前统计':''}\n${m.signal_type==='invalidation'?invalidationEvidence(m.invalidation_detail ?? m.reason_json?.invalidation).join('\n'):JSON.stringify(m.reason_json)}`;
+const eventSummary=(m:any)=>`${m.event_label ?? ''} ${exitLabel(m)} · ${new Date(Number(m.time)).toLocaleString()} · ${isMcap.value?'市值':'价格'} ${displayValue(Number(m.price))} · 数量 ${preciseValue(m.quantity)} · ${m.signal_type==='invalidation'?invalidationEvidence(m.invalidation_detail ?? m.reason_json?.invalidation).join('；'):m.reason_json?.message || labels[m.reason_json?.priority] || '策略条件满足'}${props.includeEndOfBacktest===false && m.excluded_end?' · 不计入当前统计':''}`;
 function clearSelection(){selectedBuy.value=undefined;selectedEvent.value=undefined;cursorValue.value=undefined;referenceEpoch++;if(referenceId&&ready)try{widget.activeChart().removeEntity(referenceId);}catch{}referenceId=undefined;}
 async function drawReference(){
  if(!ready||!selectedBuy.value||!loadedTimes.has(Number(selectedBuy.value.time)))return;const request=++referenceEpoch,chart=widget.activeChart();

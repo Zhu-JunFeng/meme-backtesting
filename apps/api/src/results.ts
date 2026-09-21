@@ -1,5 +1,6 @@
 import { BadRequestException } from '@nestjs/common';
 import type { Pool } from 'pg';
+import { hydrateInvalidations, invalidationFilters } from './invalidation.js';
 
 export function includesEnd(q:Record<string,string>) {
   if(q.includeEndOfBacktest!==undefined && !['true','false'].includes(q.includeEndOfBacktest)) throw new BadRequestException('includeEndOfBacktest 必须为 true 或 false');
@@ -24,14 +25,14 @@ export function classifyTrade(t:any):{trade_classification:'normal_closed'|'end_
 export function signalTypes(q:Record<string,string>):string[]{
  if(q.signalTypes!==undefined&&typeof q.signalTypes!=='string')throw new BadRequestException('交易信号筛选必须为逗号分隔的文本');
  const types=[...new Set((q.signalTypes ?? '').split(',').map(s=>s.trim()).filter(Boolean))];
- if(types.some(t=>!['entry','add',...exits].includes(t)))throw new BadRequestException('不支持的交易信号筛选');
+ if(types.some(t=>!['entry','add',...exits].includes(t)&&!Object.hasOwn(invalidationFilters,t)))throw new BadRequestException('不支持的交易信号筛选');
  return types;
 }
 /** Filter whole trades after stable association/numbering, before paging or chart windows. */
 export function selectResults(data:{trades:any[];signals:any[]},q:Record<string,string>){
  const includeEnd=includesEnd(q),types=signalTypes(q),byTrade=new Map<string,Set<string>>();
  for(const s of data.signals)if(s.trade_id!=null){const id=String(s.trade_id);if(!byTrade.has(id))byTrade.set(id,new Set());byTrade.get(id)!.add(s.signal_type);}
- const trades=data.trades.map(t=>({...t,...classifyTrade(t)})).filter(t=>(includeEnd || t.trade_classification==='normal_closed')&&(!types.length || types.some(type=>exits.has(type)?t.exit_reason===type:byTrade.get(String(t.id))?.has(type))));
+ const trades=data.trades.map(t=>({...t,...classifyTrade(t)})).filter(t=>(includeEnd || t.trade_classification==='normal_closed')&&(!types.length || types.some(type=>Object.hasOwn(invalidationFilters,type)?t.exit_reason==='invalidation'&&(t.invalidation_detail?.primary ?? 'unknown')===invalidationFilters[type]:exits.has(type)?t.exit_reason===type:byTrade.get(String(t.id))?.has(type))));
  const ids=new Set(trades.map(t=>String(t.id)));
  const signals=data.signals.filter(s=>s.trade_id!=null?ids.has(String(s.trade_id)):!types.length&&(s.signal_type==='risk_event'||includeEnd));
  return {trades,signals,hiddenUnassociated:!includeEnd||types.length?data.signals.filter(s=>s.trade_id==null&&s.signal_type!=='risk_event').length:0};
@@ -92,8 +93,8 @@ export function enrichResults(rawTrades:any[],rawSignals:any[],config:any) {
 export async function loadResults(pool:Pool,id:string,q:Record<string,string>={}) {
  const args:any[]=[id],where=['run_id=$1'];
  for(const [param,column] of [['chain','chain'],['ca','ca'],['pairId','pair_id']])if(q[param]){args.push(q[param]);where.push(`${column}=$${args.length}`);}
- const [t,s,c]=await Promise.all([pool.query(`SELECT * FROM backtest_trades WHERE ${where.join(' AND ')} ORDER BY entry_time,id`,args),pool.query(`SELECT * FROM backtest_signals WHERE ${where.join(' AND ')} ORDER BY time,trade_no,event_order,id`,args),pool.query('SELECT config_json FROM backtest_runs WHERE id=$1',[id])]);
- return enrichResults(t.rows,s.rows,c.rows[0]?.config_json ?? {});
+ const [t,s,c]=await Promise.all([pool.query(`SELECT * FROM backtest_trades WHERE ${where.join(' AND ')} ORDER BY entry_time,id`,args),pool.query(`SELECT * FROM backtest_signals WHERE ${where.join(' AND ')} ORDER BY time,trade_no,event_order,id`,args),pool.query('SELECT id,config_json,input_ready,input_source_run_id,status FROM backtest_runs WHERE id=$1',[id])]);
+ const run=c.rows[0];return hydrateInvalidations(pool,run ?? {id,config_json:{}},enrichResults(t.rows,s.rows,run?.config_json ?? {}));
 }
 
 export function filteredStatistics(trades:any[],signals:any[],capital:number,start:number,includeEnd:boolean){
@@ -110,8 +111,12 @@ export function filteredStatistics(trades:any[],signals:any[],capital:number,sta
  const first=trades.reduce((n,t)=>Math.min(n,Number(t.entry_time)),start);const curve=[{time:Number.isFinite(first)?first:start,equity:capital}];
  for(const [time,pnl]of [...buckets].sort((a,b)=>a[0]-b[0])){balance+=pnl;peak=Math.max(peak,balance);drawdown=Math.max(drawdown,peak-balance);drawdownPercent=Math.max(drawdownPercent,peak>0?(peak-balance)/peak*100:0);curve.push({time,equity:balance});}
  const counts=new Map<string,number>();for(const s of matched.signals)counts.set(s.signal_type,(counts.get(s.signal_type)??0)+1);
+ const invalidationGroups=new Map<string,any>();
+ for(const t of selected.filter(t=>t.exit_reason==='invalidation')){const code=t.invalidation_detail?.primary ?? 'unknown';if(!invalidationGroups.has(code))invalidationGroups.set(code,{code,filterType:`invalidation:${code}`,count:0,wins:0,netPnl:0,missingPnl:0});const r=invalidationGroups.get(code)!;r.count++;r.wins+=Number(t.net_pnl)>0?1:0;r.netPnl+=Number(t.net_pnl ?? 0);r.missingPnl+=present(t.net_pnl)?0:1;}
+ const invalidationCount=selected.filter(t=>t.exit_reason==='invalidation').length;
  return {summary:{netPnl:missingPnl?null:net,totalNetPnl:missingPnl?null:net,unrealizedPnl:null,totalTrades:selected.length,winRate:selected.length&&!missingPnl?wins/selected.length:null,returnPercent:capital>0&&!missingPnl?net/capital*100:null,finalEquity:missingPnl?null:balance,maxDrawdown:missingPnl?null:drawdown,maxDrawdownPercent:missingPnl?null:drawdownPercent},curve:missingPnl?[]:curve,missingPnl,
   excluded:{count:excluded.length,endCount:excluded.filter(t=>t.trade_classification==='end_of_backtest').length,openCount:excluded.filter(t=>t.trade_classification==='open').length,incompleteCount:excluded.filter(t=>t.trade_classification==='incomplete').length,netPnl:excludedClosed.reduce((n,t)=>n+Number(t.net_pnl),0),knownClosedPnlCount:excludedClosed.length},
+  invalidationReasons:[...invalidationGroups.values()].map(r=>({...r,netPnl:r.missingPnl?null:r.netPnl,share:r.count/invalidationCount,winRate:r.missingPnl?null:r.wins/r.count})),
   exitReasons:[...reasons.values()].map(r=>({...r,netPnl:r.missingPnl?null:r.netPnl,share:r.count/selected.length,winRate:r.missingPnl?null:r.wins/r.count})),signalCounts:[...counts].map(([type,count])=>({type,count})),unassociatedSignals:signals.filter(s=>s.trade_id==null&&s.signal_type!=='risk_event').length};
 }
 
