@@ -41,7 +41,7 @@ describe("run detail compatibility",()=>{
  });
  it('propagates missing historical realized profit instead of silently adding zero',async()=>{
  const query=vi.fn().mockResolvedValueOnce({rows:[{report_json:{engineVersion:'portfolio-3'}}]}).mockResolvedValueOnce({rows:[{chain:'sol',ca:'a',pair_id:'p',trades:1,entries:1,realized:0,costs:0,missingPnl:1}]});
- const result=await runCas({query} as any,{id:'run',config_json:{symbols:[{chain:'sol',ca:'a',pairId:'p'}]}},{includeEndOfBacktest:'false'});
+ const result=await runCas({query} as any,{id:'run',config_json:{symbols:[{chain:'sol',ca:'a',pairId:'p'}]}},{includeEndOfBacktest:'true'});
  expect(result.summary.realizedPnl).toBeNull();expect(result.items[0].realizedPnl).toBeNull();
  });
  it("binds pool scope and applies time/page filters only after stable numbering",async()=>{

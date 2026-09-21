@@ -9,6 +9,18 @@ const key=(r:any)=>JSON.stringify([r.chain,r.ca,r.pair_id]);
 const present=(v:any)=>v!==null && v!==undefined && Number.isFinite(Number(v));
 const same=(a:any,b:any)=>present(a)&&present(b)&&Math.abs(Number(a)-Number(b))<=1e-9*Math.max(1,Math.abs(Number(a)),Math.abs(Number(b)));
 const exits=new Set(['take_profit','stop_loss','profit_lock','invalidation','timeout','end_of_backtest']);
+const normalExits=new Set(['take_profit','stop_loss','profit_lock','invalidation','timeout']);
+const finiteValue=(v:any)=>present(v)&&typeof v!=='boolean'&&String(v).trim()!=='';
+/** Query-only classification. Absence of an exit is different from a corrupt exit. */
+export function classifyTrade(t:any):{trade_classification:'normal_closed'|'end_of_backtest'|'open'|'incomplete';exclusion_reason:string|null}{
+ if(t.exit_reason==='end_of_backtest')return {trade_classification:'end_of_backtest',exclusion_reason:'结束强平'};
+ if(t.exit_time==null&&t.exit_price==null&&t.exit_reason==null)return {trade_classification:'open',exclusion_reason:'尚未平仓'};
+ if(!normalExits.has(t.exit_reason))return {trade_classification:'incomplete',exclusion_reason:'退出原因缺失或无法识别'};
+ if(!finiteValue(t.entry_time)||!finiteValue(t.exit_time)||Number(t.exit_time)<Number(t.entry_time))return {trade_classification:'incomplete',exclusion_reason:'入场或退出时间缺失、无效或顺序矛盾'};
+ if(!finiteValue(t.exit_price)||Number(t.exit_price)<=0)return {trade_classification:'incomplete',exclusion_reason:'退出成交值缺失或无效'};
+ if(!finiteValue(t.net_pnl))return {trade_classification:'incomplete',exclusion_reason:'净盈亏缺失或无效'};
+ return {trade_classification:'normal_closed',exclusion_reason:null};
+}
 export function signalTypes(q:Record<string,string>):string[]{
  if(q.signalTypes!==undefined&&typeof q.signalTypes!=='string')throw new BadRequestException('交易信号筛选必须为逗号分隔的文本');
  const types=[...new Set((q.signalTypes ?? '').split(',').map(s=>s.trim()).filter(Boolean))];
@@ -19,7 +31,7 @@ export function signalTypes(q:Record<string,string>):string[]{
 export function selectResults(data:{trades:any[];signals:any[]},q:Record<string,string>){
  const includeEnd=includesEnd(q),types=signalTypes(q),byTrade=new Map<string,Set<string>>();
  for(const s of data.signals)if(s.trade_id!=null){const id=String(s.trade_id);if(!byTrade.has(id))byTrade.set(id,new Set());byTrade.get(id)!.add(s.signal_type);}
- const trades=data.trades.filter(t=>(includeEnd || !t.excluded_end)&&(!types.length || types.some(type=>exits.has(type)?t.exit_reason===type:byTrade.get(String(t.id))?.has(type))));
+ const trades=data.trades.map(t=>({...t,...classifyTrade(t)})).filter(t=>(includeEnd || t.trade_classification==='normal_closed')&&(!types.length || types.some(type=>exits.has(type)?t.exit_reason===type:byTrade.get(String(t.id))?.has(type))));
  const ids=new Set(trades.map(t=>String(t.id)));
  const signals=data.signals.filter(s=>s.trade_id!=null?ids.has(String(s.trade_id)):!types.length&&(s.signal_type==='risk_event'||includeEnd));
  return {trades,signals,hiddenUnassociated:!includeEnd||types.length?data.signals.filter(s=>s.trade_id==null&&s.signal_type!=='risk_event').length:0};
@@ -40,6 +52,7 @@ export function enrichResults(rawTrades:any[],rawSignals:any[],config:any) {
    if(t.trade_no!=null)append(numberMap,t.trade_no,t);
    t.holding_ms=present(t.exit_time)?Number(t.exit_time)-Number(t.entry_time):null;
    t.excluded_end=t.exit_reason==='end_of_backtest';
+   Object.assign(t,classifyTrade(t));
   }
   for(const s of group.signals){
    let matches:any[]=[];
@@ -52,6 +65,7 @@ export function enrichResults(rawTrades:any[],rawSignals:any[],config:any) {
    }) ?? [];
    const t=matches.length===1?matches[0]:undefined;
    s.trade_id=t?.id ?? null;s.excluded_end=t?.excluded_end ?? (s.signal_type==='end_of_backtest');
+   s.trade_classification=t?.trade_classification ?? null;s.exclusion_reason=t?.exclusion_reason ?? null;
    s.association_available=!!t || s.trade_no!=null;
    if(t){s.trade_no ??=t.trade_no;
     if(s.event_order==null){if(s.signal_type==='entry')s.event_order=1;else if(exits.has(s.signal_type))s.event_order=(t.adds_json?.length ?? 0)+2;
@@ -83,8 +97,10 @@ export async function loadResults(pool:Pool,id:string,q:Record<string,string>={}
 }
 
 export function filteredStatistics(trades:any[],signals:any[],capital:number,start:number,includeEnd:boolean){
- const excluded=includeEnd?[]:trades.filter(t=>t.exit_reason==='end_of_backtest');
- const selected=trades.filter(t=>present(t.exit_time) && (includeEnd || t.exit_reason!=='end_of_backtest'));
+ const matched=selectResults({trades,signals},{includeEndOfBacktest:String(includeEnd)});
+ const excluded=includeEnd?[]:trades.map(t=>({...t,...classifyTrade(t)})).filter(t=>t.trade_classification!=='normal_closed');
+ const selected=matched.trades.filter(t=>present(t.exit_time));
+ const excludedClosed=excluded.filter(t=>t.trade_classification!=='open'&&finiteValue(t.exit_time)&&finiteValue(t.net_pnl));
  const buckets=new Map<number,number>(),reasons=new Map<string,any>();const missingPnl=selected.filter(t=>!present(t.net_pnl)).length;
  let net=0,wins=0;
  for(const t of selected){const pnl=Number(t.net_pnl ?? 0),time=Number(t.exit_time);net+=pnl;wins+=pnl>0?1:0;buckets.set(time,(buckets.get(time)??0)+pnl);
@@ -93,9 +109,9 @@ export function filteredStatistics(trades:any[],signals:any[],capital:number,sta
  let balance=capital,peak=capital,drawdown=0,drawdownPercent=0;
  const first=trades.reduce((n,t)=>Math.min(n,Number(t.entry_time)),start);const curve=[{time:Number.isFinite(first)?first:start,equity:capital}];
  for(const [time,pnl]of [...buckets].sort((a,b)=>a[0]-b[0])){balance+=pnl;peak=Math.max(peak,balance);drawdown=Math.max(drawdown,peak-balance);drawdownPercent=Math.max(drawdownPercent,peak>0?(peak-balance)/peak*100:0);curve.push({time,equity:balance});}
- const counts=new Map<string,number>();for(const s of signals)if(includeEnd || !s.excluded_end && (s.trade_id!=null || s.signal_type==='risk_event'))counts.set(s.signal_type,(counts.get(s.signal_type)??0)+1);
+ const counts=new Map<string,number>();for(const s of matched.signals)counts.set(s.signal_type,(counts.get(s.signal_type)??0)+1);
  return {summary:{netPnl:missingPnl?null:net,totalNetPnl:missingPnl?null:net,unrealizedPnl:null,totalTrades:selected.length,winRate:selected.length&&!missingPnl?wins/selected.length:null,returnPercent:capital>0&&!missingPnl?net/capital*100:null,finalEquity:missingPnl?null:balance,maxDrawdown:missingPnl?null:drawdown,maxDrawdownPercent:missingPnl?null:drawdownPercent},curve:missingPnl?[]:curve,missingPnl,
-  excluded:{count:excluded.length,netPnl:excluded.some(t=>!present(t.net_pnl))?null:excluded.reduce((n,t)=>n+Number(t.net_pnl),0)},
+  excluded:{count:excluded.length,endCount:excluded.filter(t=>t.trade_classification==='end_of_backtest').length,openCount:excluded.filter(t=>t.trade_classification==='open').length,incompleteCount:excluded.filter(t=>t.trade_classification==='incomplete').length,netPnl:excludedClosed.reduce((n,t)=>n+Number(t.net_pnl),0),knownClosedPnlCount:excludedClosed.length},
   exitReasons:[...reasons.values()].map(r=>({...r,netPnl:r.missingPnl?null:r.netPnl,share:r.count/selected.length,winRate:r.missingPnl?null:r.wins/r.count})),signalCounts:[...counts].map(([type,count])=>({type,count})),unassociatedSignals:signals.filter(s=>s.trade_id==null&&s.signal_type!=='risk_event').length};
 }
 
@@ -104,5 +120,5 @@ export async function statistics(pool:Pool,run:any,q:Record<string,string>){
  const result=filteredStatistics(data.trades,data.signals,run.config_json.executionConfig.initialCapital,run.config_json.startTime?Date.parse(run.config_json.startTime):data.trades.length?Number(data.trades[0].entry_time):new Date(run.created_at).getTime(),includeEnd);
  const original=(await pool.query('SELECT report_json FROM backtest_reports WHERE run_id=$1',[run.id])).rows[0]?.report_json ?? null;
  const originalCurve=(await pool.query('SELECT time,equity FROM (SELECT *,ROW_NUMBER() OVER(ORDER BY time) rn,COUNT(*) OVER() total FROM backtest_equity_curve WHERE run_id=$1) p WHERE rn=1 OR rn=total OR rn % GREATEST(total/2000,1)=0 ORDER BY time',[run.id])).rows;
- return {...result,summary:includeEnd?{...original,...(original?{winRate:original.totalTrades?original.winRate:null}:result.summary)}:{...result.summary,engineVersion:original?.engineVersion},curve:includeEnd?originalCurve:result.curve,original,originalCurve,partial:run.status!=='completed',includeEndOfBacktest:includeEnd};
+ return {...result,summary:includeEnd?{...original,...(original?{winRate:original.totalTrades?original.winRate:null}:result.summary)}:{...result.summary,engineVersion:original?.engineVersion},curve:includeEnd?originalCurve:result.curve,original,originalCurve,partial:run.status!=='completed',openCountComplete:run.status==='completed',includeEndOfBacktest:includeEnd};
 }

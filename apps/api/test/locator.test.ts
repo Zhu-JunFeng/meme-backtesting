@@ -15,7 +15,7 @@ it('does not fabricate entry or exit for an empty selection',async()=>{vi.mocked
 it('rejects foreign pools and nonexistent event IDs',async()=>{await expect(locate({} as any,run,{...q,ca:'other'})).rejects.toThrow('不属于');await expect(locate({} as any,run,{...q,eventId:'missing'})).rejects.toThrow('不存在');});
 it('queries immutable input when available',async()=>{const query=vi.fn().mockResolvedValue({rows:[{before:30000,after:900000}]});await locate({query} as any,{...run,input_ready:true},{...q,eventId:'s'});expect(query.mock.calls[0][0]).toContain('backtest_input_chunks');});
 it('excluded selected trade falls back to first matching trade and filters all markers',async()=>{
- vi.mocked(loadResults).mockResolvedValue({trades:[{id:'end',entry_time:100,exit_time:200,excluded_end:true},{id:'profit',entry_time:600000,exit_time:900000,exit_reason:'take_profit'}],signals:[{id:'hidden',trade_id:'end',time:650000,signal_type:'entry'},{id:'shown',trade_id:'profit',time:600000,signal_type:'entry'}]});
+ vi.mocked(loadResults).mockResolvedValue({trades:[{id:'end',entry_time:100,exit_time:200,excluded_end:true,exit_reason:'end_of_backtest'},{id:'profit',entry_time:600000,exit_time:900000,exit_reason:'take_profit',exit_price:10,net_pnl:0}],signals:[{id:'hidden',trade_id:'end',time:650000,signal_type:'entry'},{id:'shown',trade_id:'profit',time:600000,signal_type:'entry'}]});
  const query=vi.fn().mockResolvedValue({rows:[{before:30000,after:3900000}]});const r=await locate({query} as any,run,{...q,tradeId:'end',includeEndOfBacktest:'false',signalTypes:'take_profit'});
  expect(r.tradeId).toBe('profit');expect(r.events.map((s:any)=>s.id)).toEqual(['shown']);
 });

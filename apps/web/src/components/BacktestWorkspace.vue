@@ -78,7 +78,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
 </script>
 
 <template>
-  <RunDetail v-if="activeRun" :run-id="activeRun.id" @back="activeRun=undefined" />
+  <RunDetail v-if="activeRun" :key="activeRun.id" :run-id="activeRun.id" @back="activeRun=undefined" />
   <div v-else class="backtest-layout" :class="'mobile-view-'+mobileView">
     <div class="mobile-workspace-switch" role="group" aria-label="回测工作台视图">
       <a-button :type="mobileView==='history'?'primary':'default'" :aria-pressed="mobileView==='history'" @click="mobileView='history'">历史任务（{{runs.length}}）</a-button>

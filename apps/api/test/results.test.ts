@@ -1,11 +1,28 @@
 import {describe,it,expect} from 'vitest';
-import {enrichResults,filteredStatistics,includesEnd,selectResults,signalTypes} from '../src/results.js';
+import {enrichResults,filteredStatistics,classifyTrade,includesEnd,selectResults,signalTypes} from '../src/results.js';
 const config={executionConfig:{feePercent:1,slippagePercent:1,buyTaxPercent:1}};
 const base={chain:'sol',ca:'a',pair_id:'p'};
 const trade=(id:string,entry:number,exit:number,reason:string,pnl:number)=>({...base,id,entry_time:entry,exit_time:exit,entry_price:100,exit_price:110,quantity:1,net_pnl:pnl,exit_reason:reason,adds_json:[]});
 describe('read-only result analytics',()=>{
+ it.each(['take_profit','stop_loss','profit_lock','invalidation','timeout'])('accepts complete %s including same-bar and zero net trades',reason=>{
+  expect(classifyTrade(trade('a',1,1,reason,0)).trade_classification).toBe('normal_closed');
+ });
+ it.each([{exit_time:null},{exit_time:0},{exit_time:NaN},{exit_price:null},{exit_price:0},{exit_price:-1},{exit_price:Infinity},{net_pnl:null},{net_pnl:''},{net_pnl:NaN},{exit_reason:'unknown'},{entry_time:null}])('rejects incomplete historical fields %j',patch=>{
+  expect(classifyTrade({...trade('a',1,2,'stop_loss',0),...patch}).trade_classification).toBe('incomplete');
+ });
+ it('excludes open/add positions and their costs/signals without adding floating PNL to excluded realized PNL',()=>{
+  const open={...trade('open',1,2,'timeout',9999),exit_time:null,exit_price:null,exit_reason:null,adds_json:[{time:2,price:100,quantity:1}]};
+  const ts=[trade('normal',1,2,'timeout',10),open,{...trade('broken',1,2,'stop_loss',0),net_pnl:null}];
+  const ss=[{signal_type:'entry',trade_id:'normal'},{signal_type:'timeout',trade_id:'normal'},{signal_type:'entry',trade_id:'open'},{signal_type:'add',trade_id:'open'},{signal_type:'risk_event'}];
+  const result=filteredStatistics(ts,ss,1000,0,false);
+  expect(result.summary).toMatchObject({netPnl:10,totalTrades:1,unrealizedPnl:null,finalEquity:1010});
+  expect(result.excluded).toMatchObject({openCount:1,incompleteCount:1,netPnl:0});
+  expect(result.signalCounts).toEqual([{type:'entry',count:1},{type:'timeout',count:1},{type:'risk_event',count:1}]);
+  expect(selectResults({trades:ts,signals:ss},{}).trades).toHaveLength(3);
+  expect(includesEnd({})).toBe(true);expect(includesEnd({includeEndOfBacktest:'false'})).toBe(false);
+ });
  it('whole-trade union preserves complete pairs, numbering and excludes unknown association',()=>{
-  const ts=[{id:'end',excluded_end:true,exit_reason:'end_of_backtest'},{id:'tp',exit_reason:'take_profit'},{id:'lock',exit_reason:'profit_lock'}];
+  const ts=[trade('end',1,2,'end_of_backtest',0),trade('tp',1,2,'take_profit',10),trade('lock',1,2,'profit_lock',20)];
   const ss=[{id:1,trade_id:'end',signal_type:'entry'},{id:2,trade_id:'end',signal_type:'end_of_backtest'},{id:3,trade_id:'tp',signal_type:'entry',event_label:'买2'},{id:4,trade_id:'tp',signal_type:'take_profit'},{id:5,trade_id:'lock',signal_type:'entry'},{id:6,signal_type:'entry'},{id:7,signal_type:'risk_event'}];
   const r=selectResults({trades:ts,signals:ss},{includeEndOfBacktest:'false',signalTypes:'take_profit,profit_lock,take_profit'});expect(r.trades.map(t=>t.id)).toEqual(['tp','lock']);expect(r.signals.map(s=>s.id)).toEqual([3,4,5]);expect(r.signals[0].event_label).toBe('买2');expect(r.hiddenUnassociated).toBe(1);
   expect(selectResults({trades:ts,signals:ss},{includeEndOfBacktest:'false'}).signals.map(s=>s.id)).toEqual([3,4,5,7]);
@@ -13,9 +30,9 @@ describe('read-only result analytics',()=>{
   expect(selectResults({trades:ts,signals:ss},{signalTypes:'end_of_backtest',includeEndOfBacktest:'false'}).signals).toEqual([]);
  });
  it('validates signal filters and normalizes blank/duplicate entries',()=>{expect(signalTypes({signalTypes:' entry, ,entry,timeout '})).toEqual(['entry','timeout']);expect(()=>signalTypes({signalTypes:'risk_event'})).toThrow();expect(()=>signalTypes({signalTypes:'invalid'})).toThrow();});
- it('filters end exits, groups equal exit times before drawdown, keeps source unchanged',()=>{const ts=[trade('1',1,10,'stop_loss',-10),trade('2',2,10,'take_profit',20),trade('3',3,20,'end_of_backtest',-100)];const original=structuredClone(ts),r=filteredStatistics(ts,[],1000,0,false);expect(r.summary.netPnl).toBe(10);expect(r.summary.maxDrawdown).toBe(0);expect(r.curve.map(p=>p.equity)).toEqual([1000,1010]);expect(r.excluded).toEqual({count:1,netPnl:-100});expect(r.exitReasons.map(x=>x.count)).toEqual([1,1]);expect(ts).toEqual(original);});
+ it('filters end exits, groups equal exit times before drawdown, keeps source unchanged',()=>{const ts=[trade('1',1,10,'stop_loss',-10),trade('2',2,10,'take_profit',20),trade('3',3,20,'end_of_backtest',-100)];const original=structuredClone(ts),r=filteredStatistics(ts,[],1000,0,false);expect(r.summary.netPnl).toBe(10);expect(r.summary.maxDrawdown).toBe(0);expect(r.curve.map(p=>p.equity)).toEqual([1000,1010]);expect(r.excluded).toMatchObject({count:1,netPnl:-100,endCount:1,openCount:0,incompleteCount:0});expect(r.exitReasons.map(x=>x.count)).toEqual([1,1]);expect(ts).toEqual(original);});
  it('empty/all-excluded has no artificial win rate',()=>{const r=filteredStatistics([trade('1',1,2,'end_of_backtest',-10)],[],1000,0,false);expect(r.summary.winRate).toBeNull();expect(r.summary.finalEquity).toBe(1000);expect(r.exitReasons).toEqual([]);expect(()=>includesEnd({includeEndOfBacktest:'0'})).toThrow();});
- it('missing historical PNL never becomes a synthetic zero-profit order',()=>{const r=filteredStatistics([{...trade('1',1,2,'stop_loss',0),net_pnl:null}],[],1000,0,false);expect(r.summary.netPnl).toBeNull();expect(r.summary.winRate).toBeNull();expect(r.curve).toEqual([]);expect(r.missingPnl).toBe(1);});
+ it('missing historical PNL never becomes a synthetic zero-profit order',()=>{const r=filteredStatistics([{...trade('1',1,2,'stop_loss',0),net_pnl:null}],[],1000,0,false);expect(r.summary.netPnl).toBe(0);expect(r.summary.winRate).toBeNull();expect(r.curve).toEqual([{time:0,equity:1000}]);expect(r.excluded.incompleteCount).toBe(1);});
  it('reconstructs only unique historical associations and cost-inclusive returns',()=>{const t=trade('1',1,2,'end_of_backtest',7);const s=[{...base,id:1,time:1,signal_type:'entry',price:100,quantity:1},{...base,id:2,time:2,signal_type:'end_of_backtest',price:110,quantity:1}];const r=enrichResults([t],s,config);expect(r.trades[0].first_entry_price).toBe(100);expect(r.trades[0].net_return_percent).toBeCloseTo(7/103*100);expect(r.trades[0].holding_ms).toBe(1);expect(r.signals.map(s=>s.event_label)).toEqual(['买1','卖1']);expect(r.signals.every(s=>s.excluded_end)).toBe(true);expect(t).not.toHaveProperty('trade_no');});
  it('does not fabricate first buy, percentage or numbers for ambiguous history',()=>{const t=trade('1',1,2,'stop_loss',-5),r=enrichResults([t,{...t,id:'2'}],[{...base,id:1,time:1,signal_type:'entry',price:100,quantity:1}],{});expect(r.trades[0].first_entry_price).toBeNull();expect(r.trades[0].trade_no).toBeNull();expect(r.trades[0].net_return_percent).toBeNull();expect(r.signals[0].association_available).toBe(false);});
  it('new persisted association disambiguates same-bar trades and add labels',()=>{const a={...trade('a',1,1,'stop_loss',-5),trade_no:1},b={...trade('b',1,2,'take_profit',10),trade_no:2};const r=enrichResults([a,b],[{...base,id:1,time:1,signal_type:'entry',trade_no:2,event_order:1,price:101,quantity:1},{...base,id:2,time:1,signal_type:'add',trade_no:2,event_order:2,price:102,quantity:1}],config);expect(r.signals.map(s=>s.event_label)).toEqual(['买2','加2.1']);expect(r.trades.find(t=>t.id==='b')?.first_entry_price).toBe(101);});

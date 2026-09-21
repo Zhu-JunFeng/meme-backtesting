@@ -82,7 +82,7 @@ export async function runCas(pool:Pool,run:any,q:Record<string,string>,detail=fa
   const config=run.config_json as DatasetConfig;
   const report=(await pool.query("SELECT report_json FROM backtest_reports WHERE run_id=$1",[run.id])).rows[0]?.report_json;
   let stats:any[];
-  if(types.length){
+  if(types.length || !includeEnd){
     const data=selectResults(await loadResults(pool,run.id),q),map=new Map<string,any>();
     for(const t of data.trades){const key=JSON.stringify([t.chain,t.ca,t.pair_id]);if(!map.has(key))map.set(key,{chain:t.chain,ca:t.ca,pair_id:t.pair_id,trades:0,entries:0,missingPnl:0,realized:0,costs:0});const s=map.get(key);s.entries++;if(t.exit_time!=null){s.trades++;s.missingPnl+=t.net_pnl==null?1:0;s.realized+=Number(t.net_pnl ?? 0);}s.costs+=Number(t.fees??0)+Number(t.slippage_cost??0)+Number(t.tax_cost??0);}
     stats=[...map.values()];
