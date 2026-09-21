@@ -63,3 +63,18 @@ node scripts/explore-strategy-neighborhood.mjs robin 30s output/research-stable5
 - 选出的前三名分别复核：滑点增加 1 个百分点、拉升门槛上下浮动 10%、最大持仓根数缩短 20%。压力结果不能反过来伪装成独立盲测。
 - 输出 `protocol.json`、`dataset.json`、逐候选 `trials.json`、`stress.json` 和 `results.json`，保留源快照摘要与引擎版本。程序中断时已完成候选仍可审计，但本工具不承诺自动断点续跑。
 - `withoutBestCaNormalReturn` 仅为从已实现利润中扣去最大贡献 CA 的诊断值，**不是**移除该 CA 后重新撮合的反事实收益。
+
+## 包含最后一根平仓的账户口径
+
+```sh
+node scripts/explore-strategy-neighborhood.mjs robin 30s output/research-stable5-20260921/terminal-close/robin-30s terminal-close
+```
+
+`terminal-close` 模式从第二轮保存的 `round2/<chain>-candidate-research-only.json` 和原始 `<chain>-candidate.json` 生成 192 个候选，固定随机种子 20260924。它与旧模式分别保存研究记录，不覆盖旧结果。
+
+- 所有候选强制 `exitConfig.closeAtEnd=true`，不预热（`warmupBars=0`），对齐服务器从所选起点计算的语义。
+- 每个池在所选范围内的最后一根有效原始 K 线结束时，如仍持仓，按该根收盘值退出。价格与市值任务使用各自的价值维度。卖出仍计入手续费、滑点、税费；已有止盈止损优先级不变。不创造末尾缺失行情，不按零价值清算。
+- **排名和目标只使用完整账户净收益**，包括结束平仓。首段门槛为完整账户收益非负、实际最大回撤不超过 10%、总平仓不少于 20 笔；后续比较三段最低完整账户收益。每段达到 5% 才标记历史目标通过。正常平仓收益仅作为诊断字段，不参与筛选门槛。
+- 先固定三段选出的前十名，再检查较短的历史后续片段：SOL UTC 9/19 00:00–17:00、ROBIN UTC 9/21 00:00–09:00。片段长度不同，不把它们当成同周期收益或新的盲测；这些日期在此前研究中已被部分查看。
+- 输出 `totalTrades` 和 `accountWinRate` 包括结束平仓。兼容旧字段 `excludedCount/excludedNet` 仅表示旧口径会排除的结束交易，**不意味着在本模式账户收益里扣除了它们**。
+- 生产页面若关闭“包含结束强平及未平仓交易”，显示的统计不是本研究排名口径；查看服务器复核时应开启此开关。本工具不修改前端默认值或任何历史报告。

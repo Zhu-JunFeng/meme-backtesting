@@ -24,3 +24,10 @@ test('historical warm-up updates indicators but never opens positions',()=>{
  const {config,inputs}=fixture(),actual=evaluateWindow({id:1,config},inputs,502*30000,600*30000,{warmupBars:1500});
  assert(actual.processedBars>0);assert.equal(actual.normalTrades,0);assert.equal(actual.excludedCount,0);assert.equal(actual.netPnl,0);
 });
+test('terminal close uses each pool last available real close, includes every cost and leaves no unrealized gain',()=>{
+ const {config,inputs}=fixture();config.positionConfig.allowReentry=false;config.exitConfig={stopLoss:{type:'percent',value:99},takeProfit:{type:'percent',value:10000},closeAtEnd:true};
+ inputs[0].candles=inputs[0].candles.slice(0,60);inputs[1].candles=inputs[1].candles.slice(0,95);
+ const reference=runBacktest(config,inputs);assert.equal(reference.trades.length,2);assert.equal(reference.report.openPositions.length,0);
+ for(const t of reference.trades){const last=inputs.find(p=>p.symbol.ca===t.symbol.ca).candles.at(-1);assert.equal(t.exitReason,'end_of_backtest');assert.equal(t.exitTime,last.time);assert.equal(t.exitPrice,last.close);assert(t.fees>0&&t.slippageCost>0&&t.taxCost>0);assert(Math.abs(t.netPnl-(t.grossPnl-t.fees-t.slippageCost-t.taxCost))<1e-8);}
+ const actual=evaluateWindow({id:'terminal',config},inputs,0,600*30000,{warmupBars:0});assert.equal(actual.totalTrades,2);assert.equal(actual.normalTrades,0);assert.equal(actual.excludedCount,2);assert.equal(actual.netPnl,reference.report.netPnl);assert.equal(actual.accountReturn,actual.excludedNet/config.executionConfig.initialCapital*100);
+});
