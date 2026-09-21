@@ -18,6 +18,7 @@ test('offline cursor reproduces reference account and normal-closed results',()=
  const actual=evaluateWindow({id:1,config},inputs,0,502*30000,{warmupBars:0});
  assert(reference.report.totalTrades>0);assert.equal(actual.accountReturn,reference.report.returnPercent);assert.equal(actual.accountMaxDrawdown,reference.report.maxDrawdownPercent);
  const normal=reference.trades.filter(t=>t.exitReason!=='end_of_backtest');assert.equal(actual.normalTrades,normal.length);assert.equal(actual.normalNet,normal.reduce((n,t)=>n+t.netPnl,0));assert.deepEqual(config,before);
+ const byCa=new Map();for(const t of normal){const k=`${t.symbol.chain}:${t.symbol.ca}`;byCa.set(k,(byCa.get(k)||0)+t.netPnl);}assert.equal(actual.topCaPnl,Math.max(0,...byCa.values()));if(actual.topCaPnl>0)assert.equal(byCa.get(actual.topCaKey),actual.topCaPnl);else assert.equal(actual.topCaKey,null);
 });
 test('historical warm-up updates indicators but never opens positions',()=>{
  const {config,inputs}=fixture(),actual=evaluateWindow({id:1,config},inputs,502*30000,600*30000,{warmupBars:1500});

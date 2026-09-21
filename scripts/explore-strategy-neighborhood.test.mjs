@@ -1,0 +1,16 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {createRequire} from 'node:module';
+import {candidatesAround,foldEligible,targetReached} from './explore-strategy-neighborhood.mjs';
+const base={schemaVersion:1,impulseCondition:{type:'impulse_fractal_swing',leftBars:2,rightBars:2,lookbackBars:100,minGainPercent:100,maxDurationBars:30,requireVolumeExpansion:false},entryConditionGroup:{mode:'all',conditions:[{type:'fib_retracement',zoneLow:.618,zoneHigh:.786}]},invalidationConditionGroup:{mode:'any',conditions:[{type:'break_swing_low_invalidation',bufferPercent:0}]},exitConfig:{stopLoss:{type:'percent',value:30},takeProfit:{type:'risk_reward',ratio:4},maxHoldingBars:120,closeAtEnd:true},positionConfig:{mode:'single_entry',maxEntries:1,maxConcurrentPositions:1,allowReentry:true,sizing:{type:'fixed_percent',value:1}},executionConfig:{initialCapital:100000,feePercent:.3,slippagePercent:1,buyTaxPercent:1,sellTaxPercent:1,fillMode:'current_bar_close'}};
+test('deterministic unique candidates preserve source, costs and supported sizing',()=>{const before=structuredClone(base),a=candidatesAround([base],256),b=candidatesAround([base],256);assert.deepEqual(a,b);assert.deepEqual(base,before);assert.equal(new Set(a.map(x=>JSON.stringify(x.config))).size,256);for(const {config:c} of a){assert.deepEqual(c.executionConfig,base.executionConfig);assert(c.positionConfig.sizing.value<=3);assert(c.impulseCondition.maxDurationBars<=c.impulseCondition.lookbackBars);assert(c.impulseCondition.rightBars>=2);assert(c.entryConditionGroup.conditions.length);}});
+test('bounds prevent unbounded or empty searches',()=>{assert.throws(()=>candidatesAround([],10));assert.throws(()=>candidatesAround([base],5001));assert.throws(()=>candidatesAround([base],0));});
+test('generated condition parameters conform to application seed schemas',()=>{
+ const require=createRequire(new URL('../apps/api/package.json',import.meta.url)),Ajv=require('ajv'),ajv=new Ajv({strict:false});
+ const sql=readFileSync(new URL('../apps/api/migrations/002_strategy_configuration.sql',import.meta.url),'utf8');
+ const schemas=new Map([...sql.matchAll(/\('([^']+)','[^']+','[^']+','[^']+',\s*\n\s*'([^']+)'::jsonb/g)].map(m=>[m[1],ajv.compile(JSON.parse(m[2]))]));assert(schemas.size>=12);
+ const check=item=>{if(item.enabled===false)return;if(item.conditions){assert(item.conditions.length);if(item.mode==='at_least')assert(item.minMatches>=1&&item.minMatches<=item.conditions.length);item.conditions.forEach(check);return;}const validate=schemas.get(item.type);assert(validate,`Unknown condition ${item.type}`);assert(validate(item),JSON.stringify(validate.errors));};
+ for(const {config:c} of candidatesAround([base])){check(c.impulseCondition);check(c.entryConditionGroup);check(c.invalidationConditionGroup);}
+});
+test('all windows and accounting views must pass; terminal losses cannot be hidden',()=>{const r={accountReturn:5,normalReturn:6,accountMaxDrawdown:10,normalTrades:20};assert(targetReached([r,r,r]));assert(!targetReached([r,r]));assert(!targetReached([r,r,{...r,accountReturn:-1}]));assert(!targetReached([r,r,{...r,normalTrades:19}]));assert(!targetReached([r,r,{...r,accountMaxDrawdown:10.1}]));assert(foldEligible({...r,accountReturn:0,normalReturn:0}));});

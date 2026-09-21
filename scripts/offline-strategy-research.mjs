@@ -48,7 +48,8 @@ export function evaluateWindow(candidate,inputs,from,to,{interval='30s',valueTyp
  }
  drain();const r=engine.finish();assert.equal(r.openPositions.length,0);
  const normalReturn=normalNet/capital*100,topCaPnl=Math.max(0,...byCa.values());
- return{id:candidate.id,from:new Date(from).toISOString(),toExclusive:new Date(to).toISOString(),accountReturn:r.returnPercent,normalReturn,netPnl:r.netPnl,normalNet,normalTrades,winRate:normalTrades?wins/normalTrades:null,accountMaxDrawdown:r.maxDrawdownPercent,profitFactor:Number.isFinite(r.profitFactor)?r.profitFactor:null,excludedCount,excludedNet,topCaPnl,withoutBestCaNormalReturn:(normalNet-topCaPnl)/capital*100,syntheticBars:r.dataQuality.syntheticBars,processedBars:engine.s.processed,seconds:(performance.now()-started)/1000};
+ const topCaKey=topCaPnl>0?[...byCa].find(([,pnl])=>pnl===topCaPnl)?.[0]:null;
+ return{id:candidate.id,from:new Date(from).toISOString(),toExclusive:new Date(to).toISOString(),accountReturn:r.returnPercent,normalReturn,netPnl:r.netPnl,normalNet,normalTrades,winRate:normalTrades?wins/normalTrades:null,accountMaxDrawdown:r.maxDrawdownPercent,profitFactor:Number.isFinite(r.profitFactor)?r.profitFactor:null,excludedCount,excludedNet,topCaPnl,topCaKey,withoutBestCaNormalReturn:(normalNet-topCaPnl)/capital*100,syntheticBars:r.dataQuality.syntheticBars,processedBars:engine.s.processed,seconds:(performance.now()-started)/1000};
 }
 
 export async function runResearch({chain,interval='30s',valueType='mcap',manifestPath,protocolPath,output}){
