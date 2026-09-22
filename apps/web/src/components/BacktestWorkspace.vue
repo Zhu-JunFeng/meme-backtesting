@@ -27,7 +27,8 @@ const selectionBlocked=caSelection.blocked;
 const strategySummary = computed(() => {
   const value = selectedVersion.value?.strategyJson;
   if (!value) return [];
-  return [`Fractal 拉升 ≥ ${value.impulseCondition.minGainPercent}% / 最长 ${value.impulseCondition.maxDurationBars} 根`, `入场条件 ${countActive(value.entryConditionGroup)} 项，失效条件 ${countActive(value.invalidationConditionGroup)} 项`, `${value.positionConfig.mode === "single_entry" ? "单次买入" : `最多 ${value.positionConfig.maxEntries} 次买入`} · 仓位 ${value.positionConfig.sizing.value}${value.positionConfig.sizing.type === "fixed_amount" ? "" : "%"}`, `默认手续费 ${value.executionConfig.feePercent}% · 滑点 ${value.executionConfig.slippagePercent}%`,value.exitConfig.profitLock?.enabled?`动态锁盈：${value.exitConfig.profitLock.tiers.map((t:any)=>`${t.activationPercent}% → 保底 ${t.floorPercent}%`).join('；')}（收盘确认，下一根生效）`:'动态锁盈：关闭'];
+  // This is read-only here: entry timing is edited and versioned in StrategyWorkspace.
+  return [value.entryAfterSignal!==false?"仅在信号触发后买入（策略设置）":"允许信号前买入（策略设置）",`Fractal 拉升 ≥ ${value.impulseCondition.minGainPercent}% / 最长 ${value.impulseCondition.maxDurationBars} 根`, `入场条件 ${countActive(value.entryConditionGroup)} 项，失效条件 ${countActive(value.invalidationConditionGroup)} 项`, `${value.positionConfig.mode === "single_entry" ? "单次买入" : `最多 ${value.positionConfig.maxEntries} 次买入`} · 仓位 ${value.positionConfig.sizing.value}${value.positionConfig.sizing.type === "fixed_amount" ? "" : "%"}`, `默认手续费 ${value.executionConfig.feePercent}% · 滑点 ${value.executionConfig.slippagePercent}%`,value.exitConfig.profitLock?.enabled?`动态锁盈：${value.exitConfig.profitLock.tiers.map((t:any)=>`${t.activationPercent}% → 保底 ${t.floorPercent}%`).join('；')}（收盘确认，下一根生效）`:'动态锁盈：关闭'];
 });
 
 function countActive(group:any): number { return group?.conditions?.filter((item:any) => item.enabled !== false).reduce((sum:number,item:any) => sum + (item.conditions ? countActive(item) : 1), 0) || 0; }
@@ -52,13 +53,14 @@ async function create() {
   try {
     const overrides = Object.fromEntries(Object.entries({ initialCapital: form.value.initialCapital, feePercent: form.value.feePercent, slippagePercent: form.value.slippagePercent, buyTaxPercent: form.value.buyTaxPercent, sellTaxPercent: form.value.sellTaxPercent }).filter(([,value]) => value !== undefined && value !== null));
     const dataset = {cas:selectedCas.value.map(({chain,ca})=>({chain,ca})),interval:form.value.interval,valueType:form.value.valueType,startTime:form.value.startTime ? new Date(form.value.startTime).toISOString():undefined,endTime:form.value.endTime ? new Date(form.value.endTime).toISOString():undefined,filters:caSelection.snapshot()};
-    const preview=(await api.post("/market/dataset-preview",dataset)).data;
-    const confirmed=await new Promise<boolean>(resolve=>Modal.confirm({title:"确认回测数据集",content:`共 ${preview.caCount} 个 CA、${preview.poolCount} 个池；可回测 ${preview.availablePoolCount} 个池，无数据 ${preview.noDataPoolCount} 个池。所有交易池共享一笔初始资金。`,okText:"提交任务",cancelText:"返回检查",onOk:()=>resolve(true),onCancel:()=>resolve(false)}));
+    const preview=(await api.post("/market/dataset-preview",{...dataset,strategyVersionId:selectedVersionId.value})).data;
+    const excluded=preview.signalSelection?.excluded??[];
+    const confirmed=await new Promise<boolean>(resolve=>Modal.confirm({title:"确认回测数据集",content:`实际纳入 ${preview.caCount} 个 CA、${preview.poolCount} 个池；可回测 ${preview.availablePoolCount} 个池，无数据 ${preview.noDataPoolCount} 个池。信号后买入：${preview.signalSelection?.enabled?'开启':'关闭'}。缺少信号已排除 ${excluded.length} 个 CA：${excluded.map((s:any)=>s.chain+'/'+s.ca).join('、')||'无'}。范围内无信号后买入机会的池 ${preview.signalSelection?.noOpportunity?.length??0} 个。所有池共享初始资金。`,okText:"提交任务",cancelText:"返回检查",onOk:()=>resolve(true),onCancel:()=>resolve(false)}));
     if(!confirmed)return;
     await api.post("/backtests",{name:form.value.name,strategyVersionId:selectedVersionId.value,dataset,executionOverrides:overrides});
     message.success("回测任务已提交到后台");
     await refreshRuns();
-  } catch (error:any) { message.error(error.response?.data?.message || "任务创建失败"); }
+  } catch (error:any) { const data=error.response?.data;if(data?.excluded?.length)Modal.warning({title:data.message,content:`缺少有效信号的 CA（${data.excluded.length} 个）：${data.excluded.map((s:any)=>s.chain+'/'+s.ca).join('、')}`});else message.error(data?.message || "任务创建失败"); }
   finally { loading.value = false; }
 }
 function openRun(run:any) { activeRun.value=run; }

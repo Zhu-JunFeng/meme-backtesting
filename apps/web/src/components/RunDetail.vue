@@ -98,6 +98,7 @@ onBeforeUnmount(()=>{filterEpoch++;loadEpoch++;epoch++;caEpoch++;poolEpoch++;loc
   <template v-if="run">
    <header><h2>{{run.name}}</h2><a-tag>{{({pending:'等待中',running:'运行中',stopping:'停止中',stopped:'已停止',completed:'已完成',failed:'失败',cancelled:'已取消'} as any)[run.status]}}</a-tag><span>{{report?.engineVersion || run.runtime_version || '历史引擎'}} · {{run.config_json.interval}} · {{run.config_json.valueType==='mcap'?'市值':'价格'}}</span><RunActions :run="run" @changed="load" /></header>
    <p v-if="run.runtime_version" class="help" role="status">阶段：{{({freezing:'冻结输入',computing:'回测计算',saving:'保存结果',completed:'已完成'} as any)[run.phase] || run.phase}} · 恢复 {{run.recovery_count}} 次 · 最近检查点：{{run.checkpoint_at ? new Date(run.checkpoint_at).toLocaleString() : '尚未生成'}}</p>
+   <p class="help">任务入场限制：{{run.config_json.entrySignals?.length?'仅在信号触发后买入':'未限制信号前买入'}}。{{run.config_json.signalSelection?.excluded?.length ? `因缺少信号排除 ${run.config_json.signalSelection.excluded.length} 个 CA` : ''}}</p>
    <a-alert v-if="run.status!=='completed'" type="info" show-icon message="当前为阶段性结果，最终盈亏报告在任务完成后生成。" />
    <a-progress v-if="['pending','running'].includes(run.status)" :percent="Math.round(Number(run.progress)*100)" />
    <a-alert v-if="run.error_message" :message="run.error_message" type="error" />

@@ -38,6 +38,7 @@ async function loadTemplate() {
 async function loadVersion() {
   if (!selectedVersionId.value) { strategy.value = undefined; return; }
   strategy.value = structuredClone((await api.get(`/strategy-versions/${selectedVersionId.value}`)).data.strategyJson);
+  strategy.value.entryAfterSignal ??= true;
 }
 async function saveVersion() {
   if (!strategy.value || !selectedTemplateId.value) return;
@@ -93,6 +94,7 @@ function groupSummary(group:any): string {
   return labels.join(group.mode === "all" ? " 且 " : " 或 ");
 }
 const summary = computed(() => strategy.value ? [
+  strategy.value.entryAfterSignal!==false?'仅在首次外部信号后买入；信号前行情用于指标预热；缺失信号的 CA 排除':'不限制信号前买入（可能高估实际可参与的交易机会）',
   `识别涨幅 ≥ ${strategy.value.impulseCondition.minGainPercent}%、最长 ${strategy.value.impulseCondition.maxDurationBars} 根的 Fractal 拉升`,
   `入场：${groupSummary(strategy.value.entryConditionGroup)}`,
   `失效：${groupSummary(strategy.value.invalidationConditionGroup)}`,
@@ -135,6 +137,7 @@ onMounted(async () => { definitions.value = (await api.get("/condition-definitio
 
         <section class="summary-panel"><div class="section-title"><BranchesOutlined /><div><h3>规则摘要</h3><p>保存前核对策略的实际含义</p></div></div><ol><li v-for="line in summary" :key="line">{{ line }}</li></ol></section>
 
+        <section class="config-section"><div class="section-copy"><h3>入场时间限制</h3><p>保存到策略版本。创建回测时读取项目最早外部信号，信号前历史仍用于指标预热。</p></div><a-form-item label="仅在信号触发后买入"><a-switch v-model:checked="strategy.entryAfterSignal" /><p>开启时，买入及加仓 K 线开盘必须严格晚于信号时间。缺失信号的 CA 会排除并提示。</p></a-form-item></section>
         <a-tabs class="strategy-tabs">
           <a-tab-pane key="impulse" tab="拉升识别">
             <section class="config-section"><div class="section-copy"><h3>Fractal Pivot</h3><p>{{ definitionMap.get('impulse_fractal_swing')?.description }}</p></div><SchemaFields v-model="strategy.impulseCondition" :schema="definitionMap.get('impulse_fractal_swing')?.parameterSchema" /></section>

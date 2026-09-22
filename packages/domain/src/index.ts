@@ -18,9 +18,12 @@ export interface SymbolRef { chain: string; ca: string; pairId: string }
 export interface CaRef { chain: string; ca: string }
 /** Earliest externally observed signal, in UTC epoch milliseconds. Applies to all pools of this CA. */
 export interface EntrySignal extends CaRef { signalTime: number }
+export interface ExternalSignal extends EntrySignal { id:string; signalSource:string; detailId?:string; sourceSignal?:Record<string,unknown>; provenance?:unknown[]; basis?:'snapshot'|'legacy_gate'|'supplemental' }
 export interface PoolSnapshot extends SymbolRef { startTime: number | null; endTime: number | null; noData: boolean }
 export interface DatasetSelection { symbols?: SymbolRef[]; cas?: CaRef[]; interval: Interval; valueType: ValueType; startTime?: string; endTime?: string; filters?: Record<string, unknown>; entrySignals?: EntrySignal[] }
 export interface DatasetConfig {
+  externalSignals?: ExternalSignal[];
+  signalSelection?: { enabled:boolean; excluded:CaRef[]; noOpportunity:SymbolRef[] };
   symbols: SymbolRef[];
   interval: Interval;
   valueType: ValueType;
@@ -111,6 +114,8 @@ export interface PositionConfig { mode: "single_entry" | "pyramiding"; maxEntrie
 
 export interface StrategyConfig {
   schemaVersion: 1;
+  /** New tasks default true; never apply defaults inside historical engine restoration. */
+  entryAfterSignal?: boolean;
   impulseCondition: ImpulseConfig;
   entryConditionGroup: ConditionGroup;
   invalidationConditionGroup: ConditionGroup;

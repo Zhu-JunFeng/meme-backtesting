@@ -6,8 +6,13 @@ const props=defineProps<{run:any}>();const emit=defineEmits(['changed']);
 const busy=ref('');let rerunRequest:string|undefined;
 async function perform(action:string){
  if(busy.value)return;
+ let timing='';
+ if(action==='rerun'){
+  try{const c=props.run.config_json??(await api.get(`/backtests/${props.run.id}`)).data.config_json;timing=c.entrySignals?.length?'沿用原快照：仅在信号后买入。':'沿用原快照：未限制信号前买入，不会自动启用新的策略默认值。';}
+  catch{message.error('原任务配置读取失败，请重试');return;}
+ }
  if(action==='stop' || action==='rerun' || (action==='retry' && !props.run.checkpoint_at)){
- const ok=await new Promise<boolean>(resolve=>Modal.confirm({title:action==='stop'?'停止并保留检查点？':action==='rerun'?'创建新任务从头回测？':'该任务尚无检查点，将从头开始',content:action==='stop'?'执行器会在安全边界保存进度；之后可点击重试继续。':action==='rerun'?'旧任务和结果不会改变，新任务重新冻结行情。':'已冻结完成的输入仍保留。',okText:'确认',cancelText:'取消',onOk:()=>resolve(true),onCancel:()=>resolve(false)}));if(!ok)return;
+ const ok=await new Promise<boolean>(resolve=>Modal.confirm({title:action==='stop'?'停止并保留检查点？':action==='rerun'?'创建新任务从头回测？':'该任务尚无检查点，将从头开始',content:action==='stop'?'执行器会在安全边界保存进度；之后可点击重试继续。':action==='rerun'?`旧任务和结果不会改变，新任务重新冻结行情。${timing}`:'已冻结完成的输入仍保留。',okText:'确认',cancelText:'取消',onOk:()=>resolve(true),onCancel:()=>resolve(false)}));if(!ok)return;
  }
  busy.value=action;
  try{if(action==='rerun')rerunRequest ||= crypto.randomUUID();const {data}=await api.post(`/backtests/${props.run.id}/${action}`,action==='rerun'?{requestId:rerunRequest}:{});if(action==='rerun')rerunRequest=undefined;message.success(action==='stop'?'已提交停止请求':action==='retry'?'已提交断点重试':'已创建新回测任务');emit('changed',data);}

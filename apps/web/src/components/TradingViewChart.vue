@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { eventLabels as labels, marketValue, changePercent, formatNumber, preciseValue, signedValue, valueTone, exitLabel, invalidationEvidence } from '../format';
 import FibAudit from './FibAudit.vue';
 import { partitionMarkers } from '../chartMarkers';
+import {externalBuckets} from '../externalSignals';
 const props=defineProps<{symbol:string;interval:string;runId?:string;startTime?:number|null;endTime?:number|null;includeEndOfBacktest?:boolean;signalTypes?:string;anchor?:{tradeId?:string;from?:number;to?:number;start?:number;end?:number;empty?:boolean;fib?:any;fibFrom?:number;fibTo?:number}}>();
 const filters=()=>({includeEndOfBacktest:props.includeEndOfBacktest ?? false,signalTypes:props.signalTypes ?? ''});
 const showFib=ref(true),fibView=ref('full'),fib=ref<any>();let fibIds:any[]=[],fibEpoch=0;
@@ -17,6 +18,35 @@ const container=ref<HTMLDivElement>(),error=ref("");let widget:any,version=0,mar
 let controller=new AbortController(),rangeTimer:number|undefined;
 let marksEpoch=0;
 const missingMarkers=ref(0);
+const showExternal=ref(true),externalRows=ref<any[]>([]),externalPage=ref(1),externalSelection=ref<any[]>(),externalMissing=ref(0),externalLoading=ref(false);
+const externalIds=new Map<any,any[]>();let externalEpoch=0;
+const externalPageRows=computed(()=>externalRows.value.slice((externalPage.value-1)*20,externalPage.value*20));
+const externalText=(e:any)=>`${e.first?'首次监控':'外部信号'} · ${new Date(e.signalTime).toISOString()} · ${e.signalSource}${e.sourceSignal?.name?' / '+e.sourceSignal.name:''}${e.sourceSignal?.signalId?' / 信号 '+e.sourceSignal.signalId:''} · 明细 ${e.detailId||'不可用'}${e.basis==='supplemental'?' · 补充展示，非当时回测依据':''}`;
+function clearExternal(chart:any){externalEpoch++;for(const id of externalIds.keys())try{chart.removeEntity(id);}catch{}externalIds.clear();}
+async function drawExternal(chart:any,v:number){
+ clearExternal(chart);const request=externalEpoch,range=chart.getVisibleRange();if(!showExternal.value||!range)return;
+ const step=(seconds[props.interval]||30)*1000;
+ const buckets=externalBuckets(externalRows.value,step,loadedTimes,range);
+ externalMissing.value=externalRows.value.filter(e=>e.signalTime>=range.from*1000&&e.signalTime<=range.to*1000&&!loadedTimes.has(Math.floor(e.signalTime/step)*step)).length;
+ for(const b of buckets){if(v!==version||request!==externalEpoch)return;
+  const id=await chart.createShape({time:b.time/1000},{shape:'vertical_line',text:b.label,lock:true,disableSave:true,disableUndo:true,overrides:{linecolor:'#376a9f',textcolor:'#376a9f',linestyle:2,showLabel:true}});
+  if(v!==version||request!==externalEpoch){try{chart.removeEntity(id);}catch{}return;}externalIds.set(id,b.events);
+ }
+}
+async function loadExternal(v:number){
+ if(!props.runId)return;const [chain,ca,pairId]=props.symbol.split(':'),rows:any[]=[];
+ externalLoading.value=true;
+ try{
+ for(let page=1;;page++){const data=await get(`/api/backtests/${props.runId}/external-signals`,{chain,ca,pairId,page,pageSize:500});if(v!==version)return;rows.push(...data.items);if(page*500>=data.total)break;}
+ if(v===version){externalRows.value=rows;if(ready)await drawExternal(widget.activeChart(),v);}
+ }finally{if(v===version)externalLoading.value=false;}
+}
+function externalOutside(e:any){return (props.startTime!=null&&e.signalTime<props.startTime)||(props.endTime!=null&&e.signalTime>=props.endTime+(seconds[props.interval]||30)*1000);}
+async function focusExternal(e:any){
+ if(fetching.value||externalOutside(e))return;const step=(seconds[props.interval]||30)*1000,t=Math.floor(e.signalTime/step)*step;
+ focused={from:Math.max(props.startTime??0,t-step*100),to:Math.min(props.endTime??t+step*100,t+step*100),start:t};
+ externalSelection.value=[e];await mountChart();
+}
 function clearMarkers(chart:any){
  markerVersion++;marksEpoch++;markMap.clear();
  chart.clearMarks();
@@ -25,10 +55,12 @@ function clearMarkers(chart:any){
 function refreshMarkers(chart:any,v:number){
  if(v!==version||!ready)return;
  clearMarkers(chart);chart.refreshMarks();void loadMarkers(chart,v);
+ void drawExternal(chart,v).catch(()=>{if(v===version)error.value='外部信号标记加载失败，请重试';});
 }
 function scheduleMarkers(v:number){
  if(v!==version||!ready)return;
  const chart=widget.activeChart();clearMarkers(chart);
+ clearExternal(chart);
  window.clearTimeout(rangeTimer);rangeTimer=window.setTimeout(()=>refreshMarkers(chart,v),200);
 }
 const resolutions:Record<string,string>={"30s":"30S","1m":"1","5m":"5","15m":"15","1h":"60","4h":"240","1d":"D"};
@@ -104,7 +136,9 @@ async function drawFib(chart:any,v:number){
  for(const [index,line] of f.thresholds.entries())await create([point(start,line.value)],'horizontal_line',`${line.label.includes('止损')?'止损':'失效'} · ${displayValue(line.value)}`,{linecolor:'#b42318',textcolor:'#b42318',fontsize:11,horzLabelsAlign:index%2?'right':'left',vertLabelsAlign:'bottom',linestyle:2,showLabel:true,showPrice:false});
 }
 async function mountChart(){
- reset();const v=version,symbol=props.symbol,step=seconds[props.interval] || 30;error.value="";
+ if(ready)clearExternal(widget.activeChart());else{externalEpoch++;externalIds.clear();}
+ reset();externalRows.value=[];externalPage.value=1;externalMissing.value=0;const v=version,symbol=props.symbol,step=seconds[props.interval] || 30;error.value="";
+ void loadExternal(v).catch(e=>{if(v===version&&e.name!=='AbortError')error.value='外部信号加载失败，请重新加载';});
  if(!container.value)return;
  const tv=(window as any).TradingView;
  if(!tv){error.value="未找到 TradingView charting_library，请检查本地组件资源";return;}
@@ -155,6 +189,7 @@ async function mountChart(){
   if(v!==version)return;ready=true;const chart=localWidget.activeChart();
   localWidget.subscribe('onMarkClick',(id:any)=>{if(v===version)selectEvent(markMap.get(String(id)));});
   localWidget.subscribe('drawing_event',(id:any,type:string)=>{if(v===version && type==='click')selectEvent(shapeMap.get(id));});
+  localWidget.subscribe('drawing_event',(id:any,type:string)=>{if(v===version&&type==='click'&&externalIds.has(id))externalSelection.value=externalIds.get(id);});
   chart.crossHairMoved().subscribe(null,(p:any)=>{if(v===version && selectedBuy.value)cursorValue.value=Number.isFinite(p.price)?p.price:undefined;});
   if(selectedBuy.value)void drawReference();
   chart.onVisibleRangeChanged().subscribe(null,()=>scheduleMarkers(v));
@@ -172,6 +207,9 @@ async function focusEvent(event:any){
  } catch { if(v===version && request===focusEpoch)error.value="图表尚未完成加载，稍后再点击事件定位"; }
 }
 defineExpose({focusEvent});
+onBeforeUnmount(()=>{externalEpoch++;externalIds.clear();});
+watch(showExternal,()=>{if(!showExternal.value){externalSelection.value=undefined;externalMissing.value=0;}if(ready)void drawExternal(widget.activeChart(),version).catch(()=>{error.value='外部信号绘制失败';});});
+watch(()=>[props.symbol,props.runId],()=>{externalSelection.value=undefined;});
 onMounted(mountChart);watch(()=>[props.symbol,props.interval,props.runId,props.anchor],()=>{focused=undefined;void mountChart();});onBeforeUnmount(reset);
 watch(()=>[props.includeEndOfBacktest,props.signalTypes],async()=>{
  reset();fib.value=undefined;focused=undefined;const v=version;
@@ -181,5 +219,11 @@ watch(()=>[props.includeEndOfBacktest,props.signalTypes],async()=>{
 watch(showFib,()=>{if(ready)void drawFib(widget.activeChart(),version).catch(()=>{error.value='Fib 绘图失败，请重新加载';});});
 watch(fibView,()=>{if(!ready)return;const a=focused ?? props.anchor;if(!a||a.empty)return;const full=fibView.value==='full'&&a.fib?.status==='available';const from=full?a.fibFrom:a.from,to=full?a.fibTo:a.to;if(from!=null&&to!=null)void widget.activeChart().setVisibleRange({from:from/1000,to:to/1000+(seconds[props.interval]||30)}).catch(()=>{error.value='视野切换失败，请重新加载';});});
 </script>
-<template><p v-if="missingMarkers" class="event-detail" role="status">{{missingMarkers}} 个可见区间事件对应 K 线缺失或尚未加载，未绘制点位；事件列表仍可查看。</p><div v-if="fib" class="measurement"><a-radio-group v-model:value="fibView" size="small"><a-radio-button value="full">完整 Fib</a-radio-button><a-radio-button value="trade">买卖区间</a-radio-button></a-radio-group><a-switch v-model:checked="showFib" size="small" :disabled="fib.status!=='available'" /> 显示 Fib <span>0 = 高点 · 1 = 低点 · 时间 UTC</span></div><a-alert v-if="error" :message="error" type="warning" show-icon><template #action><a-button @click="mountChart">重新加载</a-button></template></a-alert><div class="measurement"><template v-if="selectedBuy"><strong>{{selectedBuy.event_label || '买入'}} {{displayValue(Number(selectedBuy.price))}}</strong><span>光标{{isMcap?'市值':'价格'}}：{{cursorValue==null?'—':displayValue(cursorValue)}}</span><strong :class="valueTone(movement)">{{movement==null?'移动鼠标查看涨跌幅':signedValue(movement)+'%'}}</strong><span>不含交易成本</span><a-button size="small" @click="clearSelection">取消选择</a-button></template><span v-else>点击买入或加仓标记，再移动鼠标或长按拖动图表，比较光标{{isMcap?'市值':'价格'}}与该买入点的涨跌幅。</span></div><p v-if="selectedEvent" class="event-detail"><a-tooltip :title="JSON.stringify(selectedEvent.reason_json)">{{eventSummary(selectedEvent)}} ⓘ</a-tooltip></p><div ref="container" class="tv-chart" /><FibAudit :fib="fib" :is-mcap="isMcap" /></template>
-<style scoped>.measurement{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-height:40px;color:#43544d}.positive{color:#176b5b}.negative{color:#b42318}.event-detail{overflow-wrap:anywhere;color:#43544d}.tv-chart{height:580px;width:100%;background:#fff;border:1px solid #dfe6e3;border-radius:8px;overflow:hidden}</style>
+<template>
+<div class="measurement"><a-switch v-model:checked="showExternal" size="small" aria-label="显示外部信号" />显示外部信号 <span>蓝色虚线为监控触发，不是买卖成交；时间 UTC</span></div>
+<p v-if="externalMissing" class="event-detail">{{externalMissing}} 个可见外部信号对应 K 线缺失或未加载，未在其他 K 线上补画。</p>
+<p v-for="e in externalSelection" :key="e.id" class="event-detail">{{externalText(e)}}</p>
+<details v-if="externalRows.length" class="external-list"><summary>外部信号 · {{externalRows.length}} 次</summary><div v-for="e in externalPageRows" :key="e.id"><a-button type="link" :disabled="fetching || externalOutside(e)" @click="focusExternal(e)">{{externalText(e)}}</a-button><span v-if="externalOutside(e)">超出任务行情范围</span></div><a-pagination v-if="externalRows.length>20" v-model:current="externalPage" :total="externalRows.length" :page-size="20" :show-size-changer="false" /></details>
+<p v-else class="event-detail" role="status">{{externalLoading?'正在读取外部信号…':'该 CA 暂无已记录的外部信号。'}}</p>
+<p v-if="missingMarkers" class="event-detail" role="status">{{missingMarkers}} 个可见区间事件对应 K 线缺失或尚未加载，未绘制点位；事件列表仍可查看。</p><div v-if="fib" class="measurement"><a-radio-group v-model:value="fibView" size="small"><a-radio-button value="full">完整 Fib</a-radio-button><a-radio-button value="trade">买卖区间</a-radio-button></a-radio-group><a-switch v-model:checked="showFib" size="small" :disabled="fib.status!=='available'" /> 显示 Fib <span>0 = 高点 · 1 = 低点 · 时间 UTC</span></div><a-alert v-if="error" :message="error" type="warning" show-icon><template #action><a-button @click="mountChart">重新加载</a-button></template></a-alert><div class="measurement"><template v-if="selectedBuy"><strong>{{selectedBuy.event_label || '买入'}} {{displayValue(Number(selectedBuy.price))}}</strong><span>光标{{isMcap?'市值':'价格'}}：{{cursorValue==null?'—':displayValue(cursorValue)}}</span><strong :class="valueTone(movement)">{{movement==null?'移动鼠标查看涨跌幅':signedValue(movement)+'%'}}</strong><span>不含交易成本</span><a-button size="small" @click="clearSelection">取消选择</a-button></template><span v-else>点击买入或加仓标记，再移动鼠标或长按拖动图表，比较光标{{isMcap?'市值':'价格'}}与该买入点的涨跌幅。</span></div><p v-if="selectedEvent" class="event-detail"><a-tooltip :title="JSON.stringify(selectedEvent.reason_json)">{{eventSummary(selectedEvent)}} ⓘ</a-tooltip></p><div ref="container" class="tv-chart" /><FibAudit :fib="fib" :is-mcap="isMcap" /></template>
+<style scoped>.external-list{margin:8px 0;color:#376a9f;overflow-wrap:anywhere}.external-list summary{cursor:pointer;padding:8px 0}.external-list .ant-btn{white-space:normal;height:auto;max-width:100%;text-align:left;padding:8px 0;color:#376a9f}.external-list .ant-btn:disabled{color:#81908a}.measurement{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-height:40px;color:#43544d}.positive{color:#176b5b}.negative{color:#b42318}.event-detail{overflow-wrap:anywhere;color:#43544d}.tv-chart{height:580px;width:100%;background:#fff;border:1px solid #dfe6e3;border-radius:8px;overflow:hidden}</style>

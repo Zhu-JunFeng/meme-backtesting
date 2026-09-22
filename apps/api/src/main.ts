@@ -1,4 +1,5 @@
 import { inputOwner } from "@meme/runtime";
+import {resolveSignalDataset,externalSignalsForRun} from './token-signals.js';
 import "reflect-metadata";
 import { locate } from './locator.js';
 import { statistics } from './results.js';
@@ -69,6 +70,7 @@ export class AppService {
 
   async validateStrategy(strategy: StrategyConfig) {
     if (!strategy || strategy.schemaVersion !== 1) throw new BadRequestException("只支持 schemaVersion=1 的策略配置");
+    if(strategy.entryAfterSignal!==undefined && typeof strategy.entryAfterSignal!=='boolean')throw new BadRequestException('信号后买入设置必须是布尔值');
     if (strategy.impulseCondition?.type !== "impulse_fractal_swing") throw new BadRequestException("必须配置 Fractal Pivot 拉升识别");
     const definitions = await this.definitionMap();
     const validateItem = (item: Condition | ConditionGroup, path: string) => {
@@ -179,9 +181,10 @@ export class AppService {
 
   async createBacktest(request: CreateBacktestRequest) {
     if (!request.name?.trim() || !request.strategyVersionId) throw new BadRequestException("任务名称和策略版本不能为空");
-    const dataset = await resolveDataset(this.pool, request.dataset);
     const version = await this.version(request.strategyVersionId);
     const strategy = structuredClone(version.strategyJson) as StrategyConfig;
+    strategy.entryAfterSignal ??= true;
+    const dataset = await resolveSignalDataset(this.pool, request.dataset, strategy.entryAfterSignal);
     const overrides = request.executionOverrides ?? {};
     const allowedOverrides = new Set(["initialCapital", "feePercent", "slippagePercent", "buyTaxPercent", "sellTaxPercent"]);
     for (const [key, value] of Object.entries(overrides)) {
@@ -190,7 +193,8 @@ export class AppService {
     }
     strategy.executionConfig = { ...strategy.executionConfig, ...overrides };
     await this.validateStrategy(strategy);
-    const config: BacktestConfig = { name: request.name.trim(), strategyTemplateId: version.templateId, strategyVersionId: version.id, ...dataset, ...strategy };
+    // Database-resolved gates and frozen evidence must not be overridden by extra strategy JSON keys.
+    const config: BacktestConfig = { ...strategy, ...dataset, name: request.name.trim(), strategyTemplateId: version.templateId, strategyVersionId: version.id };
     const { rows } = await this.pool.query("INSERT INTO backtest_runs(name,status,strategy_template_id,strategy_version_id,dataset_json,config_json,progress,runtime_version,queue_scope,phase) VALUES($1,'pending',$2,$3,$4,$5,0,$6,$7,'freezing') RETURNING id,status,progress,dispatch_no", [config.name, version.templateId, version.id, JSON.stringify(dataset), JSON.stringify(config),RUNTIME_VERSION,queuePrefix()]);
     try { await enqueue(this.queue,rows[0]); }
     catch (error) { await this.pool.query("UPDATE backtest_runs SET status='failed',error_message=$2,finished_at=now() WHERE id=$1", [rows[0].id, `队列提交失败：${String(error)}`]); throw new ConflictException("任务已保存，但提交执行队列失败"); }
@@ -214,7 +218,8 @@ const periods = new Set(["30s", "1m", "5m", "15m", "1h", "4h", "1d"]);
 class AppController {
   constructor(@Inject(AppService) private readonly service: AppService) {}
   @Get("market/cas") cas(@Query() query: Record<string,string>) { return marketCas(this.service.pool,query); }
-  @Post("market/dataset-preview") async preview(@Body() body: CreateBacktestRequest["dataset"]) { const dataset=await resolveDataset(this.service.pool,body); return {dataset,...datasetCounts(dataset)}; }
+  @Post("market/dataset-preview") async preview(@Body() body: CreateBacktestRequest["dataset"] & {strategyVersionId?:string}) { const dataset=body.strategyVersionId?await resolveSignalDataset(this.service.pool,body,(await this.service.version(body.strategyVersionId)).strategyJson.entryAfterSignal??true):await resolveDataset(this.service.pool,body); return {dataset,...datasetCounts(dataset),signalSelection:dataset.signalSelection}; }
+  @Get('backtests/:id/external-signals') async external(@Param('id') id:string,@Query() q:Record<string,string>){return externalSignalsForRun(this.service.pool,await this.service.backtest(id),q);}
   @Get("market/chains") async chains() { return (await this.service.pool.query("SELECT DISTINCT chain FROM public.meme_kline ORDER BY chain")).rows.map(r=>r.chain); }
   @Get("market/projects") projects() { return this.service.projects(); }
   @Get("market/candles") candles(@Query() query: Record<string,string>) { return this.service.candles(query); }

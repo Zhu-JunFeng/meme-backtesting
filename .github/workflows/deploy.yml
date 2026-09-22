@@ -40,6 +40,7 @@ jobs:
       - run: pnpm --filter @meme/engine build
       - run: pnpm test:research
       - run: python3 scripts/test_signal_entry_manifest.py
+      - run: python3 scripts/test_token_signal_manifest.py
       - run: pnpm --filter @meme/runtime build
       - run: pnpm test
       - run: pnpm --filter @meme/api build
