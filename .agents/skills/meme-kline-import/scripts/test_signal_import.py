@@ -14,6 +14,23 @@ ROW = ['BSC','0xAbC','1700000000123','2023-11-15 06:13:20','name','fomo_new_proj
 
 
 class SignalTests(unittest.TestCase):
+    def test_resume_reuses_committed_project_without_http_or_database_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            workbook=Path(d)/'signals.xlsx';report=Path(d)/'previous.jsonl'
+            make_xlsx(workbook,[HEADERS,ROW]);now=int(m.time.time()*1000)
+            start=dict(kind='start',workbook=str(workbook),now_ms=now,created_within_days=30)
+            previous=dict(kind='project',chain='bsc',ca='0xabc',pair_id='pair',created_ms=now-100000,status='partial',errors=[],inserted=5,updated=0,signal_inserted=1,signal_duplicates=0,invalid=1,discarded=0)
+            report.write_text(json.dumps(start)+'\n'+json.dumps(previous)+'\n')
+            args=m.build_parser().parse_args([str(workbook),'--yes','--resume-report',str(report)])
+            with patch.dict(os.environ,{'DATABASE_URL':'postgresql://example/db'}), \
+                 patch.object(m,'lookup_projects',return_value=([],[(m.TokenRef('bsc','0xabc',2),'unavailable')])), \
+                 patch.object(m,'preflight_database'),patch.object(m,'preflight_signals'), \
+                 patch.object(m,'fetch_project') as fetch,patch.object(m,'write_rows') as write:
+                self.assertEqual(m.run(args),0);fetch.assert_not_called();write.assert_not_called()
+            report.write_text(json.dumps({**start,'workbook_hash':'changed'})+'\n')
+            with patch.dict(os.environ,{'DATABASE_URL':'postgresql://example/db'}):
+                with self.assertRaisesRegex(m.ImporterError,'checksum'):m.run(args)
+
     def test_recent_creation_boundary(self):
         now=1800000000000
         cutoff=now-30*m.HISTORY_MS

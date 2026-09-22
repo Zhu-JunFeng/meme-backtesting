@@ -763,6 +763,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chains", default="", help="comma-separated chain allowlist, e.g. sol,robin,bsc")
     parser.add_argument("--created-within-days", type=int, default=30, help="only projects created within this many rolling days (default: 30)")
     parser.add_argument("--report", type=Path, help="append per-project audit results as JSONL (no credentials)")
+    parser.add_argument("--resume-report", type=Path, help="resume a verified previous report, retaining its fixed cutoff and committed projects")
     return parser
 
 
@@ -779,6 +780,21 @@ def run(args: argparse.Namespace) -> int:
         raise ImporterError("DATABASE_URL is required")
 
     now_ms = int(time.time() * 1_000)
+    resumed: dict[tuple[str, str, str], dict[str, Any]] = {}
+    resume_path = getattr(args, "resume_report", None)
+    if resume_path:
+        if getattr(args, "report", None) and resume_path.resolve() == args.report.resolve():
+            raise ImporterError("resume report and output report must differ")
+        records = [json.loads(line) for line in resume_path.read_text().splitlines() if line.strip()]
+        start = next((r for r in records if r.get("kind") == "start"), None)
+        if not start or Path(start["workbook"]).resolve() != args.workbook.resolve() or start.get("created_within_days") != created_days:
+            raise ImporterError("resume workbook or age filter differs")
+        workbook_hash = hashlib.sha256(args.workbook.read_bytes()).hexdigest()
+        if start.get("workbook_hash") and start["workbook_hash"] != workbook_hash:
+            raise ImporterError("resume workbook checksum differs")
+        now_ms = start["now_ms"]
+        resumed = {(r["chain"], r["ca"], r["pair_id"]): r for r in records
+                   if r.get("kind") == "project" and r.get("status") in {"success", "partial", "no_data"} and not r.get("errors")}
     tokens = read_tokens(args.workbook.resolve())
     chains = {c.strip().lower() for c in getattr(args, "chains", "").split(",") if c.strip()}
     tokens = [t for t in tokens if not chains or t.chain in chains]
@@ -790,6 +806,14 @@ def run(args: argparse.Namespace) -> int:
         raise ImporterError("selected CA missing valid signal metadata")
     print(f"已解析项目：{len(tokens)} 个唯一 chain + CA")
     projects, skipped = lookup_projects(tokens, now_ms, args.lookup_batch_size, args.timeout, args.retries)
+    token_keys = {(t.chain, t.ca) for t in tokens}
+    project_map = {(p.chain, p.ca): p for p in projects}
+    for previous in resumed.values():
+        key = (previous["chain"], previous["ca"])
+        if key in token_keys:
+            project_map[key] = Project(previous["chain"], previous["ca"], previous["pair_id"], previous["created_ms"])
+    projects = list(project_map.values())
+    skipped = [(t, reason) for t, reason in skipped if (t.chain, t.ca) not in project_map]
     projects, outside_age = recent_projects(projects, now_ms, created_days)
     selected_keys = {(p.chain, p.ca) for p in projects}
     events = [e for e in events if (e["chain"], e["ca"]) in selected_keys]
@@ -829,13 +853,17 @@ def run(args: argparse.Namespace) -> int:
                 stream.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     record(dict(kind="start", workbook=str(args.workbook), now_ms=now_ms, projects=len(projects),
-                selected=len(tokens), created_within_days=created_days, database=safe_database_target(database_url)))
+                selected=len(tokens), created_within_days=created_days, database=safe_database_target(database_url),
+                workbook_hash=hashlib.sha256(args.workbook.read_bytes()).hexdigest(), resume_report=str(resume_path) if resume_path else None))
     for project in outside_age:
         record(dict(kind="creation_excluded", **asdict(project), reason=f"created outside last {created_days} days"))
     for token, reason in skipped:
         record(dict(kind="lookup_skipped", **asdict(token), reason=reason))
 
     def import_project(project: Project) -> dict[str, Any]:
+        previous = resumed.get((project.chain, project.ca, project.pair_id))
+        if previous and previous["created_ms"] == project.created_ms:
+            return {**previous, "resumed": True}
         result = fetch_project(project, now_ms, args.timeout, args.retries)
         signals = [0, 0]
         inserted, updated = write_rows(database_url, result.rows,

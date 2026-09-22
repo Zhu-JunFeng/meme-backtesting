@@ -13,6 +13,9 @@ export function assertLocalDatabase(options){
  if(typeof host!=='string'||!['localhost','127.0.0.1','::1'].includes(host)&&!host.startsWith('/'))throw Error('研究工具只允许本机 PostgreSQL / Unix socket，禁止远程数据库');
 }
 
+export function canonical(value){if(Array.isArray(value))return value.map(canonical);if(value&&typeof value==='object')return Object.fromEntries(Object.keys(value).sort().filter(k=>value[k]!==undefined).map(k=>[k,canonical(value[k])]));return value;}
+export const ledgerHash=rows=>createHash('sha256').update(rows.map(r=>JSON.stringify(canonical(r))).sort().join('\n')).digest('hex');
+
 /** Gap semantics match FrozenReader; only the previous close fills a gap. */
 export class LocalCandleReader{
  constructor(input,from,to,step){this.symbol=input.symbol;this.rows=input.candles.filter(c=>c.time>=from&&c.time<to);this.i=0;this.previous=undefined;this.step=step;}
@@ -23,7 +26,7 @@ export class LocalCandleReader{
  consume(c){this.previous=c;if(!c.synthetic)this.i++;}
 }
 
-export function evaluateWindow(candidate,inputs,from,to,{interval='30s',valueType='mcap',warmupBars=1500}={}){
+export function evaluateWindow(candidate,inputs,from,to,{interval='30s',valueType='mcap',warmupBars=1500,detail=false}={}){
  assert(['30s','1m'].includes(interval));assert(['price','mcap'].includes(valueType));assert(Number.isFinite(from)&&to>from);
  const step=interval==='30s'?30000:60000,started=performance.now(),config=structuredClone(candidate.config);
  config.symbols=inputs.map(p=>p.symbol);config.interval=interval;config.valueType=valueType;config.exitConfig.closeAtEnd=true;
@@ -34,7 +37,17 @@ export function evaluateWindow(candidate,inputs,from,to,{interval='30s',valueTyp
  const readers=inputs.map(p=>new LocalCandleReader(p,from-warmupBars*step,to,step)),heads=readers.map(r=>r.peek());
  let enabled=false,normalNet=0,normalTrades=0,wins=0,excludedNet=0,excludedCount=0;
  const byCa=new Map();
- const drain=()=>{for(const t of engine.drain().trades){
+ const allByCa=new Map(),auditTrades=[],auditSignals=[];
+ const gates=new Map((config.entrySignals??[]).map(s=>[`${s.chain}:${s.ca}`,s.signalTime]));
+ let fees=0,slippageCost=0,taxCost=0,tradeReturnSum=0,tradeReturnCount=0,buyEvents=0;
+ const drain=()=>{const batch=engine.drain();if(detail)for(const s of batch.signals){
+  auditSignals.push(s);if(s.type==='entry'||s.type==='add'){buyEvents++;assert(s.time>gates.get(`${s.symbol.chain}:${s.symbol.ca}`),'Entry before or at monitoring signal');}
+ }
+ for(const t of batch.trades){
+  if(detail){auditTrades.push(t);fees+=t.fees;slippageCost+=t.slippageCost;taxCost+=t.taxCost;
+   const key=`${t.symbol.chain}:${t.symbol.ca}`;allByCa.set(key,(allByCa.get(key)||0)+t.netPnl);
+   const invested=t.buyAmount+t.buyFees+t.buySlippageCost+t.buyTaxCost;if(invested>0){tradeReturnSum+=t.netPnl/invested*100;tradeReturnCount++;}
+  }
   if(t.exitReason==='end_of_backtest'){excludedNet+=t.netPnl;excludedCount++;continue;}
   assert(['take_profit','stop_loss','profit_lock','invalidation','timeout'].includes(t.exitReason));assert(Number.isFinite(t.netPnl));
   normalNet+=t.netPnl;normalTrades++;if(t.netPnl>0)wins++;
@@ -49,7 +62,8 @@ export function evaluateWindow(candidate,inputs,from,to,{interval='30s',valueTyp
  drain();const r=engine.finish();assert.equal(r.openPositions.length,0);
  const normalReturn=normalNet/capital*100,topCaPnl=Math.max(0,...byCa.values());
  const topCaKey=topCaPnl>0?[...byCa].find(([,pnl])=>pnl===topCaPnl)?.[0]:null;
- return{id:candidate.id,from:new Date(from).toISOString(),toExclusive:new Date(to).toISOString(),accountReturn:r.returnPercent,normalReturn,netPnl:r.netPnl,normalNet,totalTrades:r.totalTrades,accountWinRate:r.totalTrades?r.winRate:null,normalTrades,winRate:normalTrades?wins/normalTrades:null,accountMaxDrawdown:r.maxDrawdownPercent,profitFactor:Number.isFinite(r.profitFactor)?r.profitFactor:null,excludedCount,excludedNet,topCaPnl,topCaKey,withoutBestCaNormalReturn:(normalNet-topCaPnl)/capital*100,syntheticBars:r.dataQuality.syntheticBars,processedBars:engine.s.processed,seconds:(performance.now()-started)/1000};
+ const audit=detail?{fees,slippageCost,taxCost,buyEvents,averageTradeReturn:tradeReturnCount?tradeReturnSum/tradeReturnCount:null,byCa:Object.fromEntries(allByCa),tradeHash:ledgerHash(auditTrades),signalHash:ledgerHash(auditSignals)}:undefined;
+ return{id:candidate.id,from:new Date(from).toISOString(),toExclusive:new Date(to).toISOString(),accountReturn:r.returnPercent,normalReturn,netPnl:r.netPnl,normalNet,totalTrades:r.totalTrades,accountWinRate:r.totalTrades?r.winRate:null,normalTrades,winRate:normalTrades?wins/normalTrades:null,accountMaxDrawdown:r.maxDrawdownPercent,profitFactor:Number.isFinite(r.profitFactor)?r.profitFactor:null,excludedCount,excludedNet,topCaPnl,topCaKey,withoutBestCaNormalReturn:(normalNet-topCaPnl)/capital*100,syntheticBars:r.dataQuality.syntheticBars,processedBars:engine.s.processed,seconds:(performance.now()-started)/1000,...(detail?{audit}: {})};
 }
 
 export async function runResearch({chain,interval='30s',valueType='mcap',manifestPath,protocolPath,output}){
