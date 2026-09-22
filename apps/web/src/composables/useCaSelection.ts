@@ -1,3 +1,4 @@
+import { beijingInputToIso } from "../time";
 import { computed, onScopeDispose, reactive, watch } from "vue";
 
 export interface CaRow { chain:string; ca:string; poolCount:number; availablePoolCount?:number; pairIds?:string[]; minTime?:string; maxTime?:string }
@@ -18,7 +19,7 @@ export function useCaSelection(dimension:()=>Dimension, fetchPage:CaFetcher) {
  let listEpoch=0,bulkEpoch=0,disposed=false;
  const baseParams=()=>{
   const d=dimension();
-  return {interval:d.interval,type:d.valueType,startTime:d.startTime?new Date(d.startTime).toISOString():undefined,endTime:d.endTime?new Date(d.endTime).toISOString():undefined,chains:state.chains.join(",")};
+  return {interval:d.interval,type:d.valueType,startTime:beijingInputToIso(d.startTime || ""),endTime:beijingInputToIso(d.endTime || ""),chains:state.chains.join(",")};
  };
  const listParams=()=>({...baseParams(),ca:state.search.trim() || undefined,sort:state.sort,page:state.page,pageSize:20});
  const blocked=computed(()=>state.listLoading || state.bulkLoading || !!state.listError || !!state.bulkError);

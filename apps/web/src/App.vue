@@ -22,7 +22,7 @@ const pageDescription = computed(() => page.value === "strategy" ? "定义指标
         <div class="environment"><i></i><div><span>数据服务</span><strong>已连接</strong></div></div>
       </aside>
       <main>
-        <header class="page-header"><div><h1>{{ pageTitle }}</h1><p>{{ pageDescription }}</p></div><div class="scope-badge">历史 K 线 · 单周期</div></header>
+        <header class="page-header"><div><h1>{{ pageTitle }}</h1><p>{{ pageDescription }}</p></div><div class="scope-badge">历史 K 线 · 单周期 · 北京时间 UTC+8</div></header>
         <BacktestWorkspace v-if="page==='backtest'" />
         <StrategyWorkspace v-else />
       </main>

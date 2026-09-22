@@ -1,5 +1,6 @@
 // Internal CLI only; deliberately no HTTP bulk execution endpoint.
 process.env.BACKTEST_CLI='1';
+import {generateStrategyDescription} from '@meme/domain';
 const {AppService}=await import('./main.js');
 import{BATCH,SOURCES,BASE_VERSION,combinations,batchId,digest,PILOTS}from'./batch-grid.js';
 import{enqueue,queuePrefix,RUNTIME_VERSION,validateInputSource}from'@meme/runtime';
@@ -54,11 +55,11 @@ async function main(){
    // A retained or pruned ledger item is never passed here. Unexpected rows fail closed.
    if((await c.query('SELECT 1 FROM backtest_runs WHERE id=$1',[t.id])).rowCount)throw new Error('计划任务已存在，拒绝重复创建');
    const source=sources[t.chain],versionId=t.row.number===0?BASE_VERSION:batchId(`version:${t.row.number}`);
-   if(t.row.number){await c.query("INSERT INTO backtest_strategy_templates(id,name,description,status) VALUES($1,$2,'已确认有限候选全组合；非无限参数穷举','draft') ON CONFLICT(id) DO NOTHING",[templateId,BATCH]);await c.query('INSERT INTO backtest_strategy_versions(id,template_id,version,schema_version,strategy_json,checksum) VALUES($1,$2,$3,1,$4,$5) ON CONFLICT(id) DO NOTHING',[versionId,templateId,t.row.number,JSON.stringify(t.row.strategy),t.row.checksum]);await c.query('UPDATE backtest_strategy_templates SET current_version_id=$2 WHERE id=$1',[templateId,versionId]);}
+   if(t.row.number){await c.query("INSERT INTO backtest_strategy_templates(id,name,description,status) VALUES($1,$2,'已确认有限候选全组合；非无限参数穷举','draft') ON CONFLICT(id) DO NOTHING",[templateId,BATCH]);await c.query('INSERT INTO backtest_strategy_versions(id,template_id,version,schema_version,strategy_json,checksum,description_json) VALUES($1,$2,$3,1,$4,$5,$6) ON CONFLICT(id) DO NOTHING',[versionId,templateId,t.row.number,JSON.stringify(t.row.strategy),t.row.checksum,JSON.stringify(generateStrategyDescription(t.row.strategy))]);await c.query('UPDATE backtest_strategy_templates SET current_version_id=$2 WHERE id=$1',[templateId,versionId]);}
    const name=`${BATCH} · ${t.chain.toUpperCase()} · ${String(t.row.number).padStart(3,'0')} ${t.row.key}`;
-   const persisted=(await c.query('SELECT strategy_json FROM backtest_strategy_versions WHERE id=$1',[versionId])).rows[0];if(digest(persisted?.strategy_json)!==t.row.checksum)throw new Error('策略版本幂等内容冲突');
+   const persisted=(await c.query('SELECT strategy_json,description_json,version FROM backtest_strategy_versions WHERE id=$1',[versionId])).rows[0];if(digest(persisted?.strategy_json)!==t.row.checksum)throw new Error('策略版本幂等内容冲突');
    const config={...source.config_json,...structuredClone(t.row.strategy),name,strategyTemplateId:t.row.number?templateId:base.templateId,strategyVersionId:versionId,batch:{id:BATCH,key:t.row.key,number:t.row.number,chain:t.chain,strategyChecksum:t.row.checksum,manifestChecksum:summary.manifestChecksum,sourceReportChecksum:digest(source.sourceReport)}};
-   await c.query("INSERT INTO backtest_runs(id,name,status,config_json,dataset_json,strategy_template_id,strategy_version_id,parent_run_id,input_source_run_id,input_ready,runtime_version,queue_scope,phase) VALUES($1,$2,'pending',$3,$4,$5,$6,$7,$7,true,$8,$9,'computing')",[t.id,name,JSON.stringify(config),source.dataset_json,config.strategyTemplateId,versionId,source.id,RUNTIME_VERSION,queuePrefix()]);
+   await c.query("INSERT INTO backtest_runs(id,name,status,config_json,dataset_json,strategy_template_id,strategy_version_id,parent_run_id,input_source_run_id,input_ready,runtime_version,queue_scope,phase,strategy_description_json) VALUES($1,$2,'pending',$3,$4,$5,$6,$7,$7,true,$8,$9,'computing',$10)",[t.id,name,JSON.stringify(config),source.dataset_json,config.strategyTemplateId,versionId,source.id,RUNTIME_VERSION,queuePrefix(),persisted.description_json ? JSON.stringify({...persisted.description_json,version:persisted.version,executionOverrides:{}}) : null]);
   }};
  if(command==='pilot'){
   if(control)throw new Error('滚动批次已经建立；禁止重建已淘汰先导任务');

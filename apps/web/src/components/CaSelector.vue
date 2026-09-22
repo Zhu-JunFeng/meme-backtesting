@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { beijingTime } from "../time";
 import { computed, ref, onMounted } from "vue";
 import { api } from "../api";
 import { caKey, type CaSelection } from "../composables/useCaSelection";
@@ -11,7 +12,7 @@ async function loadChains(){
  try{chains.value=(await api.get("/market/chains")).data;chainError.value="";}
  catch{chainError.value="链列表加载失败";}
 }
-function date(t:any){return t ? new Date(Number(t)).toLocaleString():"—";}
+const date=beijingTime;
 onMounted(loadChains);
 </script>
 <template>

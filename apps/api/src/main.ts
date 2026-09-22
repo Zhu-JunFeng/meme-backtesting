@@ -3,7 +3,7 @@ import {resolveSignalDataset,externalSignalsForRun} from './token-signals.js';
 import "reflect-metadata";
 import { locate } from './locator.js';
 import { statistics } from './results.js';
-import { validateProfitLock } from '@meme/domain';
+import { generateStrategyDescription, validateProfitLock } from '@meme/domain';
 import { marketCas, resolveDataset, datasetCounts, resultRows, runCas } from "./datasets.js";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -125,7 +125,7 @@ export class AppService {
     return result.rows[0];
   }
 
-  async createTemplate(body: { name?: string; description?: string; status?: string; strategyJson?: StrategyConfig }) {
+  async createTemplate(body: { name?: string; description?: string; status?: string; strategyJson?: StrategyConfig; notes?: string }) {
     if (!body.name?.trim()) throw new BadRequestException("策略名称不能为空");
     if (body.status && !["draft", "active", "archived"].includes(body.status)) throw new BadRequestException("模板状态无效");
     if (body.strategyJson) await this.validateStrategy(body.strategyJson);
@@ -133,7 +133,7 @@ export class AppService {
     try {
       await client.query("BEGIN");
       const template = (await client.query("INSERT INTO backtest_strategy_templates(name,description,status) VALUES($1,$2,$3) RETURNING id", [body.name.trim(), body.description ?? "", body.status ?? "draft"])).rows[0];
-      if (body.strategyJson) await this.insertVersion(client, template.id, body.strategyJson);
+      if (body.strategyJson) await this.insertVersion(client, template.id, body.strategyJson, body.notes);
       await client.query("COMMIT");
       return this.template(template.id);
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
@@ -146,36 +146,38 @@ export class AppService {
     return this.template(id);
   }
 
-  private async insertVersion(client: PoolClient, templateId: string, strategy: StrategyConfig) {
+  private async insertVersion(client: PoolClient, templateId: string, strategy: StrategyConfig, notes = '') {
+    let description;
+    try { description = generateStrategyDescription(strategy, notes); } catch(e) { throw new BadRequestException(String(e)); }
     await client.query("SELECT id FROM backtest_strategy_templates WHERE id=$1 FOR UPDATE", [templateId]);
     const next = Number((await client.query("SELECT COALESCE(MAX(version),0)+1 AS version FROM backtest_strategy_versions WHERE template_id=$1", [templateId])).rows[0].version);
-    const inserted = (await client.query('INSERT INTO backtest_strategy_versions(template_id,version,schema_version,strategy_json,checksum) VALUES($1,$2,$3,$4,$5) RETURNING id,template_id AS "templateId",version,schema_version AS "schemaVersion",strategy_json AS "strategyJson",checksum,created_at AS "createdAt"', [templateId, next, strategy.schemaVersion, JSON.stringify(strategy), checksum(strategy)])).rows[0];
+    const inserted = (await client.query('INSERT INTO backtest_strategy_versions(template_id,version,schema_version,strategy_json,checksum,description_json) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,template_id AS "templateId",version,schema_version AS "schemaVersion",strategy_json AS "strategyJson",checksum,description_json AS "versionDescription",created_at AS "createdAt"', [templateId, next, strategy.schemaVersion, JSON.stringify(strategy), checksum(strategy), JSON.stringify(description)])).rows[0];
     await client.query("UPDATE backtest_strategy_templates SET current_version_id=$2,updated_at=now() WHERE id=$1", [templateId, inserted.id]);
     return inserted;
   }
 
-  async createVersion(templateId: string, strategy: StrategyConfig) {
+  async createVersion(templateId: string, strategy: StrategyConfig, notes = '') {
     await this.template(templateId);
     await this.validateStrategy(strategy);
     const client = await this.pool.connect();
-    try { await client.query("BEGIN"); const result = await this.insertVersion(client, templateId, strategy); await client.query("COMMIT"); return result; }
+    try { await client.query("BEGIN"); const result = await this.insertVersion(client, templateId, strategy, notes); await client.query("COMMIT"); return result; }
     catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
 
   async versions(templateId: string) {
     await this.template(templateId);
-    return (await this.pool.query('SELECT id,template_id AS "templateId",version,schema_version AS "schemaVersion",strategy_json AS "strategyJson",checksum,created_at AS "createdAt" FROM backtest_strategy_versions WHERE template_id=$1 ORDER BY version DESC', [templateId])).rows;
+    return (await this.pool.query('SELECT id,template_id AS "templateId",version,schema_version AS "schemaVersion",strategy_json AS "strategyJson",checksum,description_json AS "versionDescription",created_at AS "createdAt" FROM backtest_strategy_versions WHERE template_id=$1 ORDER BY version DESC', [templateId])).rows;
   }
 
   async version(id: string) {
-    const result = await this.pool.query('SELECT v.id,v.template_id AS "templateId",v.version,v.schema_version AS "schemaVersion",v.strategy_json AS "strategyJson",v.checksum,v.created_at AS "createdAt",t.name AS "templateName",t.description AS "templateDescription" FROM backtest_strategy_versions v JOIN backtest_strategy_templates t ON t.id=v.template_id WHERE v.id=$1', [id]);
+    const result = await this.pool.query('SELECT v.id,v.template_id AS "templateId",v.version,v.schema_version AS "schemaVersion",v.strategy_json AS "strategyJson",v.description_json AS "versionDescription",v.checksum,v.created_at AS "createdAt",t.name AS "templateName",t.description AS "templateDescription" FROM backtest_strategy_versions v JOIN backtest_strategy_templates t ON t.id=v.template_id WHERE v.id=$1', [id]);
     if (!result.rowCount) throw new NotFoundException("策略版本不存在");
     return result.rows[0];
   }
 
   async cloneVersion(id: string, body: { name?: string; description?: string }) {
     const source = await this.version(id);
-    return this.createTemplate({ name: body.name?.trim() || `${source.templateName} 副本`, description: body.description ?? source.templateDescription, status: "draft", strategyJson: source.strategyJson });
+    return this.createTemplate({ name: body.name?.trim() || `${source.templateName} 副本`, description: body.description ?? source.templateDescription, status: "draft", strategyJson: source.strategyJson, notes: source.versionDescription?.notes ?? "" });
   }
 
 
@@ -195,7 +197,7 @@ export class AppService {
     await this.validateStrategy(strategy);
     // Database-resolved gates and frozen evidence must not be overridden by extra strategy JSON keys.
     const config: BacktestConfig = { ...strategy, ...dataset, name: request.name.trim(), strategyTemplateId: version.templateId, strategyVersionId: version.id };
-    const { rows } = await this.pool.query("INSERT INTO backtest_runs(name,status,strategy_template_id,strategy_version_id,dataset_json,config_json,progress,runtime_version,queue_scope,phase) VALUES($1,'pending',$2,$3,$4,$5,0,$6,$7,'freezing') RETURNING id,status,progress,dispatch_no", [config.name, version.templateId, version.id, JSON.stringify(dataset), JSON.stringify(config),RUNTIME_VERSION,queuePrefix()]);
+    const { rows } = await this.pool.query("INSERT INTO backtest_runs(name,status,strategy_template_id,strategy_version_id,dataset_json,config_json,progress,runtime_version,queue_scope,phase,strategy_description_json) VALUES($1,'pending',$2,$3,$4,$5,0,$6,$7,'freezing',$8) RETURNING id,status,progress,dispatch_no", [config.name, version.templateId, version.id, JSON.stringify(dataset), JSON.stringify(config),RUNTIME_VERSION,queuePrefix(), version.versionDescription ? JSON.stringify({...version.versionDescription, version:version.version, executionOverrides:overrides}) : null]);
     try { await enqueue(this.queue,rows[0]); }
     catch (error) { await this.pool.query("UPDATE backtest_runs SET status='failed',error_message=$2,finished_at=now() WHERE id=$1", [rows[0].id, `队列提交失败：${String(error)}`]); throw new ConflictException("任务已保存，但提交执行队列失败"); }
     return rows[0];
@@ -229,7 +231,7 @@ class AppController {
   @Post("strategy-templates") createTemplate(@Body() body: any) { return this.service.createTemplate(body); }
   @Get("strategy-templates/:id") template(@Param("id") id: string) { return this.service.template(id); }
   @Patch("strategy-templates/:id") patchTemplate(@Param("id") id: string, @Body() body: any) { return this.service.patchTemplate(id, body); }
-  @Post("strategy-templates/:id/versions") createVersion(@Param("id") id: string, @Body() body: StrategyConfig | { strategyJson: StrategyConfig }) { return this.service.createVersion(id, "strategyJson" in body ? body.strategyJson : body); }
+  @Post("strategy-templates/:id/versions") createVersion(@Param("id") id: string, @Body() body: StrategyConfig | { strategyJson: StrategyConfig; notes?: string }) { return this.service.createVersion(id, "strategyJson" in body ? body.strategyJson : body, "strategyJson" in body ? body.notes : undefined); }
   @Get("strategy-templates/:id/versions") versions(@Param("id") id: string) { return this.service.versions(id); }
   @Get("strategy-versions/:id") version(@Param("id") id: string) { return this.service.version(id); }
   @Post("strategy-versions/:id/clone") clone(@Param("id") id: string, @Body() body: any) { return this.service.cloneVersion(id, body); }

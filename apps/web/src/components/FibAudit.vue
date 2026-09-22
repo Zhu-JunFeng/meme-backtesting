@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import { beijingTime } from "../time";
 import {formatNumber,valueTone} from '../format';
 defineProps<{fib:any;isMcap:boolean}>();
-const utc=(t:number)=>new Date(t).toISOString().replace('T',' ').replace('.000Z',' UTC');
+const utc=(t:number)=>beijingTime(t,true)+' 北京时间 UTC+8';
 const raw=(n:number)=>Number(n).toString();
 </script>
 <template>

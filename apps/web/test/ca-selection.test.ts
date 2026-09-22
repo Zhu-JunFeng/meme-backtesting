@@ -31,7 +31,8 @@ describe("chain-driven CA selection",()=>{
  it("preserves exclusions across dimensions and restores them when rechecked",async()=>{
   const t=setup();t.selection.state.chains=["sol"];await settle();
   t.selection.change([caKey(row("b"))]);expect(t.selection.state.excluded.map(r=>r.ca)).toEqual(["a"]);
-  t.dimension.interval="1m";t.dimension.valueType="price";t.dimension.startTime="2026-09-01";await settle();
+  t.dimension.interval="1m";t.dimension.valueType="price";t.dimension.startTime="2026-09-01T00:00";await settle();
+  expect(t.fetch.mock.calls.at(-1)?.[0].startTime).toBe('2026-08-31T16:00:00.000Z');
   expect(t.selection.state.selected.map(r=>r.ca)).toEqual(["b"]);
   t.selection.change([caKey(row("a")),caKey(row("b"))]);expect(t.selection.state.excluded).toEqual([]);t.stop();
  });
@@ -91,4 +92,3 @@ describe("chain-driven CA selection",()=>{
   t.selection.state.chains=["sol"];await settle();expect(t.selection.blocked.value).toBe(true);expect(t.selection.state.selected).toEqual([]);t.stop();
  });
 });
-

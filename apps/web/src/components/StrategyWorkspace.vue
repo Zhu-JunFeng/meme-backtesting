@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { generateStrategyDescription } from "@meme/domain";
+import StrategyDescription from "./StrategyDescription.vue";
 import { computed, onMounted, ref, watch } from "vue";
 import { message, Modal } from "ant-design-vue";
 import { InboxOutlined, BranchesOutlined, CopyOutlined, PlusOutlined, SaveOutlined } from "@ant-design/icons-vue";
@@ -12,6 +14,10 @@ const versions = ref<any[]>([]);
 const selectedTemplateId = ref<string>();
 const selectedVersionId = ref<string>();
 const strategy = ref<any>();
+const notes=ref("");
+const savedDescription=ref<any>();
+let versionEpoch=0,templateEpoch=0;
+const fullDescription=computed(()=>{try{return strategy.value ? generateStrategyDescription(strategy.value,notes.value) : null;}catch{return null;}});
 const template = ref<any>();
 const loading = ref(false);
 const saving = ref(false);
@@ -26,25 +32,32 @@ async function refreshTemplates(preferred?: string) {
 }
 async function loadTemplate() {
   if (!selectedTemplateId.value) return;
+  const request=++templateEpoch; ++versionEpoch; strategy.value=undefined; notes.value=""; savedDescription.value=null;
   loading.value = true;
   try {
     const [detail, history] = await Promise.all([api.get(`/strategy-templates/${selectedTemplateId.value}`), api.get(`/strategy-templates/${selectedTemplateId.value}/versions`)]);
+    if(request!==templateEpoch)return;
     template.value = detail.data;
     versions.value = history.data;
     selectedVersionId.value = detail.data.currentVersionId || versions.value[0]?.id;
     await loadVersion();
-  } finally { loading.value = false; }
+  } finally { if(request===templateEpoch)loading.value = false; }
 }
 async function loadVersion() {
-  if (!selectedVersionId.value) { strategy.value = undefined; return; }
-  strategy.value = structuredClone((await api.get(`/strategy-versions/${selectedVersionId.value}`)).data.strategyJson);
+  const request=++versionEpoch; strategy.value=undefined; notes.value=""; savedDescription.value=null;
+  if (!selectedVersionId.value) return;
+  const {data}=await api.get(`/strategy-versions/${selectedVersionId.value}`);
+  if(request!==versionEpoch)return;
+  strategy.value=structuredClone(data.strategyJson);
   strategy.value.entryAfterSignal ??= true;
+  savedDescription.value=data.versionDescription ?? null;
+  notes.value=data.versionDescription?.notes ?? "";
 }
 async function saveVersion() {
   if (!strategy.value || !selectedTemplateId.value) return;
   saving.value = true;
   try {
-    const version = (await api.post(`/strategy-templates/${selectedTemplateId.value}/versions`, { strategyJson: strategy.value })).data;
+    const version = (await api.post(`/strategy-templates/${selectedTemplateId.value}/versions`, { strategyJson: strategy.value, notes:notes.value })).data;
     message.success(`已保存为不可变版本 v${version.version}`);
     await refreshTemplates(selectedTemplateId.value);
     await loadTemplate();
@@ -54,7 +67,7 @@ async function saveVersion() {
 function openCreate() { dialog.value = { name: "新策略模板", description: "" }; createOpen.value = true; }
 async function createTemplate() {
   if (!dialog.value.name.trim() || !strategy.value) return message.warning("请输入模板名称");
-  const created = (await api.post("/strategy-templates", { ...dialog.value, status: "draft", strategyJson: strategy.value })).data;
+  const created = (await api.post("/strategy-templates", { ...dialog.value, status: "draft", strategyJson: strategy.value, notes:notes.value })).data;
   createOpen.value = false;
   await refreshTemplates(created.id);
   await loadTemplate();
@@ -137,6 +150,9 @@ onMounted(async () => { definitions.value = (await api.get("/condition-definitio
 
         <section class="summary-panel"><div class="section-title"><BranchesOutlined /><div><h3>规则摘要</h3><p>保存前核对策略的实际含义</p></div></div><ol><li v-for="line in summary" :key="line">{{ line }}</li></ol></section>
 
+        <StrategyDescription :key="selectedVersionId" :description="savedDescription" :version="versions.find(item=>item.id===selectedVersionId)?.version" />
+        <StrategyDescription :description="fullDescription" preview />
+        <a-form-item label="新版本补充备注（可选）"><a-textarea v-model:value="notes" :rows="4" :maxlength="20000" show-count placeholder="补充适用场景、验证结论或注意事项；修改备注也将保存为新版本。" /></a-form-item>
         <section class="config-section"><div class="section-copy"><h3>入场时间限制</h3><p>保存到策略版本。创建回测时读取项目最早外部信号，信号前历史仍用于指标预热。</p></div><a-form-item label="仅在信号触发后买入"><a-switch v-model:checked="strategy.entryAfterSignal" /><p>开启时，买入及加仓 K 线开盘必须严格晚于信号时间。缺失信号的 CA 会排除并提示。</p></a-form-item></section>
         <a-tabs class="strategy-tabs">
           <a-tab-pane key="impulse" tab="拉升识别">

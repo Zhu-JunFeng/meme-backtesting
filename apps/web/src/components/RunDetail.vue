@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { beijingTime } from "../time";
+import StrategyDescription from "./StrategyDescription.vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { api } from "../api";
 import TradingViewChart from "./TradingViewChart.vue";
@@ -24,7 +26,7 @@ let epoch=0,caEpoch=0,poolEpoch=0,locateEpoch=0,loadEpoch=0,timer:number|undefin
 const pool=computed(()=>ca.value?.pools?.find((p:any)=>p.pairId===pairId.value));
 const symbol=computed(()=>pool.value ? [pool.value.chain,pool.value.ca,pool.value.pairId,run.value.config_json.valueType].join(":"):"");
 const detailValue=(key:string,n:any)=>key==='quantity'||run.value?.config_json.valueType==='price'&&['entry_price','first_entry_price','exit_price','price'].includes(key)?preciseValue(n):fmt(n);
-const date=(n:any)=>n===null || n===undefined?"不可用":new Date(Number(n)).toLocaleString();
+const date=beijingTime;
 const equityPoints=computed(()=>{
  if(!equity.value.length)return "";
  const values=equity.value.map(p=>Number(p.equity)),min=Math.min(...values),max=Math.max(...values),span=max-min || 1;
@@ -97,7 +99,9 @@ onBeforeUnmount(()=>{filterEpoch++;loadEpoch++;epoch++;caEpoch++;poolEpoch++;loc
   <a-skeleton v-if="loading" active />
   <template v-if="run">
    <header><h2>{{run.name}}</h2><a-tag>{{({pending:'等待中',running:'运行中',stopping:'停止中',stopped:'已停止',completed:'已完成',failed:'失败',cancelled:'已取消'} as any)[run.status]}}</a-tag><span>{{report?.engineVersion || run.runtime_version || '历史引擎'}} · {{run.config_json.interval}} · {{run.config_json.valueType==='mcap'?'市值':'价格'}}</span><RunActions :run="run" @changed="load" /></header>
-   <p v-if="run.runtime_version" class="help" role="status">阶段：{{({freezing:'冻结输入',computing:'回测计算',saving:'保存结果',completed:'已完成'} as any)[run.phase] || run.phase}} · 恢复 {{run.recovery_count}} 次 · 最近检查点：{{run.checkpoint_at ? new Date(run.checkpoint_at).toLocaleString() : '尚未生成'}}</p>
+   <p v-if="run.runtime_version" class="help" role="status">阶段：{{({freezing:'冻结输入',computing:'回测计算',saving:'保存结果',completed:'已完成'} as any)[run.phase] || run.phase}} · 恢复 {{run.recovery_count}} 次 · 最近检查点：{{run.checkpoint_at ? beijingTime(run.checkpoint_at) : '尚未生成'}}</p>
+   <p class="help">所有展示时间：北京时间 UTC+8</p>
+   <StrategyDescription :key="run.id" :description="run.strategy_description_json" :version="run.strategy_version" :execution="run.config_json.executionConfig" />
    <p class="help">任务入场限制：{{run.config_json.entrySignals?.length?'仅在信号触发后买入':'未限制信号前买入'}}。{{run.config_json.signalSelection?.excluded?.length ? `因缺少信号排除 ${run.config_json.signalSelection.excluded.length} 个 CA` : ''}}</p>
    <a-alert v-if="run.status!=='completed'" type="info" show-icon message="当前为阶段性结果，最终盈亏报告在任务完成后生成。" />
    <a-progress v-if="['pending','running'].includes(run.status)" :percent="Math.round(Number(run.progress)*100)" />
@@ -147,14 +151,14 @@ onBeforeUnmount(()=>{filterEpoch++;loadEpoch++;epoch++;caEpoch++;poolEpoch++;loc
     <template v-else-if="symbol && anchor"><p v-if="anchor.empty" class="help">当前筛选下该池无匹配交易，展示无交易标记的历史行情。</p><TradingViewChart :key="symbol" ref="chart" :symbol="symbol" :interval="run.config_json.interval" :run-id="run.id" :start-time="pool.startTime" :end-time="pool.endTime" :anchor="anchor" :include-end-of-backtest="includeEnd" :signal-types="selectedSignals.join(',')" /></template>
     <p v-if="hiddenUnassociated" class="help">{{hiddenUnassociated}} 个事件无法可靠关联订单，当前筛选已隐藏。</p><h3>事件时间线 · 点击定位</h3>
     <a-table :data-source="events" row-key="id" size="small" :scroll="{x:800}" :pagination="{disabled:lowerBusy,current:eventPage,pageSize:20,total:eventTotal,showSizeChanger:false,onChange:(p:number)=>eventPage=p}" :columns="[{title:'事件时间',key:'time'},{title:'事件',key:'type'},{title:run.config_json.valueType==='mcap'?'市值':'价格',key:'price'},{title:'数量',key:'quantity'},{title:'原因',key:'reason'}]">
-     <template #bodyCell="{column,record}"><a-button v-if="column.key==='time'" type="link" :disabled="lowerBusy || locating" @click="chart?.focusEvent(record)">{{date(record.time)}}</a-button><template v-else-if="column.key==='type'"><a-tag>{{record.event_label}} {{labels[record.signal_type] || record.signal_type}}</a-tag><a-tag v-if="!includeEnd && record.excluded_end">不计入当前统计</a-tag></template><template v-else-if="column.key==='reason'"><ExitReason v-if="record.signal_type==='invalidation'" :record="record" /><a-tooltip v-else :title="JSON.stringify(record.reason_json)"><span>{{record.reason_json?.message || labels[record.reason_json?.priority] || '策略条件满足'}} ⓘ</span></a-tooltip></template><template v-else>{{detailValue(column.key,record[column.key])}}</template></template>
+     <template #bodyCell="{column,record}"><a-button v-if="column.key==='time'" type="link" :disabled="lowerBusy || locating" @click="chart?.focusEvent(record)">{{date(record.time)}}</a-button><template v-else-if="column.key==='type'"><a-tag>{{record.event_label}} {{labels[record.signal_type] || record.signal_type}}</a-tag><a-tag v-if="!includeEnd && record.excluded_end">不计入当前统计</a-tag></template><template v-else-if="column.key==='reason'"><ExitReason v-if="record.signal_type==='invalidation'" :record="record" /><a-tooltip v-else :title="'原始数据（时间戳未转换）：'+JSON.stringify(record.reason_json)"><span>{{record.reason_json?.message || labels[record.reason_json?.priority] || '策略条件满足'}} ⓘ</span></a-tooltip></template><template v-else>{{detailValue(column.key,record[column.key])}}</template></template>
     </a-table>
     <h3>交易明细</h3>
     <a-table :data-source="trades" row-key="id" size="small" :scroll="{x:1550}" :pagination="{disabled:lowerBusy,current:tradePage,pageSize:20,total:tradeTotal,showSizeChanger:false,onChange:(p:number)=>tradePage=p}" :columns="[{title:'交易',key:'locate'},{title:'首次入场时间',key:'entry_time'},{title:'首次买入'+valueLabel,key:'first_entry_price'},{title:'平均买入'+valueLabel,key:'entry_price'},{title:'卖出'+valueLabel,key:'exit_price'},{title:'数量',key:'quantity'},{title:'退出时间',key:'exit_time'},{title:'净盈亏金额',key:'net_pnl'},{title:'净盈亏比例',key:'net_return_percent'},{title:'持仓时间',key:'holding_ms'},{title:'退出原因',key:'exit_reason'}]">
      <template #bodyCell="{column,record}"><a-button v-if="column.key==='locate'" type="link" :disabled="lowerBusy || locating" @click="locateTrade(record.id)">{{record.trade_no ? '买'+record.trade_no+' / 卖'+record.trade_no : '买卖区间'}}</a-button><template v-else-if="column.key.endsWith('_time')">{{record[column.key]!=null ? date(record[column.key]):'未平仓'}}</template><template v-else-if="column.key==='exit_reason'"><span v-if="record.trade_classification==='open'">未平仓</span><ExitReason v-else :record="record" /></template><template v-else-if="column.key==='holding_ms'">{{record.exit_time==null?'未平仓':duration(record.holding_ms)}}<small v-if="record.holding_bars!=null"> · {{record.holding_bars}} 根</small></template><template v-else-if="column.key==='net_return_percent'"><ResultValue :value="record.net_return_percent" percent /></template><template v-else-if="column.key==='net_pnl'"><ResultValue :value="record.net_pnl" /></template><template v-else>{{detailValue(column.key,record[column.key])}}</template></template>
     </a-table>
    </section>
-   <a-collapse><a-collapse-panel key="snapshot" header="不可变任务配置快照"><pre>{{JSON.stringify(run.config_json,null,2)}}</pre></a-collapse-panel></a-collapse>
+   <a-collapse><a-collapse-panel key="snapshot" header="不可变任务配置快照（原始数据，时间戳未转换）"><pre>{{JSON.stringify(run.config_json,null,2)}}</pre></a-collapse-panel></a-collapse>
   </template>
  </section>
 </template>

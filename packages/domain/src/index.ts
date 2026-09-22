@@ -1,3 +1,5 @@
+export { generateStrategyDescription, DESCRIPTION_GENERATOR_VERSION } from './strategy-description.js';
+export type { VersionDescription, RunStrategyDescription } from './strategy-description.js';
 export type Interval = "30s" | "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
 export type ValueType = "price" | "mcap";
 
@@ -150,4 +152,4 @@ export interface ConditionDefinition {
 }
 
 export interface StrategyTemplateSummary { id: string; name: string; description: string; status: "draft" | "active" | "archived"; currentVersionId: string | null; currentVersion?: number; createdAt: string; updatedAt: string }
-export interface StrategyVersion { id: string; templateId: string; version: number; schemaVersion: number; strategyJson: StrategyConfig; checksum: string; createdAt: string }
+export interface StrategyVersion { id: string; templateId: string; version: number; schemaVersion: number; strategyJson: StrategyConfig; checksum: string; createdAt: string; versionDescription?: import('./strategy-description.js').VersionDescription | null }
