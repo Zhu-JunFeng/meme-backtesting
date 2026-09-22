@@ -6,6 +6,6 @@ COPY apps ./apps
 COPY packages ./packages
 COPY scripts ./scripts
 RUN pnpm install --frozen-lockfile --ignore-scripts
-RUN pnpm --filter @meme/web build
+RUN pnpm --filter @meme/web... build
 EXPOSE 5173
 CMD ["pnpm", "--filter", "@meme/web", "dev", "--host", "0.0.0.0"]
