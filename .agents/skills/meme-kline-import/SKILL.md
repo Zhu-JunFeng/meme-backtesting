@@ -31,6 +31,8 @@ Each small transaction synchronizes `meme_kline`, `token_info` and `token_signal
 
 ## Operational boundaries
 
+- By default only import projects created in the last rolling 30 days, based on lookup creation time, not workbook signal time. `--created-within-days` changes this when requested. The cutoff is fixed at execution start; excluded older projects are reported and none of their three-table data is modified. Existing older database records are not deleted.
+
 - Do not create an SSH tunnel. The script connects using `DATABASE_URL` and the local `psql` client.
 - Do not hardcode credentials, CA lists, pair IDs, or timestamps into this skill.
 - Do not import into the obsolete `public.xxyy_kline` relation.

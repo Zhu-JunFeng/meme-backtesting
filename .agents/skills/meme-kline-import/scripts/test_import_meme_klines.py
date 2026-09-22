@@ -183,7 +183,7 @@ class DatabaseTests(unittest.TestCase):
             timeout=1, retries=0, lookup_batch_size=50,
         )
         tokens = [importer.TokenRef("sol", "CA", 2)]
-        projects = [importer.Project("sol", "CA", "PAIR", 1700000000000)]
+        projects = [importer.Project("sol", "CA", "PAIR", int(importer.time.time()*1000)-1000)]
         with patch.dict(os.environ, {"DATABASE_URL": "postgresql://example/db"}), \
              patch.object(importer, "read_tokens", return_value=tokens), \
              patch.object(importer, "read_signals", return_value=[{"chain":"sol", "ca":"CA"}]), \

@@ -468,6 +468,12 @@ def aligned_start(timestamp_ms: int, interval_seconds: int) -> int:
     return timestamp_ms - timestamp_ms % interval_ms
 
 
+def recent_projects(projects: Sequence[Project], now_ms: int, days: int) -> tuple[list[Project], list[Project]]:
+    cutoff = now_ms - days * HISTORY_MS
+    return ([p for p in projects if cutoff <= p.created_ms <= now_ms],
+            [p for p in projects if not cutoff <= p.created_ms <= now_ms])
+
+
 def closed_cutoff(now_ms: int, interval_seconds: int) -> int:
     return aligned_start(now_ms, interval_seconds)
 
@@ -755,6 +761,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retries", type=int, default=3, help="HTTP retries after the first attempt (default: 3)")
     parser.add_argument("--lookup-batch-size", type=int, default=50, help="CAs per MemeInfo lookup request (default: 50)")
     parser.add_argument("--chains", default="", help="comma-separated chain allowlist, e.g. sol,robin,bsc")
+    parser.add_argument("--created-within-days", type=int, default=30, help="only projects created within this many rolling days (default: 30)")
     parser.add_argument("--report", type=Path, help="append per-project audit results as JSONL (no credentials)")
     return parser
 
@@ -764,6 +771,9 @@ def run(args: argparse.Namespace) -> int:
         raise ImporterError("--workers must be between 1 and 32")
     if args.timeout <= 0 or args.retries < 0 or not 1 <= args.lookup_batch_size <= 200:
         raise ImporterError("invalid timeout, retry, or lookup batch-size option")
+    created_days = getattr(args, "created_within_days", 30)
+    if created_days < 1:
+        raise ImporterError("--created-within-days must be positive")
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
         raise ImporterError("DATABASE_URL is required")
@@ -780,12 +790,16 @@ def run(args: argparse.Namespace) -> int:
         raise ImporterError("selected CA missing valid signal metadata")
     print(f"已解析项目：{len(tokens)} 个唯一 chain + CA")
     projects, skipped = lookup_projects(tokens, now_ms, args.lookup_batch_size, args.timeout, args.retries)
+    projects, outside_age = recent_projects(projects, now_ms, created_days)
+    selected_keys = {(p.chain, p.ca) for p in projects}
+    events = [e for e in events if (e["chain"], e["ca"]) in selected_keys]
     for token, reason in skipped:
         print(f"[WARN] 跳过 {token.chain}:{token.ca}（Excel 第 {token.source_row} 行）：{reason}", file=sys.stderr)
 
     preflight_database(database_url)
     preflight_signals(database_url, events)
     print(f"Lookup 匹配：{len(projects)}；跳过：{len(skipped)}")
+    print(f"创建时间筛选：最近 {created_days} 天（{utc_text(now_ms-created_days*HISTORY_MS)} 起）；超出范围 {len(outside_age)} 个")
     print(f"数据库目标：{safe_database_target(database_url)} / public.meme_kline")
     if projects:
         print(f"创建时间范围：{utc_text(min(project.created_ms for project in projects))} 至 {utc_text(max(project.created_ms for project in projects))}")
@@ -815,7 +829,9 @@ def run(args: argparse.Namespace) -> int:
                 stream.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     record(dict(kind="start", workbook=str(args.workbook), now_ms=now_ms, projects=len(projects),
-                selected=len(tokens), database=safe_database_target(database_url)))
+                selected=len(tokens), created_within_days=created_days, database=safe_database_target(database_url)))
+    for project in outside_age:
+        record(dict(kind="creation_excluded", **asdict(project), reason=f"created outside last {created_days} days"))
     for token, reason in skipped:
         record(dict(kind="lookup_skipped", **asdict(token), reason=reason))
 

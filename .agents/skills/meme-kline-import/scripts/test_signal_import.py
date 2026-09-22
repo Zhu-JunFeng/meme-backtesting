@@ -14,6 +14,14 @@ ROW = ['BSC','0xAbC','1700000000123','2023-11-15 06:13:20','name','fomo_new_proj
 
 
 class SignalTests(unittest.TestCase):
+    def test_recent_creation_boundary(self):
+        now=1800000000000
+        cutoff=now-30*m.HISTORY_MS
+        projects=[m.Project('sol',str(t),'p',t) for t in [cutoff-1,cutoff,now,now+1]]
+        included,excluded=m.recent_projects(projects,now,30)
+        self.assertEqual([p.created_ms for p in included],[cutoff,now])
+        self.assertEqual([p.created_ms for p in excluded],[cutoff-1,now+1])
+
     def test_normalization_dedup_and_chain_filter(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d)/'test.xlsx'
@@ -60,7 +68,7 @@ class SignalTests(unittest.TestCase):
         with patch.dict(os.environ,{'DATABASE_URL':'postgresql://example/db'}), \
              patch.object(m,'read_tokens',return_value=[m.TokenRef('sol','ca',1)]), \
              patch.object(m,'read_signals',return_value=[dict(chain='sol',ca='ca')]), \
-             patch.object(m,'lookup_projects',return_value=([m.Project('sol','ca','p',1)],[])), \
+             patch.object(m,'lookup_projects',return_value=([m.Project('sol','ca','p',int(m.time.time()*1000)-1000)],[])), \
              patch.object(m,'preflight_database'), patch.object(m,'preflight_signals'), \
              patch('builtins.input',return_value='NO'), patch.object(m,'write_rows') as write, \
              patch.object(m,'fetch_project') as fetch:
