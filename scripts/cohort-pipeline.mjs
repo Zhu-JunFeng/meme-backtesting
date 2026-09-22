@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFile,mkdir,writeFile,open} from 'node:fs/promises';
 import {spawn} from 'node:child_process';
 import {resolve} from 'node:path';
-import {snapshot,saveJson,requireFinishedImport} from './cohort-snapshot.mjs';
+import {snapshot,saveJson,importComplete} from './cohort-snapshot.mjs';
 import {generateStrategyDescription} from '../packages/domain/dist/index.js';
 
 const args=process.argv.slice(2),value=k=>args[args.indexOf(k)+1];
@@ -20,7 +20,7 @@ async function child(script,parameters,name,production=false){
 }
 try{
  await state('waiting_for_import');const until=Date.now()+24*3600000;
- for(;;){let complete=false;try{requireFinishedImport(await readFile(importReport,'utf8'));complete=true;}catch(e){if(e.code&&e.code!=='ENOENT')throw e;}
+ for(;;){let complete=false;try{complete=importComplete(await readFile(importReport,'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
   if(complete)break;
   try{process.kill(pid,0);}catch{throw Error('Importer stopped without a summary; inspect/repair import before restarting pipeline');}
   assert(Date.now()<until,'Import wait exceeded 24 hours; no snapshot taken');await new Promise(r=>setTimeout(r,15000));

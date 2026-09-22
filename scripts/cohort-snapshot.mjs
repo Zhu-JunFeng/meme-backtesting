@@ -17,6 +17,7 @@ export const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex'
 export async function saveJson(path,value){await writeFile(path+'.tmp',JSON.stringify(value,null,2));await rename(path+'.tmp',path);}
 export async function fileHash(path){const h=createHash('sha256');for await(const chunk of createReadStream(path))h.update(chunk);return h.digest('hex');}
 export function requireFinishedImport(text){const rows=text.trim().split('\n').filter(Boolean).map(JSON.parse);const end=rows.at(-1);assert.equal(end?.kind,'summary','Import not complete: refuse to freeze changing data');return {start:rows.find(r=>r.kind==='start'),summary:end,issues:rows.filter(r=>['lookup_skipped','creation_excluded'].includes(r.kind)||r.kind==='project'&&r.status!=='success')};}
+export function importComplete(text){if(!text.trim())return false;try{if(JSON.parse(text.trim().split('\n').at(-1)).kind!=='summary')return false;}catch(e){if(e instanceof SyntaxError)return false;throw e;}requireFinishedImport(text);return true;}
 export async function* candleLines(path){const stream=createReadStream(path).pipe(createGunzip());for await(const line of createInterface({input:stream,crlfDelay:Infinity}))if(line)yield JSON.parse(line);}
 export function decodeRow(chain,r){const [ca,pairId,time,closeTime,open,high,low,close,volume,valid]=r;return {symbol:{chain,ca,pairId},candle:{time,closeTime,open,high,low,close,volume,valid}};}
 

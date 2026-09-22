@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {earliestSignals,partitionDays,dateNumber,subsets,stability,eligible,evaluateCohort,research} from './cohort-research.mjs';
-import {requireFinishedImport,snapshot,fileHash} from './cohort-snapshot.mjs';
+import {requireFinishedImport,importComplete,snapshot,fileHash} from './cohort-snapshot.mjs';
 import {compareResult,deterministicId} from './cohort-server-verify.mjs';
 import {mkdtemp,writeFile,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
@@ -26,6 +26,8 @@ test('stability uses positive returns, 20 trades, 10% drawdown and median deviat
  assert.equal(subsets(5).length,31);assert.equal(new Set(subsets(5).map(JSON.stringify)).size,31);
 });
 test('refuses a snapshot until import has a terminal summary',()=>{
+ assert.equal(importComplete(''),false);assert.equal(importComplete('{"kind":"project"}\n'),false);assert.equal(importComplete('{"kind":'),false);
+ assert.equal(importComplete('{"kind":"summary"}\n'),true);
  assert.throws(()=>requireFinishedImport('{"kind":"start"}\n{"kind":"project"}'));
  assert(requireFinishedImport('{"kind":"start"}\n{"kind":"summary"}').summary);
 });
