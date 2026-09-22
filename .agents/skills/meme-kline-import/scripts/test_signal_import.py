@@ -6,6 +6,7 @@ import unittest
 import uuid
 from pathlib import Path
 from unittest.mock import patch
+from subprocess import CompletedProcess
 
 from test_import_meme_klines import importer as m, make_xlsx
 
@@ -14,6 +15,36 @@ ROW = ['BSC','0xAbC','1700000000123','2023-11-15 06:13:20','name','fomo_new_proj
 
 
 class SignalTests(unittest.TestCase):
+    def test_reconnect_replays_identical_transaction_with_bounded_backoff(self):
+        failed=CompletedProcess([],2,'','server closed the connection unexpectedly')
+        succeeded=CompletedProcess([],0,'RESULT|0|1\n','')
+        events=[]
+        with patch.object(m.shutil,'which',return_value='/usr/bin/psql'), \
+             patch.object(m.subprocess,'run',side_effect=[failed,failed,succeeded]) as run, \
+             patch.object(m.time,'sleep') as sleep:
+            self.assertEqual(m.run_psql('postgresql://test/db','BEGIN; SELECT 1; COMMIT;',connection_retries=2,retry_events=events),'RESULT|0|1\n')
+            self.assertEqual(events,[1,2])
+            self.assertEqual([c.args[0] for c in sleep.call_args_list],[1,2])
+            self.assertTrue(all(c.kwargs['input']=='BEGIN; SELECT 1; COMMIT;' for c in run.call_args_list))
+        for error,expected_calls in [('server closed the connection unexpectedly',3),('ERROR: conflicting token signal identity',1),('ERROR: no space left on device',1)]:
+            with patch.object(m.shutil,'which',return_value='/usr/bin/psql'), \
+                 patch.object(m.subprocess,'run',return_value=CompletedProcess([],2,'',error)) as run, \
+                 patch.object(m.time,'sleep'):
+                with self.assertRaises(m.ImporterError):m.run_psql('postgresql://test/db','BEGIN; COMMIT;',connection_retries=2)
+                self.assertEqual(run.call_count,expected_calls)
+
+    def test_write_batch_reconnect_and_csv_lifetime(self):
+        project=m.Project('sol','ca','pair',60001)
+        row=m.candle_row(project,30,'30s','price',{'time':60000,'price':dict(open=1,high=2,low=1,close=2,volume=3)},60001,120000)
+        events=[];paths=[]
+        def execute(*args,**kwargs):
+            sql=kwargs['input'];path=Path(sql.split("FROM '")[1].split("' WITH")[0]);paths.append(path)
+            self.assertTrue(path.exists());self.assertIn('BEGIN;',sql);self.assertIn('COMMIT;',sql)
+            return CompletedProcess([],2,'','connection reset by peer') if len(paths)==1 else CompletedProcess([],0,'RESULT|1|0\n','')
+        with patch.object(m.shutil,'which',return_value='/usr/bin/psql'),patch.object(m.subprocess,'run',side_effect=execute),patch.object(m.time,'sleep'):
+            self.assertEqual(m.write_rows('postgresql://test/db',[row,row],batch_size=1,retry_events=events),(2,0))
+        self.assertEqual(events,[1]);self.assertEqual(paths[0],paths[1]);self.assertTrue(all(not p.exists() for p in paths))
+
     def test_resume_reuses_committed_project_without_http_or_database_write(self):
         with tempfile.TemporaryDirectory() as d:
             workbook=Path(d)/'signals.xlsx';report=Path(d)/'previous.jsonl'
@@ -115,6 +146,20 @@ UNIQUE(chain,pair_id,interval,open_time,type));''')
                 self.assertIn('RESULT|1|0',apply([event]))
                 self.assertIn('RESULT|0|1',apply([event]))
                 self.assertIn('SIGNALS|0|1',apply([event]))
+                # Real COMMIT succeeds but its acknowledgement is lost: retry must
+                # preserve all three tables without duplicate signals or candles.
+                execute=m.subprocess.run;attempts=[]
+                def lose_reply(*args,**kwargs):
+                    result=execute(*args,**kwargs);attempts.append(result)
+                    if len(attempts)==1:
+                        self.assertEqual(result.returncode,0)
+                        return CompletedProcess(result.args,2,'','server closed the connection unexpectedly')
+                    return result
+                sql=m.build_upsert_sql(p,m.metadata_sql(project,[event])).replace('public.',schema+'.')
+                with patch.object(m.subprocess,'run',side_effect=lose_reply),patch.object(m.time,'sleep'):
+                    self.assertIn('RESULT|0|1',m.run_psql(url,sql,connection_retries=1))
+                self.assertEqual(len(attempts),2)
+                self.assertEqual(m.run_psql(url,f'SELECT (SELECT count(*) FROM {schema}.meme_kline),(SELECT count(*) FROM {schema}.token_info),(SELECT count(*) FROM {schema}.token_signal_events);').strip(),'1|1|1')
                 earlier={**event,'detail_id':'d0','signal_time':70000}
                 apply([earlier]);apply([event])
                 self.assertEqual(m.run_psql(url,f'SELECT signal_time FROM {schema}.token_info;').strip(),'70000')

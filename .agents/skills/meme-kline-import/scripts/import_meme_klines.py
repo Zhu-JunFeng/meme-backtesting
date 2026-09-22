@@ -619,11 +619,13 @@ def retryable_psql_error(detail: str) -> bool:
         "server closed the connection",
         "ssl syscall error",
         "connection reset by peer",
+        "protocol synchronization was lost",
+        "unexpected eof on client connection",
     ))
 
 
 def run_psql(database_url: str, sql: str, *, field_separator: str | None = None,
-             connection_retries: int = 3) -> str:
+             connection_retries: int = 3, retry_events: list[int] | None = None) -> str:
     executable = shutil.which("psql")
     if executable is None:
         raise ImporterError("psql is required but was not found in PATH")
@@ -641,7 +643,11 @@ def run_psql(database_url: str, sql: str, *, field_separator: str | None = None,
         detail = (completed.stderr or completed.stdout or "unknown psql error").strip()[-1_500:]
         if attempt == connection_retries or not retryable_psql_error(detail):
             break
-        time.sleep(2 ** attempt)
+        if retry_events is not None:
+            retry_events.append(attempt + 1)
+        delay = min(30, 2 ** attempt)
+        print(f"[WARN] PostgreSQL connection interrupted; reconnect/replay {attempt + 1}/{connection_retries} in {delay}s", file=sys.stderr)
+        time.sleep(delay)
     assert completed is not None
     if completed.returncode:
         detail = (completed.stderr or completed.stdout or "unknown psql error").strip()[-1_500:]
@@ -719,8 +725,9 @@ COMMIT;
 """
 
 
-def write_rows(database_url: str, rows: Sequence[CandleRow], batch_size: int = 20_000,
-               metadata: str = "", signal_counts: list[int] | None = None) -> tuple[int, int]:
+def write_rows(database_url: str, rows: Sequence[CandleRow], batch_size: int = 1_000,
+               metadata: str = "", signal_counts: list[int] | None = None,
+               connection_retries: int = 5, retry_events: list[int] | None = None) -> tuple[int, int]:
     inserted = 0
     updated = 0
     for batch in (list(chunks(rows, batch_size)) or ([[]] if metadata else [])):
@@ -729,7 +736,10 @@ def write_rows(database_url: str, rows: Sequence[CandleRow], batch_size: int = 2
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", suffix=".csv", delete=False) as temporary:
                 temporary_path = Path(temporary.name)
                 write_csv_rows(temporary, batch)
-            output = run_psql(database_url, build_upsert_sql(temporary_path, metadata), connection_retries=0)
+            # A fresh psql process replays the same complete three-table transaction.
+            # Unique keys and metadata UPSERT make even a lost COMMIT reply safe.
+            output = run_psql(database_url, build_upsert_sql(temporary_path, metadata),
+                              connection_retries=connection_retries, retry_events=retry_events)
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
@@ -759,6 +769,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4, help="number of concurrent project fetches (default: 4)")
     parser.add_argument("--timeout", type=float, default=30, help="HTTP timeout in seconds (default: 30)")
     parser.add_argument("--retries", type=int, default=3, help="HTTP retries after the first attempt (default: 3)")
+    parser.add_argument("--db-retries", type=int, default=5, help="bounded connection retries per write batch (default: 5)")
+    parser.add_argument("--db-batch-size", type=int, default=1000, help="candles per atomic three-table write (default: 1000)")
     parser.add_argument("--lookup-batch-size", type=int, default=50, help="CAs per MemeInfo lookup request (default: 50)")
     parser.add_argument("--chains", default="", help="comma-separated chain allowlist, e.g. sol,robin,bsc")
     parser.add_argument("--created-within-days", type=int, default=30, help="only projects created within this many rolling days (default: 30)")
@@ -768,10 +780,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
+    args.db_retries = getattr(args, "db_retries", 5)
+    args.db_batch_size = getattr(args, "db_batch_size", 1000)
     if args.workers < 1 or args.workers > 32:
         raise ImporterError("--workers must be between 1 and 32")
     if args.timeout <= 0 or args.retries < 0 or not 1 <= args.lookup_batch_size <= 200:
         raise ImporterError("invalid timeout, retry, or lookup batch-size option")
+    if not 0 <= args.db_retries <= 10 or not 1 <= args.db_batch_size <= 20000:
+        raise ImporterError("--db-retries must be 0..10; --db-batch-size must be 1..20000")
     created_days = getattr(args, "created_within_days", 30)
     if created_days < 1:
         raise ImporterError("--created-within-days must be positive")
@@ -854,7 +870,8 @@ def run(args: argparse.Namespace) -> int:
 
     record(dict(kind="start", workbook=str(args.workbook), now_ms=now_ms, projects=len(projects),
                 selected=len(tokens), created_within_days=created_days, database=safe_database_target(database_url),
-                workbook_hash=hashlib.sha256(args.workbook.read_bytes()).hexdigest(), resume_report=str(resume_path) if resume_path else None))
+                workbook_hash=hashlib.sha256(args.workbook.read_bytes()).hexdigest(), resume_report=str(resume_path) if resume_path else None,
+                db_retries=args.db_retries, db_batch_size=args.db_batch_size))
     for project in outside_age:
         record(dict(kind="creation_excluded", **asdict(project), reason=f"created outside last {created_days} days"))
     for token, reason in skipped:
@@ -866,13 +883,16 @@ def run(args: argparse.Namespace) -> int:
             return {**previous, "resumed": True}
         result = fetch_project(project, now_ms, args.timeout, args.retries)
         signals = [0, 0]
-        inserted, updated = write_rows(database_url, result.rows,
-            metadata=metadata_sql(project, by_token[(project.chain, project.ca)]), signal_counts=signals)
+        retry_events: list[int] = []
+        inserted, updated = write_rows(database_url, result.rows, batch_size=args.db_batch_size,
+            metadata=metadata_sql(project, by_token[(project.chain, project.ca)]), signal_counts=signals,
+            connection_retries=args.db_retries, retry_events=retry_events)
         status = ("failed" if not result.rows and result.errors else "no_data" if not result.rows
                   else "partial" if result.errors or result.empty_combinations or result.invalid or result.discarded else "success")
         return dict(kind="project", **asdict(project), status=status, inserted=inserted, updated=updated,
                     signal_inserted=signals[0], signal_duplicates=signals[1], invalid=result.invalid,
                     discarded=result.discarded, errors=result.errors, empty=result.empty_combinations,
+                    db_reconnects=len(retry_events), write_counts_may_include_replay=bool(retry_events),
                     cutoff_ms=min(now_ms, project.created_ms + HISTORY_MS),
                     age_under_24h=now_ms < project.created_ms + HISTORY_MS)
 
