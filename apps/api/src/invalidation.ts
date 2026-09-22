@@ -63,7 +63,7 @@ export async function hydrateInvalidations(pool: Pool, run: any, data: {trades:a
   if(missing.length && run.input_ready) {
     const versions=(await pool.query(`SELECT report_json->>'engineVersion' version FROM backtest_reports WHERE run_id=$1 UNION ALL SELECT state_json->'engine'->>'engineVersion' FROM backtest_checkpoints WHERE run_id=$1`,[run.id])).rows;
     const conditions=leaves(run.config_json.invalidationConditionGroup), period=Math.max(1,...conditions.map(c=>c.period ?? 0));
-    if(versions.some(r=>['portfolio-3','portfolio-4'].includes(r.version)) && conditions.length && conditions.every(c=>supported.has(c.type)) && Number.isInteger(period) && period<=2000) {
+    if(versions.some(r=>['portfolio-3','portfolio-4','portfolio-5'].includes(r.version)) && conditions.length && conditions.every(c=>supported.has(c.type)) && Number.isInteger(period) && period<=2000) {
       const step=intervalMs(run.config_json.interval);
       const wanted=missing.map(({trade,exit})=>({id:String(trade.id),key:`${trade.chain}:${trade.ca}:${trade.pair_id}`,from:Number(exit.time)-period*step,to:Number(exit.time)}));
       // Only overlapping chunks plus one predecessor/successor. No mutable meme_kline reads.

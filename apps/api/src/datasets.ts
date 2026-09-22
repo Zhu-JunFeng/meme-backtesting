@@ -1,6 +1,7 @@
 import { BadRequestException } from "@nestjs/common";
 import type { Pool } from "pg";
 import type { DatasetSelection, DatasetConfig, PoolSnapshot } from "@meme/domain";
+import { normalizeEntrySignals } from '@meme/domain';
 import { includesEnd, loadResults, selectResults, signalTypes } from './results.js';
 
 export const intervals = new Set(["30s","1m","5m","15m","1h","4h","1d"]);
@@ -54,6 +55,9 @@ export async function resolveDataset(pool:Pool,input:DatasetSelection):Promise<D
   if (!Array.isArray(refs) || !refs.length || refs.length>10000 || refs.some(s=>!s || typeof s.chain!=="string" || !s.chain.trim() || typeof s.ca!=="string" || !s.ca.trim())) throw new BadRequestException("请选择有效的 CA（最多 10000 个）");
   const {start,end}=bounds(input);
   const selected=[...new Map(refs.map(s=>{const r={...s,chain:s.chain.trim().toLowerCase(),ca:s.ca.trim()};return [JSON.stringify(r),r]})).values()];
+  let entrySignals;
+  try { entrySignals=normalizeEntrySignals(input.entrySignals,selected); }
+  catch(error) { throw new BadRequestException((error as Error).message); }
   const pools:PoolSnapshot[]=(await pool.query(`
     WITH selected AS (SELECT * FROM jsonb_to_recordset($1::jsonb) AS s(chain text,ca text,"pairId" text)),
     pairs AS (SELECT DISTINCT k.chain,k.ca,k.pair_id FROM public.meme_kline k JOIN selected s
@@ -65,7 +69,7 @@ export async function resolveDataset(pool:Pool,input:DatasetSelection):Promise<D
       AND k.valid IS DISTINCT FROM false AND k.open_time BETWEEN $4 AND $5
     ) r ON true ORDER BY p.chain,p.ca,p.pair_id`,[JSON.stringify(selected),input.interval,input.valueType,start,end,!!input.cas?.length])).rows.map(r=>({...r,startTime:r.startTime===null?null:Number(r.startTime),endTime:r.endTime===null?null:Number(r.endTime)}));
   for (const ref of selected) if (!pools.some(p=>p.chain===ref.chain && p.ca===ref.ca && !p.noData)) throw new BadRequestException(`CA ${ref.chain}/${ref.ca} 在所选范围没有有效 K 线，请重新筛选`);
-  return {symbols:pools.map(({chain,ca,pairId})=>({chain,ca,pairId})),pools,interval:input.interval,valueType:input.valueType,startTime:input.startTime || undefined,endTime:input.endTime || undefined,selection:structuredClone(input)};
+  return {symbols:pools.map(({chain,ca,pairId})=>({chain,ca,pairId})),pools,interval:input.interval,valueType:input.valueType,startTime:input.startTime || undefined,endTime:input.endTime || undefined,selection:structuredClone(input),...(entrySignals?{entrySignals}:{})};
 }
 export function datasetCounts(dataset:DatasetConfig) {
   return {caCount:new Set(dataset.symbols.map(s=>s.chain+":"+s.ca)).size,poolCount:dataset.symbols.length,availablePoolCount:dataset.pools?.filter(p=>!p.noData).length ?? dataset.symbols.length,noDataPoolCount:dataset.pools?.filter(p=>p.noData).length ?? 0};

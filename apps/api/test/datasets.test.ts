@@ -1,6 +1,13 @@
 import {describe,it,expect,vi} from "vitest";
 import {bounds,resolveDataset,runCas,resultRows,marketCas} from "../src/datasets.js";
 describe("dataset selection",()=>{
+ it('freezes validated signal times without truncating historical input used for indicators',async()=>{
+ const query=vi.fn().mockResolvedValue({rows:[{chain:'sol',ca:'a',pairId:'p',startTime:100,endTime:200,noData:false}]});
+ const input:any={cas:[{chain:'sol',ca:'a'}],interval:'30s',valueType:'mcap',entrySignals:[{chain:'sol',ca:'a',signalTime:150}]};
+ const result=await resolveDataset({query} as any,input);expect(result.pools?.[0].startTime).toBe(100);expect(result.entrySignals).toEqual(input.entrySignals);
+ input.entrySignals[0].signalTime=999;expect(result.entrySignals?.[0].signalTime).toBe(150);
+ await expect(resolveDataset({query} as any,{...input,entrySignals:[]})).rejects.toThrow('信号');
+ });
  it("allows empty and one-sided time bounds, rejects malformed ranges",()=>{
  expect(bounds({}).start).toBe(0);expect(bounds({startTime:"2026-01-01"}).start).toBe(Date.parse("2026-01-01"));
  expect(bounds({endTime:"2026-01-01"}).end).toBe(Date.parse("2026-01-01"));

@@ -2,6 +2,7 @@ import type { BacktestConfig, BacktestReport, Candle, Condition, ConditionGroup,
 export * from './resumable.js';
 export * from './invalidation.js';
 import { describeInvalidation } from './invalidation.js';
+import { createEntryGate } from './entry-gate.js';
 
 const finite = (n: number) => Number.isFinite(n);
 const symbolKey = (s: SymbolRef) => `${s.chain}:${s.ca}:${s.pairId}`;
@@ -222,8 +223,10 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
   const signals: Array<Signal & { symbol: SymbolRef }> = [];
   const equityByTime = new Map<number, EquityPoint>();
   const activeTrades = new Map<string, ActiveTrade>();
+  const entryGate = createEntryGate(config);
 
   const enter = (symbol: SymbolRef, candle: Candle, index: number, impulse: Impulse, existing?: ActiveTrade) => {
+    if (!entryGate.allows(symbol,candle.time)) return;
     const sizing = config.positionConfig.sizing;
     const provisionalStop = existing ? stopPrice(config, existing) : candle.close * .9;
     const riskDistance = Math.max(Number.EPSILON, candle.close - provisionalStop);
@@ -244,13 +247,13 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
       existing.trade.slippageCost += entrySlip;
       existing.trade.taxCost += entryTax;
       existing.entries++;
-      const signal: Signal = { time: candle.time, price: candle.close, type: "add", quantity, reason: { conditionGroup: config.addConditionGroup ?? config.entryConditionGroup } };
+      const signal: Signal = { time: candle.time, price: candle.close, type: "add", quantity, reason: { conditionGroup: config.addConditionGroup ?? config.entryConditionGroup, ...entryGate.evidence(symbol) } };
       existing.trade.adds.push(signal);
       signals.push({ symbol, ...signal });
     } else {
       const trade: Trade = { symbol, entryTime: candle.time, entryPrice: candle.close, quantity, fees: entryFee, slippageCost: entrySlip, taxCost: entryTax, adds: [] };
       activeTrades.set(symbolKey(symbol), { trade, entryIndex: index, entries: 1, impulse });
-      signals.push({ symbol, time: candle.time, price: candle.close, type: "entry", quantity, reason: { impulse, conditionGroup: config.entryConditionGroup } });
+      signals.push({ symbol, time: candle.time, price: candle.close, type: "entry", quantity, reason: { impulse, conditionGroup: config.entryConditionGroup, ...entryGate.evidence(symbol) } });
     }
   };
 
@@ -306,6 +309,7 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
       if (exit) close(state,candle,exit.price,exit.type,{priority:exit.type,stop,target,...(exit.type==='invalidation'?{invalidation:describeInvalidation(config.invalidationConditionGroup,history,active.impulse)}:{})});
     }
     for (const {state,candle,history,impulse} of contexts) {
+      if (!entryGate.allows(state.symbol,candle.time)) {state.entryWasMet=false;state.addWasMet=false;state.index++;processed++;continue;}
       const active = activeTrades.get(symbolKey(state.symbol));
       if (active) {
         const addNow = evaluateConditionGroup(config.addConditionGroup ?? config.entryConditionGroup,history,active.impulse);

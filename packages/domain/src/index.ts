@@ -16,8 +16,10 @@ export interface Candle {
 
 export interface SymbolRef { chain: string; ca: string; pairId: string }
 export interface CaRef { chain: string; ca: string }
+/** Earliest externally observed signal, in UTC epoch milliseconds. Applies to all pools of this CA. */
+export interface EntrySignal extends CaRef { signalTime: number }
 export interface PoolSnapshot extends SymbolRef { startTime: number | null; endTime: number | null; noData: boolean }
-export interface DatasetSelection { symbols?: SymbolRef[]; cas?: CaRef[]; interval: Interval; valueType: ValueType; startTime?: string; endTime?: string; filters?: Record<string, unknown> }
+export interface DatasetSelection { symbols?: SymbolRef[]; cas?: CaRef[]; interval: Interval; valueType: ValueType; startTime?: string; endTime?: string; filters?: Record<string, unknown>; entrySignals?: EntrySignal[] }
 export interface DatasetConfig {
   symbols: SymbolRef[];
   interval: Interval;
@@ -28,6 +30,24 @@ export interface DatasetConfig {
   selection?: DatasetSelection;
   trendInterval?: Interval;
   entryInterval?: Interval;
+  entrySignals?: EntrySignal[];
+}
+
+/** Fail closed: an enabled gate must cover exactly the selected chain/CA set. */
+export function normalizeEntrySignals(input: EntrySignal[] | undefined, refs: CaRef[]): EntrySignal[] | undefined {
+  if (input === undefined) return;
+  if (!Array.isArray(input) || !input.length || input.length > 10000) throw new Error('信号入场限制需要 1–10000 个有效信号');
+  const key = (r: CaRef) => JSON.stringify([r.chain.trim().toLowerCase(), r.ca.trim()]);
+  const expected = new Set(refs.map(key)), signals = new Map<string, EntrySignal>();
+  for (const r of input) {
+    if (!r || typeof r.chain !== 'string' || !r.chain.trim() || typeof r.ca !== 'string' || !r.ca.trim() || !Number.isSafeInteger(r.signalTime) || r.signalTime < 0 || r.signalTime > 8640000000000000) throw new Error('信号时间必须为合法毫秒时间戳，链和 CA 不能为空');
+    const k = key(r);
+    if (!expected.has(k)) throw new Error(`信号 CA 不在数据集中：${r.chain}/${r.ca}`);
+    const old = signals.get(k);
+    if (!old || r.signalTime < old.signalTime) signals.set(k, {chain:r.chain.trim().toLowerCase(), ca:r.ca.trim(), signalTime:r.signalTime});
+  }
+  if (signals.size !== expected.size) throw new Error('数据集存在缺少触发时间的 CA，禁止无信号买入');
+  return [...signals.values()].sort((a,b)=>key(a).localeCompare(key(b)));
 }
 
 export interface BaseCondition { enabled?: boolean }

@@ -2,9 +2,10 @@ import type { BacktestConfig, BacktestReport, Candle, Condition, ConditionGroup,
 import { evaluateCondition, stopPrice, targetPrice, type Impulse } from './index.js';
 import { validateProfitLock } from '@meme/domain';
 import { describeInvalidation } from './invalidation.js';
+import { createEntryGate } from './entry-gate.js';
 
-export const ENGINE_VERSION = 'portfolio-4';
-export const CHECKPOINT_VERSION = 3;
+export const ENGINE_VERSION = 'portfolio-5';
+export const CHECKPOINT_VERSION = 4;
 export const intervalMs = (interval: string) => ({'30s':30000,'1m':60000,'5m':300000,'15m':900000,'1h':3600000,'4h':14400000,'1d':86400000}[interval]!);
 export const poolKey = (s: SymbolRef) => `${s.chain}:${s.ca}:${s.pairId}`;
 export function validCandle(c: Candle) {
@@ -35,11 +36,14 @@ export class ResumableEngine {
   private readonly capacity:number;
   private readonly emaPeriods:number[];
   private readonly rollingPeriods:number[];
+  private readonly entryGate:ReturnType<typeof createEntryGate>;
   private batch:EngineBatch={trades:[],signals:[],equity:[]};
   constructor(readonly config:BacktestConfig, checkpoint?:EngineCheckpoint) {
     const invalidLock=validateProfitLock(config.exitConfig.profitLock);if(invalidLock)throw new Error(invalidLock);
-    const legacy=checkpoint?.version===2 && checkpoint.engineVersion==='portfolio-3' && !config.exitConfig.profitLock?.enabled;
-    if(checkpoint && !legacy && (checkpoint.version!==CHECKPOINT_VERSION || checkpoint.engineVersion!==ENGINE_VERSION)) throw new Error('检查点版本不兼容，禁止从头自动重跑');
+    this.entryGate=createEntryGate(config);
+    const legacy=checkpoint?.version===2 && checkpoint.engineVersion==='portfolio-3' && !config.exitConfig.profitLock?.enabled && !config.entrySignals;
+    const previous=checkpoint?.version===3 && checkpoint.engineVersion==='portfolio-4' && !config.entrySignals;
+    if(checkpoint && !legacy && !previous && (checkpoint.version!==CHECKPOINT_VERSION || checkpoint.engineVersion!==ENGINE_VERSION)) throw new Error('检查点版本不兼容，禁止从头自动重跑');
     const all=[...conditions(config.entryConditionGroup),...conditions(config.invalidationConditionGroup),...conditions(config.addConditionGroup ?? config.entryConditionGroup)];
     this.emaPeriods=[...new Set(all.filter(c=>c.type==='ema_reclaim').map(c=>Number(c.period)))];
     this.rollingPeriods=[...new Set(all.flatMap(c=>'period' in c && c.type!=='ema_reclaim'?[Number(c.period)]:[]))];
@@ -131,6 +135,7 @@ export class ResumableEngine {
     return group.mode==='all'?results.every(Boolean):group.mode==='any'?results.some(Boolean):results.filter(Boolean).length>=Math.max(1,group.minMatches ?? 1);
   }
   private enter(s:PoolState,c:Candle,impulse:Impulse) {
+    if(!this.entryGate.allows(s.symbol,c.time))return;
     const existing=s.active,cfg=this.config,cost=cfg.executionConfig,sizing=cfg.positionConfig.sizing;
     const stop=existing?stopPrice(cfg,existing):c.close*.9;
     const amount=sizing.type==='fixed_amount'?sizing.value:sizing.type==='fixed_percent'?this.s.cash*sizing.value/100:Math.min(this.s.cash,this.s.cash*sizing.value/100*c.close/Math.max(Number.EPSILON,c.close-stop));
@@ -139,8 +144,8 @@ export class ResumableEngine {
     this.s.cash-=value+fee+slip+tax;
     if(existing){const t=existing.trade;t.entryPrice=(t.entryPrice*t.quantity+value)/(t.quantity+quantity);t.quantity+=quantity;t.fees+=fee;t.slippageCost+=slip;t.taxCost+=tax;existing.entries++;
       t.buyAmount=(t.buyAmount ?? 0)+value;t.buyFees=(t.buyFees ?? 0)+fee;t.buySlippageCost=(t.buySlippageCost ?? 0)+slip;t.buyTaxCost=(t.buyTaxCost ?? 0)+tax;
-      const signal:Signal={time:c.time,price:c.close,type:'add',quantity,tradeNo:t.tradeNo,eventOrder:existing.entries,reason:{conditionGroup:cfg.addConditionGroup ?? cfg.entryConditionGroup}};t.adds.push(signal);this.batch.signals.push({symbol:s.symbol,...signal});
-    }else{const trade:Trade={symbol:s.symbol,entryTime:c.time,entryPrice:c.close,quantity,fees:fee,slippageCost:slip,taxCost:tax,adds:[],tradeNo:s.closed+1,firstEntryPrice:c.close,buyAmount:value,buyFees:fee,buySlippageCost:slip,buyTaxCost:tax};s.active={trade,entryIndex:s.index,entries:1,impulse};this.batch.signals.push({symbol:s.symbol,time:c.time,price:c.close,type:'entry',quantity,tradeNo:trade.tradeNo,eventOrder:1,reason:{impulse,conditionGroup:cfg.entryConditionGroup}});}
+      const signal:Signal={time:c.time,price:c.close,type:'add',quantity,tradeNo:t.tradeNo,eventOrder:existing.entries,reason:{conditionGroup:cfg.addConditionGroup ?? cfg.entryConditionGroup,...this.entryGate.evidence(s.symbol)}};t.adds.push(signal);this.batch.signals.push({symbol:s.symbol,...signal});
+    }else{const trade:Trade={symbol:s.symbol,entryTime:c.time,entryPrice:c.close,quantity,fees:fee,slippageCost:slip,taxCost:tax,adds:[],tradeNo:s.closed+1,firstEntryPrice:c.close,buyAmount:value,buyFees:fee,buySlippageCost:slip,buyTaxCost:tax};s.active={trade,entryIndex:s.index,entries:1,impulse};this.batch.signals.push({symbol:s.symbol,time:c.time,price:c.close,type:'entry',quantity,tradeNo:trade.tradeNo,eventOrder:1,reason:{impulse,conditionGroup:cfg.entryConditionGroup,...this.entryGate.evidence(s.symbol)}});}
   }
   private close(s:PoolState,c:Candle,price:number,type:Signal['type'],reason:Record<string,unknown>) {
     if(!s.active)return;const a=s.active,t=a.trade,cost=this.config.executionConfig,proceeds=t.quantity*price;
@@ -167,6 +172,8 @@ export class ResumableEngine {
     }
     let positions=this.s.states.filter(s=>s.active).length;
     for(const {s,candle:c,last} of contexts){
+      // Warm history must not consume cash, the first-entry allowance, or a signal edge.
+      if(!this.entryGate.allows(s.symbol,c.time)){s.entryWasMet=false;s.addWasMet=false;this.s.processed++;continue;}
       if(s.active){const add=this.group(this.config.addConditionGroup ?? this.config.entryConditionGroup,s,s.active.impulse);if(this.config.positionConfig.mode==='pyramiding' && s.active.entries<this.config.positionConfig.maxEntries && add && !s.addWasMet)this.enter(s,c,s.active.impulse);s.addWasMet=add;}
       else{const impulse=this.impulse(s),entry=!!impulse && this.group(this.config.entryConditionGroup,s,impulse);if(entry && !s.entryWasMet && (this.config.positionConfig.allowReentry || !s.traded) && positions<this.config.positionConfig.maxConcurrentPositions){this.enter(s,c,impulse!);if(s.active)positions++;}s.entryWasMet=entry;s.addWasMet=false;}
       if(last && this.config.exitConfig.closeAtEnd && s.active){this.close(s,c,c.close,'end_of_backtest',{closeAtEnd:true});positions--;}

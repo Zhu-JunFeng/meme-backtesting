@@ -1,6 +1,6 @@
 import {describe,it,expect} from 'vitest';
 import {validateProfitLock} from '@meme/domain';
-import {ResumableEngine} from '../src/index.js';
+import {ResumableEngine,CHECKPOINT_VERSION} from '../src/index.js';
 import {configuration} from './fixtures.js';
 function setup(){
  const config=configuration();config.symbols=[config.symbols[0]];config.positionConfig.mode='single_entry';config.positionConfig.maxEntries=1;
@@ -20,6 +20,6 @@ describe('close-confirmed profit locks',()=>{
  it('additions cannot lower an activated absolute floor',()=>{const e=setup();bar(e,30000,150,100,155);e.config.positionConfig.mode='pyramiding';e.config.positionConfig.maxEntries=3;e.config.addConditionGroup={mode:'all',conditions:[{type:'candle_pattern',patterns:['long_lower_wick']}]};const s=e.s.states[0];const before=s.active!.trade.quantity;
  bar(e,60000,132,121,133,130);expect(s.active!.trade.quantity).toBeGreaterThan(before);expect(s.active!.lockPrice).toBe(120);expect(s.active!.trade.buyAmount).toBeGreaterThan(100);
  });
- it('legacy checkpoints restore only without new strategy behavior',()=>{const e=setup(),cp=e.checkpoint();cp.version=2;cp.engineVersion='portfolio-3';expect(()=>new ResumableEngine(e.config,cp)).toThrow('不兼容');e.config.exitConfig.profitLock=undefined;expect(new ResumableEngine(e.config,cp).s.version).toBe(3);});
+ it('legacy checkpoints restore only without new strategy behavior',()=>{const e=setup(),cp=e.checkpoint();cp.version=2;cp.engineVersion='portfolio-3';expect(()=>new ResumableEngine(e.config,cp)).toThrow('不兼容');e.config.exitConfig.profitLock=undefined;expect(new ResumableEngine(e.config,cp).s.version).toBe(CHECKPOINT_VERSION);});
  it('migration of a genuine old open holding preserves cash and final result',()=>{const e=setup();e.config.exitConfig.profitLock=undefined;bar(e,30000,110);e.drain();const cp=e.checkpoint();cp.version=2;cp.engineVersion='portfolio-3';const t=cp.states[0].active!.trade;for(const k of ['tradeNo','firstEntryPrice','buyAmount','buyFees','buySlippageCost','buyTaxCost'])delete (t as any)[k];const restored=new ResumableEngine(e.config,cp);bar(e,60000,80);bar(restored,60000,80);expect(restored.finish()).toEqual(e.finish());expect(restored.s.cash).toBe(e.s.cash);});
 });

@@ -52,7 +52,7 @@ export async function tradeFib(pool:Pool,run:any,q:Record<string,string>,tradeId
  }else{
   if(!run.input_ready)return unavailable('历史 Fib 锚点无法完整还原：没有冻结行情',base);
   const versions=await pool.query(`SELECT report_json->>'engineVersion' AS version FROM backtest_reports WHERE run_id=$1 UNION ALL SELECT state_json->'engine'->>'engineVersion' FROM backtest_checkpoints WHERE run_id=$1`,[run.id]);
-  if(!versions.rows.some(r=>['portfolio-3','portfolio-4'].includes(r.version)))return unavailable('历史 Fib 锚点无法完整还原：引擎版本不支持',base);
+  if(!versions.rows.some(r=>['portfolio-3','portfolio-4','portfolio-5'].includes(r.version)))return unavailable('历史 Fib 锚点无法完整还原：引擎版本不支持',base);
   const mapper=new FibIndexMapper([i.lowIndex,i.highIndex,i.confirmedAtIndex],intervalMs(run.config_json.interval));let after=-1;
   for(;;){const rows=(await pool.query('SELECT chunk_no,candles_json FROM backtest_input_chunks WHERE run_id=$1 AND pool_key=$2 AND chunk_no>$3 ORDER BY chunk_no LIMIT 16',[inputOwner(run),`${q.chain}:${q.ca}:${q.pairId}`,after])).rows;if(!rows.length)break;
    for(const row of rows){if(row.chunk_no!==after+1)return unavailable('冻结行情分块缺失',base);after=row.chunk_no;for(const c of row.candles_json){try{mapper.accept(c);}catch{return unavailable('冻结行情顺序异常，无法还原锚点',base);}if(mapper.index>=i.confirmedAtIndex)break;}if(mapper.index>=i.confirmedAtIndex)break;}if(mapper.index>=i.confirmedAtIndex)break;
