@@ -41,6 +41,10 @@ jobs:
       - run: pnpm test:research
       - run: python3 scripts/test_signal_entry_manifest.py
       - run: python3 scripts/test_token_signal_manifest.py
+      - run: python3 .agents/skills/meme-kline-import/scripts/test_import_meme_klines.py
+      - run: python3 .agents/skills/meme-kline-import/scripts/test_signal_import.py
+        env:
+          IMPORT_TEST_DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
       - run: pnpm --filter @meme/runtime build
       - run: pnpm test
       - run: pnpm --filter @meme/api build

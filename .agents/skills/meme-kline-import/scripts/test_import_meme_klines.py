@@ -186,6 +186,8 @@ class DatabaseTests(unittest.TestCase):
         projects = [importer.Project("sol", "CA", "PAIR", 1700000000000)]
         with patch.dict(os.environ, {"DATABASE_URL": "postgresql://example/db"}), \
              patch.object(importer, "read_tokens", return_value=tokens), \
+             patch.object(importer, "read_signals", return_value=[{"chain":"sol", "ca":"CA"}]), \
+             patch.object(importer, "preflight_signals"), \
              patch.object(importer, "lookup_projects", return_value=(projects, [])), \
              patch.object(importer, "preflight_database"), \
              patch.object(importer, "fetch_project") as fetch, \
