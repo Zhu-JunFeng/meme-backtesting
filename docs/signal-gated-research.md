@@ -20,3 +20,18 @@
 这是已被反复查看的历史样本，不是新的盲测。全历史排名、少量交易、单个大赚 CA 都不能证明稳定盈利。应同时查看交易数、回撤、盈利集中度、正常退出/末根平仓分项；`withoutBestCaNormalReturn` 只是扣除最大正常平仓盈利 CA 的归因诊断，不是重新撮合后的账户回报。后续要使用真正新增的信号和行情检验。
 
 输出目录保存协议、数据校验值、基线、逐个训练结果、冻结候选名单和验证结果；这些数据不提交 Git。候选编号只在本轮协议内有效，不等同于此前服务器的 E 编号。
+
+## 使用数据库信号预检的新一轮探索
+
+可传第四个参数指定新的输入协议：
+
+```sh
+node scripts/signal-gated-research.mjs sol output/new-search/sol 192 output/new-search/sol-input.json
+node scripts/stress-signal-candidates.mjs output/new-search/sol
+```
+
+协议格式为 `{chain, seed, dataset, bases:[{id,config}]}`；`dataset` 必须来自线上带策略版本的 `/market/dataset-preview`，包含服务器解析的 `entrySignals`、池范围及开启的 `signalSelection`。准备协议时只能读 API；搜索仍只读本地库。本地每池起止覆盖必须与预检一致，否则中止。完整本地 OHLCV 校验值写入协议；覆盖相同不代表中间数据绝对未变化，候选必须再在服务器复测核对收益和成交数。
+
+新一轮候选强制 `entryAfterSignal=true`，保留原成本，按相同的 70%/30% 发现时间分组冻结前十后验证。更改随机种子或使用此前优选作基础依然是历史探索，不是未见样本的盲测。训练期不盈利时仍保留前十用于诊断，不能因此宣称找到盈利策略。
+
+压力脚本只对训练、验证、全历史均正收益的前三名，将**买卖滑点各增加 1 个百分点**，重跑全历史和验证组。结果单独保存，不覆盖原实验，也不反过来调整已冻结的候选名单。服务器提交须另外明确执行，研究脚本不会自动创建任务。
