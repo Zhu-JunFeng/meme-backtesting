@@ -5,11 +5,14 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {gzipSync} from 'node:zlib';
 import {splitSmallSets} from './small-set-research.mjs';
-import {judge,eligibleForBoth} from './tri-chain-stability.mjs';
+import {judge,eligibleForBoth,RESEARCH_COSTS} from './tri-chain-stability.mjs';
 import {replayCandidates} from './cohort-server-verify.mjs';
 import {dataHash,reuseSnapshot} from './cohort-snapshot-reuse.mjs';
 import {fileHash,hash} from './cohort-snapshot.mjs';
 const day=86400000;
+test('all new chain validations use the same per-side fees, slippage and taxes',()=>{
+ assert.deepEqual(RESEARCH_COSTS,{feePercent:1,slippagePercent:1,buyTaxPercent:1,sellTaxPercent:1});
+});
 test('six groups plus reserve are deterministic, day balanced and CA disjoint',()=>{
  const signals=Array.from({length:420},(_,i)=>({chain:'bsc',ca:`c${i}`,signalTime:Date.UTC(2026,8,5)+i%14*day}));
  const a=splitSmallSets(signals,20260924,25,6,10),b=splitSmallSets([...signals].reverse(),20260924,25,6,10);

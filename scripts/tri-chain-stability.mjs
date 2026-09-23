@@ -11,6 +11,8 @@ import {splitSmallSets} from './small-set-research.mjs';
 
 const read=async p=>JSON.parse(await readFile(p,'utf8'));
 const caKey=s=>JSON.stringify([s.chain,s.ca]);
+/** Fixed assumptions for all new three-chain searches and validation replays. Percent per side. */
+export const RESEARCH_COSTS=Object.freeze({feePercent:1,slippagePercent:1,buyTaxPercent:1,sellTaxPercent:1});
 const positive=r=>Number.isFinite(r.accountReturn)&&r.accountReturn>0&&r.totalTrades>=10&&Number.isFinite(r.accountMaxDrawdown)&&r.accountMaxDrawdown<=10;
 export function judge(groups,reserve,large,full,stressLarge,withoutBest){
  const values=groups.map(r=>r.accountReturn),mid=median(values);
@@ -56,7 +58,7 @@ export async function studyChain(snapshot,prior,output,chain,{seed=20260924,coun
  const eligible=eligibleForBoth(signals,byInterval);
  const partition=splitSmallSets(eligible,seed,chain==='bsc'?25:50,6,10);
  const included=new Set(eligible.map(caKey)),excluded=signals.filter(s=>!included.has(caKey(s)));
- const costs=structuredClone(old.costs),bases=candidateBases(old,oldReport,chain);
+ const costs={...structuredClone(old.costs),...RESEARCH_COSTS},bases=candidateBases(old,oldReport,chain);
  const candidates=prepareCandidates(bases,countPerInterval,seed,costs);
  for(const c of candidates)assert(c.config.entryAfterSignal===true&&c.config.exitConfig.closeAtEnd===true);
  const protocol={version:1,kind:'tri-chain-stability-v1',chain,snapshotHash:checksum,engineVersion:ENGINE_VERSION,seed,costs,partition,
