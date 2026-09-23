@@ -18,13 +18,26 @@ export function compareResult(expected,report,trades,signals){
  for(const [a,b] of [['accountReturn','returnPercent'],['accountMaxDrawdown','maxDrawdownPercent'],['netPnl','netPnl']])assert(Math.abs(expected[a]-report[b])<=1e-7,`${a} differs`);
  assert.equal(expected.totalTrades,report.totalTrades);assert.equal(ledgerHash(trades),expected.audit.tradeHash,'trade events differ');assert.equal(ledgerHash(signals),expected.audit.signalHash,'signal events differ');
 }
-export async function serverVerify({snapshot,study,output,api,connectionString,submit=false,queueScope='meme-production-v3'}){
+export function replayCandidates(report,protocol,exploratoryIds=[]){
+ if(exploratoryIds.length){
+  assert(exploratoryIds.length<=3);assert.equal(new Set(exploratoryIds).size,exploratoryIds.length);
+  return exploratoryIds.map(id=>{
+   const result=report.results.find(r=>r.id===id),original=protocol.candidates.find(c=>c.id===id);
+   assert(result&&original,'Unknown exploratory candidate');assert.deepEqual(result.config,original.config);
+   assert(result.full&&result.large,'Small-set results required');
+   return {...result,interval:original.interval,replays:[{folds:[1,2,3,4,5,6],expected:result.full,label:'全量'},{folds:[2,3,4,5,6],expected:result.large,label:'独立大集合'}]};
+  });
+ }
+ const candidates=report.uploadCandidates.map(id=>report.results.find(r=>r.id===id));assert(candidates.length<=3);
+ for(const c of candidates){assert(c?.pass&&!c.costSensitive&&c.stress?.assessment.pass);assert(stability([...c.development.slice(1),...c.validation],c.combined).pass);}
+ return candidates.map(c=>({...c,replays:[[1],[2],[3],[4],[5],[1,2,3,4,5]].map(folds=>({folds,expected:c.combinations.find(r=>JSON.stringify(r.foldIds)===JSON.stringify(folds)),label:`D${folds.join('+')}`}))}));
+}
+export async function serverVerify({snapshot,study,output,api,connectionString,submit=false,queueScope='meme-production-v3',exploratoryIds=[]}){
  const read=async p=>JSON.parse(await readFile(p,'utf8'));
  const report=await read(resolve(study,'report.json')),protocol=await read(resolve(study,'protocol.json')),manifest=await read(resolve(snapshot,'manifest.json'));
  assert.equal(report.protocolHash,hash(protocol));assert.equal(report.snapshotHash,manifest.checksum);assert.equal(manifest.engineVersion,ENGINE_VERSION);
  assert.equal(await fileHash(resolve(snapshot,'metadata.json')),manifest.metadataHash);const metadata=await read(resolve(snapshot,'metadata.json'));
- const candidates=report.uploadCandidates.map(id=>report.results.find(r=>r.id===id));assert(candidates.length<=3);
- for(const c of candidates){assert(c?.pass&&!c.costSensitive&&c.stress?.assessment.pass);assert(stability([...c.development.slice(1),...c.validation],c.combined).pass);}
+ const candidates=replayCandidates(report,protocol,exploratoryIds);
  if(!candidates.length)return {chain:report.chain,submitted:[],reason:'No qualifying strategies; no server writes'};
  if(!submit)return {chain:report.chain,candidates:candidates.map(c=>c.id),submit:false};
  assert(connectionString&&api);await mkdir(output,{recursive:true});
@@ -33,20 +46,20 @@ export async function serverVerify({snapshot,study,output,api,connectionString,s
  const verified=[];await db.connect();
  const stagingScope=`${queueScope}-research-staging-${report.protocolHash.slice(0,8)}`;
  try{for(const candidate of candidates){
-  const name=`日期分组稳健 · ${report.chain.toUpperCase()} · ${candidate.id} · ${report.snapshotHash.slice(0,8)}`;
+  const name=`${exploratoryIds.length?'小集合探索（未达稳定标准）':'日期分组稳健'} · ${report.chain.toUpperCase()} · ${candidate.id} · ${report.protocolHash.slice(0,8)}`;
   const matches=(await request('/strategy-templates')).filter(t=>t.name===name);assert(matches.length<=1);
   const template=matches.length?await request(`/strategy-templates/${matches[0].id}`):await request('/strategy-templates',{name,description:report.scope,status:'active',strategyJson:candidate.config});
   assert.deepEqual(template.strategyJson,candidate.config,'Existing template differs');
   const version=await request(`/strategy-versions/${template.currentVersionId}`);
   const {inputs}=await loadInputs(snapshot,manifest,report.chain,candidate.interval),signals=earliestSignals(metadata.token_info.filter(t=>t.chain===report.chain));
-  for(const folds of [[1],[2],[3],[4],[5],[1,2,3,4,5]]){
-   const expected=candidate.combinations.find(r=>JSON.stringify(r.foldIds)===JSON.stringify(folds));assert(expected);
+  for(const {folds,expected,label} of candidate.replays){
+   assert(expected);
    const refs=new Set(protocol.partition.entries.filter(e=>folds.includes(e.fold)).map(key));
    const selected=inputs.filter(p=>refs.has(key(p.symbol))&&p.candles.length);
    const symbols=selected.map(p=>p.symbol),step=candidate.interval==='30s'?30000:60000;
    const from=Math.min(...selected.map(p=>p.candles[0].time)),to=Math.max(...selected.map(p=>p.candles.at(-1).time));
    const pools=selected.map(p=>({...p.symbol,startTime:p.candles[0].time,endTime:p.candles.at(-1).time,noData:false}));
-   const runName=`${name} · D${folds.join('+')}`;
+   const runName=`${name} · ${label}`;
    const id=deterministicId({study:report.protocolHash,candidate:candidate.id,folds});
    const dataset={symbols,pools,interval:candidate.interval,valueType:'mcap',startTime:new Date(from).toISOString(),endTime:new Date(to).toISOString(),
     externalSignals:metadata.token_signal_events.filter(s=>refs.has(key(s))).map(s=>({chain:s.chain,ca:s.ca,id:s.id,detailId:s.detail_id,signalSource:s.signal_source,signalTime:Number(s.signal_time),sourceSignal:s.source_signal,provenance:s.provenance,basis:'snapshot'})),
@@ -91,4 +104,4 @@ export async function serverVerify({snapshot,study,output,api,connectionString,s
  }}finally{await db.end();}
  return verified;
 }
-if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.url){const [snapshot,study,output,api,...flags]=process.argv.slice(2);console.log(await serverVerify({snapshot,study,output,api,connectionString:process.env.DATABASE_URL,submit:flags.includes('--submit')}));}
+if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.url){const [snapshot,study,output,api,...flags]=process.argv.slice(2);const exploratory=flags.find(f=>f.startsWith('--exploratory='));console.log(await serverVerify({snapshot,study,output,api,connectionString:process.env.DATABASE_URL,submit:flags.includes('--submit'),exploratoryIds:exploratory?exploratory.slice('--exploratory='.length).split(','):[]}));}
