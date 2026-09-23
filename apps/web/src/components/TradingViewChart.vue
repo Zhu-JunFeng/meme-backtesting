@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { beijingTime, DISPLAY_TIME_ZONE } from "../time";
+import { chartTimeFormatters } from "../chartTime";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { eventLabels as labels, marketValue, changePercent, formatNumber, preciseValue, signedValue, valueTone, exitLabel, invalidationEvidence } from '../format';
 import FibAudit from './FibAudit.vue';
@@ -162,7 +163,7 @@ async function mountChart(){
  if(fib.value?.status==='available' && [fib.value.low,fib.value.high,fib.value.confirmed].some(p=>p.synthetic || !loadedTimes.has(p.time)))error.value='部分 Fib 锚点对应补齐或缺失 K 线，未在相邻真实 K 线上冒画锚点；准确时间和值见 Fib 核验明细。';
  const localWidget=new tv.widget({container:container.value,library_path:"/charting_library/",symbol,interval:resolutions[props.interval],timezone:DISPLAY_TIME_ZONE,theme:"Light",autosize:true,
  enabled_features:['two_character_bar_marks_labels',...(window.matchMedia('(max-width:680px)').matches?['hide_left_toolbar_by_default']:[])],
- custom_formatters:{priceFormatterFactory:()=>({format:(value:number)=>displayValue(value)}),studyFormatterFactory:(format:any)=>format.type==='volume'?{format:(value:number)=>formatNumber(value)}:null},
+ custom_formatters:{...chartTimeFormatters,priceFormatterFactory:()=>({format:(value:number)=>displayValue(value)}),studyFormatterFactory:(format:any)=>format.type==='volume'?{format:(value:number)=>formatNumber(value)}:null},
  disabled_features:["timezone_menu","header_symbol_search","header_resolutions","header_compare","timeframes_toolbar","use_localstorage_for_settings","legend_inplace_edit","symbol_search_hot_key","show_interval_dialog_on_key_press"],
  datafeed:{
   onReady:(cb:any)=>setTimeout(()=>cb({supported_resolutions:[resolutions[props.interval]],supports_time:false,supports_marks:true}),0),
