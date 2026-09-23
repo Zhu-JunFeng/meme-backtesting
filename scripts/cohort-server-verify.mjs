@@ -19,6 +19,16 @@ export function compareResult(expected,report,trades,signals){
  assert.equal(expected.totalTrades,report.totalTrades);assert.equal(ledgerHash(trades),expected.audit.tradeHash,'trade events differ');assert.equal(ledgerHash(signals),expected.audit.signalHash,'signal events differ');
 }
 export function replayCandidates(report,protocol,exploratoryIds=[]){
+ if(report.kind==='tri-chain-exploratory-cost-v1'){
+  assert.equal(protocol.kind,report.kind);assert.equal(exploratoryIds.length,0);
+  assert.equal(report.uploadCandidates.length,1,'Only one explicitly selected exploratory candidate may be submitted');
+  const id=report.uploadCandidates[0],result=report.results.find(r=>r.id===id),original=protocol.candidates.find(c=>c.id===id);
+  assert(result&&original&&result.pass===false&&result.sourceAssessment?.pass===false,'Exploratory status must be explicit');
+  assert.deepEqual(result.config,original.config);assert.equal(result.config.entryAfterSignal,true);
+  for(const field of ['feePercent','slippagePercent','buyTaxPercent','sellTaxPercent'])assert.equal(result.config.executionConfig[field],1);
+  assert(result.full?.audit?.tradeHash&&result.full.audit.signalHash);
+  return [{...result,interval:original.interval,replays:[{folds:[1,2,3,4,5,6,7],expected:result.full,label:'全量（探索未达标）'}]}];
+ }
  if(report.kind==='tri-chain-stability-v1'){
   assert.equal(protocol.kind,report.kind);assert.equal(exploratoryIds.length,0,'达标研究不接受探索候选旁路');
   const ids=report.uploadCandidates??[];assert(ids.length<=3);
@@ -62,7 +72,7 @@ export async function serverVerify({snapshot,study,output,api,connectionString,s
  const verified=[];await db.connect();
  const stagingScope=`${queueScope}-research-staging-${report.protocolHash.slice(0,8)}`;
  try{for(const candidate of candidates){
-  const name=`${report.kind==='tri-chain-stability-v1'?'本批历史跨集合达标':exploratoryIds.length?'小集合探索（未达稳定标准）':'日期分组稳健'} · ${report.chain.toUpperCase()} · ${candidate.id} · ${report.protocolHash.slice(0,8)}`;
+  const name=`${report.kind==='tri-chain-exploratory-cost-v1'?'探索复验（未达稳定标准）':report.kind==='tri-chain-stability-v1'?'本批历史跨集合达标':exploratoryIds.length?'小集合探索（未达稳定标准）':'日期分组稳健'} · ${report.chain.toUpperCase()} · ${candidate.id} · ${report.protocolHash.slice(0,8)}`;
   const matches=(await request('/strategy-templates')).filter(t=>t.name===name);assert(matches.length<=1);
   const template=matches.length?await request(`/strategy-templates/${matches[0].id}`):await request('/strategy-templates',{name,description:report.scope,status:'active',strategyJson:candidate.config});
   assert.deepEqual(template.strategyJson,candidate.config,'Existing template differs');

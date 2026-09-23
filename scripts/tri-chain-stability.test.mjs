@@ -40,6 +40,15 @@ test('server replay only accepts passing candidates and covers all acceptance co
  const replays=replayCandidates(report,protocol)[0].replays;assert.deepEqual(replays.map(x=>x.folds),[[1],[2],[3],[4],[5],[6],[7],[4,5,6,7],[1,2,3,4,5,6,7]]);
  assert.throws(()=>replayCandidates({...report,results:[{...result,pass:false}]},protocol));
 });
+test('explicit exploratory replay cannot be mislabeled stable or silently lower its costs',()=>{
+ const config={entryAfterSignal:true,executionConfig:{feePercent:1,slippagePercent:1,buyTaxPercent:1,sellTaxPercent:1}};
+ const full={audit:{tradeHash:'trade',signalHash:'signals'}};
+ const protocol={kind:'tri-chain-exploratory-cost-v1',candidates:[{id:'30s-E0119',interval:'30s',config}]};
+ const report={kind:protocol.kind,uploadCandidates:['30s-E0119'],results:[{id:'30s-E0119',config,pass:false,sourceAssessment:{pass:false},full}]};
+ assert.deepEqual(replayCandidates(report,protocol)[0].replays.map(x=>x.folds),[[1,2,3,4,5,6,7]]);
+ assert.throws(()=>replayCandidates({...report,results:[{...report.results[0],pass:true}]},protocol));
+ assert.throws(()=>replayCandidates(report,{...protocol,candidates:[{...protocol.candidates[0],config:{...config,executionConfig:{...config.executionConfig,buyTaxPercent:0}}}]}));
+});
 test('fresh snapshot may reuse only verified identical row content',async t=>{
  const root=await mkdtemp(join(tmpdir(),'meme-snapshot-reuse-'));t.after(async()=>{const {rm}=await import('node:fs/promises');await rm(root,{recursive:true,force:true});});
  const oldDir=join(root,'old'),newDir=join(root,'verified');await mkdir(oldDir);
