@@ -85,3 +85,16 @@ test('read-only snapshot to local search, frozen protocol and no held-out access
   await assert.rejects(()=>research({...opts,seed:1}),/protocol differs/);
  }finally{await rm(dir,{recursive:true,force:true});}
 });
+test('all-K-line export discovers database dimensions, includes time bounds and skips historical run payloads',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'meme-all-bars-'));let fetched=false;const calls=[];
+ const client={connect:async()=>{},end:async()=>{},query:async(sql)=>{calls.push(sql);let rows=[];
+  if(sql.includes('txid_current_snapshot'))rows=[{snapshot:'frozen'}];
+  else if(sql.includes('SELECT DISTINCT chain,interval,type'))rows=[{chain:'bsc',interval:'30s',type:'mcap'}];
+  else if(sql.startsWith('DECLARE'))fetched=false;
+  else if(sql.startsWith('FETCH')&&!fetched){fetched=true;rows=[{ca:'x',pair_id:'p',open_time:200000,close_time:230000,open:2,high:2,low:2,close:2,volume:10,valid:true}];}
+  return {rows,rowCount:rows.length};}};
+ try{const m=await snapshot({output:join(dir,'frozen'),client,allKlines:true});
+  assert.equal(m.files.length,1);assert.equal(m.files[0].rows,1);assert.equal(m.files[0].firstTime,200000);assert.equal(m.files[0].lastTime,200000);
+  assert(!calls.some(s=>s.includes('FROM backtest_runs')));assert(calls.includes('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY'));
+ }finally{await rm(dir,{recursive:true,force:true});}
+});

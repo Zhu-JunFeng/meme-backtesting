@@ -39,7 +39,7 @@ export function generateStrategyDescription(s: StrategyConfig, notes=''): Versio
   const target=e.takeProfit.type==='percent'?`当前加权平均买入值上方 ${e.takeProfit.value}%`:e.takeProfit.type==='risk_reward'?`当前均价 + max(0, 当前均价−基础止损值) × ${e.takeProfit.ratio}`:e.takeProfit.type==='previous_high'?'首次入场锁定的 Swing High':`首次入场锁定的 Fib ${e.takeProfit.ratio}`;
   const sizing=p.sizing.type==='fixed_amount'?`每次固定金额 ${p.sizing.value}`:p.sizing.type==='fixed_percent'?`每次使用当时剩余现金的 ${p.sizing.value}%（不是总权益比例）`:`每次按剩余现金的 ${p.sizing.value}% 估算风险金额。现有引擎首次入场使用收盘下方 10% 的估算距离，而非配置止损；加仓使用原持仓基础止损估算。计算金额不超过现金`;
   const parts=[
-    `监控与回放\n${s.entryAfterSignal!==false?'仅在信号触发后买入：首次买入及加仓所在 K 线的开盘时间必须严格晚于该 CA 最早有效外部信号。等于信号时间、信号落在本根内部均不允许本根买入；缺失信号的 CA 全池排除，信号晚于行情末尾则没有买入机会。':'不限制信号前买入；外部信号仅用于展示。'}信号前已经存在的行情可用于指标预热。单周期按时间推进，仅使用当时已完成的数据；周期、链、CA 和时间范围由任务选择，不属于本版本。`,
+    `监控与回放\n${s.entryAfterSignal!==false?`仅在信号触发后买入：首次买入及加仓所在 K 线的开盘时间必须严格晚于该 CA 最早有效外部信号${s.minimumSignalAgeMinutes ? `加 ${s.minimumSignalAgeMinutes} 分钟` : ''}。等于边界时间、信号落在本根内部均不允许本根买入；缺失信号的 CA 全池排除，信号晚于行情末尾则没有买入机会。`:'不限制信号前买入；外部信号仅用于展示。'}信号前已经存在的行情可用于指标预热。单周期按时间推进，仅使用当时已完成的数据；周期、链、CA 和时间范围由任务选择，不属于本版本。`,
     `拉升识别\n${i.enabled===false?'[已禁用，无法产生首次入场] ':''}Fractal Pivot 左侧 ${i.leftBars} 根、右侧 ${i.rightBars} 根确认；回看 ${i.lookbackBars} 根。先从最近已确认高点向前寻找，再从最近的先行低点向前匹配；低点须早于高点，跨度≤${i.maxDurationBars} 根，涨幅≥${i.minGainPercent}%。右侧 K 线完成后才能确认高点。${i.requireVolumeExpansion?`拉升段均量≥低点之前最多 ${Math.max(5,i.leftBars*2)} 根均量的 ${i.volumeExpansionRatio ?? 1.5} 倍，缺少基准量不通过。`:'不要求拉升放量。'}Fib 值=High−(High−Low)×比例；0 为高点，1 为低点。`,
     `首次入场\n${groupText(s.entryConditionGroup)}\n需要有效拉升；条件由不满足变为满足时尝试买入，持续满足不会逐根重复触发。持仓后锁定首次入场的拉升依据，不按后续新高低点替换。`,
     `失效判断\n${groupText(s.invalidationConditionGroup)}\n持仓时按上述组关系判断，不能将每个子条件都描述为独立退出原因。失效退出按本根收盘值成交，可能盈利也可能亏损。`,

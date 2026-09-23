@@ -118,6 +118,8 @@ export interface StrategyConfig {
   schemaVersion: 1;
   /** New tasks default true; never apply defaults inside historical engine restoration. */
   entryAfterSignal?: boolean;
+  /** Optional minimum elapsed minutes after the earliest external signal. Entry bar open must be strictly later. */
+  minimumSignalAgeMinutes?: number;
   impulseCondition: ImpulseConfig;
   entryConditionGroup: ConditionGroup;
   invalidationConditionGroup: ConditionGroup;

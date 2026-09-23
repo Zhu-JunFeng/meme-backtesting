@@ -19,6 +19,22 @@ export function compareResult(expected,report,trades,signals){
  assert.equal(expected.totalTrades,report.totalTrades);assert.equal(ledgerHash(trades),expected.audit.tradeHash,'trade events differ');assert.equal(ledgerHash(signals),expected.audit.signalHash,'signal events differ');
 }
 export function replayCandidates(report,protocol,exploratoryIds=[]){
+ if(report.kind==='tri-chain-stability-v1'){
+  assert.equal(protocol.kind,report.kind);assert.equal(exploratoryIds.length,0,'达标研究不接受探索候选旁路');
+  const ids=report.uploadCandidates??[];assert(ids.length<=3);
+  return ids.map(id=>{
+   const result=report.results.find(r=>r.id===id),original=protocol.candidates.find(c=>c.id===id);
+   assert(result?.pass&&result.assessment?.pass&&original,'仅允许提交完整达标候选');
+   assert.deepEqual(result.config,original.config);
+   const replays=[...[1,2,3].map((fold,i)=>({folds:[fold],expected:result.development[i],label:`D${fold}`})),
+    ...[4,5,6].map((fold,i)=>({folds:[fold],expected:result.validation[i],label:`V${fold-3}`})),
+    {folds:[7],expected:result.reserve,label:'剩余项目'},
+    {folds:[4,5,6,7],expected:result.large,label:'独立大集合'},
+    {folds:[1,2,3,4,5,6,7],expected:result.full,label:'全量'}];
+   assert(replays.every(x=>x.expected?.audit?.tradeHash&&x.expected.audit.signalHash));
+   return {...result,interval:original.interval,replays};
+  });
+ }
  if(exploratoryIds.length){
   assert(exploratoryIds.length<=3);assert.equal(new Set(exploratoryIds).size,exploratoryIds.length);
   return exploratoryIds.map(id=>{
@@ -46,7 +62,7 @@ export async function serverVerify({snapshot,study,output,api,connectionString,s
  const verified=[];await db.connect();
  const stagingScope=`${queueScope}-research-staging-${report.protocolHash.slice(0,8)}`;
  try{for(const candidate of candidates){
-  const name=`${exploratoryIds.length?'小集合探索（未达稳定标准）':'日期分组稳健'} · ${report.chain.toUpperCase()} · ${candidate.id} · ${report.protocolHash.slice(0,8)}`;
+  const name=`${report.kind==='tri-chain-stability-v1'?'本批历史跨集合达标':exploratoryIds.length?'小集合探索（未达稳定标准）':'日期分组稳健'} · ${report.chain.toUpperCase()} · ${candidate.id} · ${report.protocolHash.slice(0,8)}`;
   const matches=(await request('/strategy-templates')).filter(t=>t.name===name);assert(matches.length<=1);
   const template=matches.length?await request(`/strategy-templates/${matches[0].id}`):await request('/strategy-templates',{name,description:report.scope,status:'active',strategyJson:candidate.config});
   assert.deepEqual(template.strategyJson,candidate.config,'Existing template differs');

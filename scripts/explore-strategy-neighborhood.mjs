@@ -10,7 +10,7 @@ import {validCandle,poolKey,ENGINE_VERSION} from '../packages/engine/dist/index.
 import {validateProfitLock} from '../packages/domain/dist/index.js';
 
 const clone=structuredClone;
-const strategyKeys=['schemaVersion','impulseCondition','entryConditionGroup','invalidationConditionGroup','addConditionGroup','exitConfig','positionConfig','executionConfig'];
+const strategyKeys=['schemaVersion','minimumSignalAgeMinutes','impulseCondition','entryConditionGroup','invalidationConditionGroup','addConditionGroup','exitConfig','positionConfig','executionConfig'];
 const strategy=c=>Object.fromEntries(strategyKeys.filter(k=>k in c).map(k=>[k,clone(c[k])]));
 export function candidatesAround(bases,count=256,seed=20260922){
  assert(Number.isInteger(count)&&count>=bases.length&&count<=5000);assert(bases.length);

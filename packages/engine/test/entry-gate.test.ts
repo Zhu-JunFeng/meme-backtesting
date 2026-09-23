@@ -26,6 +26,17 @@ describe('externally observed signal entry gate',()=>{
   c.entrySignals=[{chain:'sol',ca:'a',signalTime:30001},{chain:'robin',ca:'a',signalTime:60000}];const g=createEntryGate(c);
   expect(g.allows(c.symbols[0],30000)).toBe(false);expect(g.allows(c.symbols[1],60000)).toBe(true);expect(g.allows(c.symbols[2],60000)).toBe(false);expect(g.allows(c.symbols[2],90000)).toBe(true);
  });
+ it('applies the waiting boundary to both entry and add, without changing old configurations',()=>{
+  const c=configuration();c.entrySignals=c.symbols.map(s=>({...s,signalTime:30001}));
+  const prior=createEntryGate(c);expect(prior.allows(c.symbols[0],60000)).toBe(true);
+  c.minimumSignalAgeMinutes=30;const gate=createEntryGate(c);
+  expect(gate.allows(c.symbols[0],1800000)).toBe(false);
+  expect(gate.allows(c.symbols[0],1830000)).toBe(false);
+  expect(gate.allows(c.symbols[0],1860000)).toBe(true);
+  const r=execute(c,true);for(const s of r.signals.filter(s=>s.type==='entry'||s.type==='add'))expect(s.time).toBeGreaterThan(30001+1800000);
+  expect(()=>createEntryGate({...c,entrySignals:undefined})).toThrow('信号');
+  expect(()=>createEntryGate({...c,minimumSignalAgeMinutes:-1})).toThrow('0–1440');
+ });
  it('warms indicators without spending cash or consuming the single entry, then enters after discovery',()=>{
   const c=configuration();c.positionConfig.allowReentry=false;c.entrySignals=c.symbols.map(s=>({...s,signalTime:1200000}));
   const r=execute(c,true);expect(r.trades.length).toBeGreaterThan(0);

@@ -9,21 +9,22 @@ import {hash,fileHash,saveJson} from './cohort-snapshot.mjs';
 import {earliestSignals,dateNumber,loadInputs,prepareCandidates,evaluateCohort,median} from './cohort-research.mjs';
 
 const key=s=>JSON.stringify([s.chain,s.ca]);
-export function splitSmallSets(signals,seed=20260923,limit=50){
- const unique=earliestSignals(signals),size=Math.min(limit,Math.floor(unique.length/5));
- assert(size>=10,'Fewer than 50 eligible CAs: insufficient independent small sets');
+export function splitSmallSets(signals,seed=20260923,limit=50,groupCount=5,minReserve=0){
+ assert(Number.isInteger(groupCount)&&groupCount>=2);
+ const unique=earliestSignals(signals),size=Math.min(limit,Math.floor((unique.length-minReserve)/groupCount));
+ assert(size>=10,'insufficient eligible CAs for independent small sets');
  const days=new Map();for(const s of unique){const d=dateNumber(s.signalTime);if(!days.has(d))days.set(d,[]);days.get(d).push(s);}
  // Proportional per-day quotas, decided without prices, returns or strategy results.
- const groups=Array.from({length:5},()=>[]),reserve=[];
+ const groups=Array.from({length:groupCount},()=>[]),reserve=[];
  for(const [day,rows] of [...days].sort((a,b)=>a[0]-b[0])){
   rows.sort((a,b)=>hash([seed,key(a)]).localeCompare(hash([seed,key(b)])));
   const base=Math.floor(rows.length*size/unique.length);
-  for(let g=0;g<5;g++)groups[g].push(...rows.splice(0,base));
+  for(let g=0;g<groupCount;g++)groups[g].push(...rows.splice(0,base));
   reserve.push(...rows);
  }
  reserve.sort((a,b)=>hash([seed,'reserve',key(a)]).localeCompare(hash([seed,'reserve',key(b)])));
  while(groups.some(g=>g.length<size))for(const g of groups)if(g.length<size)g.push(reserve.shift());
- const entries=groups.flatMap((g,i)=>g.map(s=>({...s,fold:i+1}))).concat(reserve.map(s=>({...s,fold:6})));
+ const entries=groups.flatMap((g,i)=>g.map(s=>({...s,fold:i+1}))).concat(reserve.map(s=>({...s,fold:groupCount+1})));
  assert.equal(new Set(entries.map(key)).size,unique.length);
  return {size,entries,sets:groups.map((g,i)=>({id:i+1,count:g.length,dates:Object.fromEntries([...new Set(g.map(s=>dateNumber(s.signalTime)))].sort().map(d=>[new Date(d*86400000).toISOString().slice(0,10),g.filter(s=>dateNumber(s.signalTime)===d).length]))})),reserve:reserve.length};
 }

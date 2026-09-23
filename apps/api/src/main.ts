@@ -71,6 +71,7 @@ export class AppService {
   async validateStrategy(strategy: StrategyConfig) {
     if (!strategy || strategy.schemaVersion !== 1) throw new BadRequestException("只支持 schemaVersion=1 的策略配置");
     if(strategy.entryAfterSignal!==undefined && typeof strategy.entryAfterSignal!=='boolean')throw new BadRequestException('信号后买入设置必须是布尔值');
+    if(strategy.minimumSignalAgeMinutes!==undefined && (!Number.isInteger(strategy.minimumSignalAgeMinutes)||strategy.minimumSignalAgeMinutes<0||strategy.minimumSignalAgeMinutes>1440||strategy.entryAfterSignal===false))throw new BadRequestException('信号后等待时间必须为 0–1440 分钟，且开启信号后买入');
     if (strategy.impulseCondition?.type !== "impulse_fractal_swing") throw new BadRequestException("必须配置 Fractal Pivot 拉升识别");
     const definitions = await this.definitionMap();
     const validateItem = (item: Condition | ConditionGroup, path: string) => {
