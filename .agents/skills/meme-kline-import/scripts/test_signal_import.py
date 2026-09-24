@@ -2,6 +2,8 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -78,6 +80,62 @@ class SignalTests(unittest.TestCase):
             self.assertEqual([(e['chain'],e['ca']) for e in events], [('bsc','0xabc'),('sol','AbC')])
             self.assertEqual(len(events[0]['provenance']),2)
             self.assertEqual(events[0]['signal_time'],1700000000123)
+
+    def test_expanded_signal_keeps_its_source_and_separate_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)/'expanded.xlsx'
+            expanded = list(ROW); expanded[5] = 'fomo_new_project_expanded'
+            make_xlsx(p,[HEADERS,ROW,expanded])
+            events = m.read_signals(p, {'bsc'})
+            self.assertEqual(len(events), 2)
+            self.assertEqual({e['signal_source'] for e in events},
+                             {'fomo_new_project', 'fomo_new_project_expanded'})
+            project = m.Project('bsc','0xabc','pair',1700000000000)
+            self.assertIn("'fomo_new_project_expanded'", m.metadata_sql(project,[events[1]]))
+
+    def test_project_downloads_are_parallel_but_database_writes_are_capped(self):
+        with tempfile.TemporaryDirectory() as d:
+            workbook = Path(d)/'signals.xlsx'
+            make_xlsx(workbook,[HEADERS,ROW])
+            args = m.build_parser().parse_args([str(workbook),'--yes','--workers','4','--db-writers','2'])
+            now = int(time.time()*1000)
+            projects = [m.Project('bsc',f'ca{i}',f'pair{i}',now-100000) for i in range(4)]
+            events = [dict(chain='bsc',ca=p.ca,signal_source='fomo_new_project',detail_id=f'd{i}',
+                           signal_time=now-100000,source_signal={},provenance=[]) for i,p in enumerate(projects)]
+            barrier = threading.Barrier(4)
+            lock = threading.Lock()
+            active_writes = max_writes = 0
+
+            def fetch(project,*args):
+                barrier.wait(timeout=3)
+                return m.ProjectResult(project,[])
+
+            def write(*args,**kwargs):
+                nonlocal active_writes,max_writes
+                with lock:
+                    active_writes += 1
+                    max_writes = max(max_writes,active_writes)
+                time.sleep(.05)
+                with lock:
+                    active_writes -= 1
+                return 0,0
+
+            with patch.dict(os.environ,{'DATABASE_URL':'postgresql://example/db'}), \
+                 patch.object(m,'read_tokens',return_value=[m.TokenRef('bsc',p.ca,2) for p in projects]), \
+                 patch.object(m,'read_signals',return_value=events), \
+                 patch.object(m,'lookup_projects',return_value=(projects,[])), \
+                 patch.object(m,'preflight_database'),patch.object(m,'preflight_signals'), \
+                 patch.object(m,'fetch_project',side_effect=fetch),patch.object(m,'write_rows',side_effect=write):
+                self.assertEqual(m.run(args),0)
+            self.assertEqual(max_writes,2)
+
+    def test_single_worker_uses_single_database_writer_by_default(self):
+        args = m.build_parser().parse_args(['signals.xlsx','--workers','1'])
+        with patch.dict(os.environ,{'DATABASE_URL':'postgresql://example/db'}), \
+             patch.object(m,'read_tokens',return_value=[]),patch.object(m,'read_signals',return_value=[]), \
+             patch.object(m,'lookup_projects',return_value=([],[])), \
+             patch.object(m,'preflight_database'),patch.object(m,'preflight_signals'):
+            self.assertEqual(m.run(args),0)
 
     def test_invalid_time_and_conflicting_identity(self):
         with tempfile.TemporaryDirectory() as d:

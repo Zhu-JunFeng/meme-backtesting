@@ -24,11 +24,12 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from threading import Event, Semaphore
 from typing import Any, Callable, Iterator, Sequence
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
@@ -265,7 +266,7 @@ def read_tokens(path: Path) -> list[TokenRef]:
 def read_signals(path: Path, chains: set[str]) -> list[dict[str, Any]]:
     required = ["所属链", "合约地址", "触发时间戳（毫秒）", "触发时间（北京时间）",
                 "信号名称", "信号代码", "信号来源", "信号ID", "明细ID"]
-    events: dict[tuple[str, str, str], dict[str, Any]] = {}
+    events: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     found = False
     with zipfile.ZipFile(path) as archive:
@@ -286,17 +287,19 @@ def read_signals(path: Path, chains: set[str]) -> list[dict[str, Any]]:
                     continue
                 ca = normalized_ca(chain, data["合约地址"])
                 raw = data["触发时间戳（毫秒）"]
-                if (not chain or not ca or not data["明细ID"] or data["信号代码"] != "fomo_new_project"
+                signal_code = data["信号代码"]
+                if (not chain or not ca or not data["明细ID"]
+                        or signal_code not in {"fomo_new_project", "fomo_new_project_expanded"}
                         or not raw.isdigit() or not 946684800000 <= int(raw) < 4102444800000):
                     raise ImporterError(f"{sheet}/{row}: invalid signal identity/time")
                 ms = int(raw)
                 expected = datetime.fromtimestamp(ms // 1000, timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
                 if data["触发时间（北京时间）"] != expected:
                     raise ImporterError(f"{sheet}/{row}: signal timestamp/Beijing time mismatch")
-                event = dict(chain=chain, ca=ca, signal_source="fomo_new_project", detail_id=data["明细ID"],
+                event = dict(chain=chain, ca=ca, signal_source=signal_code, detail_id=data["明细ID"],
                              signal_time=ms, source_signal=dict(name=data["信号名称"], code=data["信号代码"],
                              signalId=data["信号ID"], detailId=data["明细ID"], upstreamSource=data["信号来源"]))
-                key = (chain, ca, data["明细ID"])
+                key = (chain, ca, signal_code, data["明细ID"])
                 if key in events and {k: v for k, v in events[key].items() if k != "provenance"} != event:
                     raise ImporterError(f"conflicting signal detail: {key}")
                 events.setdefault(key, {**event, "provenance": []})
@@ -341,6 +344,7 @@ def metadata_sql(project: Project, events: Sequence[dict[str, Any]]) -> str:
     if not events or any((e["chain"], e["ca"]) != (project.chain, project.ca) for e in events):
         raise ImporterError("project signal metadata missing or mismatched")
     identity = sql_json(dict(chain=project.chain, ca=project.ca, pair=project.pair_id))
+    signal_source = "'" + events[0]["signal_source"].replace("'", "''") + "'"
     return f"""
 SELECT pg_advisory_xact_lock(hashtextextended(({identity}->>'chain') || ':' || ({identity}->>'ca'), 0));
 CREATE TEMP TABLE import_signals ON COMMIT DROP AS SELECT * FROM {signal_relation(events)};
@@ -358,7 +362,7 @@ ON CONFLICT(chain,ca,signal_source,detail_id) DO UPDATE SET provenance=(
 RETURNING (xmax=0) AS inserted)
 SELECT 'SIGNALS|' || count(*) FILTER(WHERE inserted) || '|' || count(*) FILTER(WHERE NOT inserted) FROM saved;
 INSERT INTO public.token_info(chain,ca,pair,signal_source)
-VALUES ({identity}->>'chain', {identity}->>'ca', {identity}->>'pair', 'fomo_new_project')
+VALUES ({identity}->>'chain', {identity}->>'ca', {identity}->>'pair', {signal_source})
 ON CONFLICT(chain,ca,pair) DO NOTHING;
 WITH first_signal AS (
  SELECT chain,ca,signal_source,signal_time,source_signal FROM public.token_signal_events
@@ -766,7 +770,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("workbook", type=Path, help="XLSX workbook containing 所属链 and 合约地址 columns")
     parser.add_argument("--dry-run", action="store_true", help="parse, lookup, and validate the database without writing")
     parser.add_argument("--yes", action="store_true", help="skip the IMPORT confirmation; use only with explicit authorization")
-    parser.add_argument("--workers", type=int, default=4, help="number of concurrent project fetches (default: 4)")
+    parser.add_argument("--workers", type=int, default=8, help="concurrent project download threads (default: 8)")
+    parser.add_argument("--db-writers", type=int, help="maximum concurrent PostgreSQL writers (default: up to 2)")
     parser.add_argument("--timeout", type=float, default=30, help="HTTP timeout in seconds (default: 30)")
     parser.add_argument("--retries", type=int, default=3, help="HTTP retries after the first attempt (default: 3)")
     parser.add_argument("--db-retries", type=int, default=5, help="bounded connection retries per write batch (default: 5)")
@@ -784,6 +789,10 @@ def run(args: argparse.Namespace) -> int:
     args.db_batch_size = getattr(args, "db_batch_size", 1000)
     if args.workers < 1 or args.workers > 32:
         raise ImporterError("--workers must be between 1 and 32")
+    configured_writers = getattr(args, "db_writers", None)
+    db_writers = min(2, args.workers) if configured_writers is None else configured_writers
+    if not 1 <= db_writers <= args.workers:
+        raise ImporterError("--db-writers must be between 1 and --workers")
     if args.timeout <= 0 or args.retries < 0 or not 1 <= args.lookup_batch_size <= 200:
         raise ImporterError("invalid timeout, retry, or lookup batch-size option")
     if not 0 <= args.db_retries <= 10 or not 1 <= args.db_batch_size <= 20000:
@@ -845,6 +854,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"创建时间范围：{utc_text(min(project.created_ms for project in projects))} 至 {utc_text(max(project.created_ms for project in projects))}")
     print(f"K线组合：30s/1m × price/mcap；创建后24h，仅保存已收盘K线；理论上限 {len(projects)*8640:,} 行")
     print(f"同步 token_info + token_signal_events：文件唯一信号 {len(events)}")
+    print(f"并发：{args.workers} 个下载线程，最多 {db_writers} 个数据库写入线程")
 
     if args.dry_run:
         print("Dry run 完成：未请求 XXYY K 线，未写入数据库。")
@@ -861,6 +871,8 @@ def run(args: argparse.Namespace) -> int:
     totals = Totals()
     chain_totals: dict[str, dict[str, int]] = {}
     report_path = getattr(args, "report", None)
+    write_slots = Semaphore(db_writers)
+    stopping = Event()
 
     def record(item: dict[str, Any]) -> None:
         if report_path:
@@ -871,7 +883,8 @@ def run(args: argparse.Namespace) -> int:
     record(dict(kind="start", workbook=str(args.workbook), now_ms=now_ms, projects=len(projects),
                 selected=len(tokens), created_within_days=created_days, database=safe_database_target(database_url),
                 workbook_hash=hashlib.sha256(args.workbook.read_bytes()).hexdigest(), resume_report=str(resume_path) if resume_path else None,
-                db_retries=args.db_retries, db_batch_size=args.db_batch_size))
+                db_retries=args.db_retries, db_batch_size=args.db_batch_size,
+                chains=sorted(chains), workers=args.workers, db_writers=db_writers))
     for project in outside_age:
         record(dict(kind="creation_excluded", **asdict(project), reason=f"created outside last {created_days} days"))
     for token, reason in skipped:
@@ -882,11 +895,16 @@ def run(args: argparse.Namespace) -> int:
         if previous and previous["created_ms"] == project.created_ms:
             return {**previous, "resumed": True}
         result = fetch_project(project, now_ms, args.timeout, args.retries)
+        if stopping.is_set():
+            raise ImporterError("import stopped after a global failure")
         signals = [0, 0]
         retry_events: list[int] = []
-        inserted, updated = write_rows(database_url, result.rows, batch_size=args.db_batch_size,
-            metadata=metadata_sql(project, by_token[(project.chain, project.ca)]), signal_counts=signals,
-            connection_retries=args.db_retries, retry_events=retry_events)
+        with write_slots:
+            if stopping.is_set():
+                raise ImporterError("import stopped after a global failure")
+            inserted, updated = write_rows(database_url, result.rows, batch_size=args.db_batch_size,
+                metadata=metadata_sql(project, by_token[(project.chain, project.ca)]), signal_counts=signals,
+                connection_retries=args.db_retries, retry_events=retry_events)
         status = ("failed" if not result.rows and result.errors else "no_data" if not result.rows
                   else "partial" if result.errors or result.empty_combinations or result.invalid or result.discarded else "success")
         return dict(kind="project", **asdict(project), status=status, inserted=inserted, updated=updated,
@@ -897,39 +915,55 @@ def run(args: argparse.Namespace) -> int:
                     age_under_24h=now_ms < project.created_ms + HISTORY_MS)
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(import_project, project): project
-                   for project in projects}
-        for future in as_completed(futures):
-            project = futures[future]
+        remaining = iter(projects)
+        futures: dict[Any, Project] = {}
+
+        def submit_next() -> None:
             try:
-                result = future.result()
-            except ImporterError:
-                for pending in futures:
-                    pending.cancel()
-                raise
-            except Exception as error:
-                totals.failed_projects += 1
-                print(f"[WARN] 跳过 {project.chain}:{project.ca}：{error}", file=sys.stderr)
-                record(dict(kind="project", **asdict(project), status="failed", error=str(error)))
-                continue
-            record(result)
-            summary = chain_totals.setdefault(project.chain, {})
-            for key in [result["status"]]:
-                summary[key] = summary.get(key, 0) + 1
-            for key in ["inserted", "updated", "signal_inserted", "signal_duplicates", "invalid", "discarded"]:
-                summary[key] = summary.get(key, 0) + result[key]
-            totals.inserted += result["inserted"]
-            totals.updated += result["updated"]
-            totals.imported_projects += 1
-            totals.invalid += result["invalid"]
-            totals.discarded += result["discarded"]
-            print(f"[{totals.imported_projects}/{len(projects)}] {project.chain}:{project.ca} "
-                  f"{result['status']} 新增 {result['inserted']} 更新 {result['updated']}", flush=True)
+                project = next(remaining)
+            except StopIteration:
+                return
+            futures[executor.submit(import_project, project)] = project
+
+        for _ in range(min(len(projects), args.workers * 2)):
+            submit_next()
+        while futures:
+            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                project = futures.pop(future)
+                try:
+                    result = future.result()
+                except ImporterError:
+                    stopping.set()
+                    for pending in futures:
+                        pending.cancel()
+                    raise
+                except Exception as error:
+                    totals.failed_projects += 1
+                    print(f"[WARN] 跳过 {project.chain}:{project.ca}：{error}", file=sys.stderr)
+                    record(dict(kind="project", **asdict(project), status="failed", error=str(error)))
+                    summary = chain_totals.setdefault(project.chain, {})
+                    summary["failed"] = summary.get("failed", 0) + 1
+                    submit_next()
+                    continue
+                record(result)
+                summary = chain_totals.setdefault(project.chain, {})
+                summary[result["status"]] = summary.get(result["status"], 0) + 1
+                for key in ["inserted", "updated", "signal_inserted", "signal_duplicates", "invalid", "discarded"]:
+                    summary[key] = summary.get(key, 0) + result[key]
+                totals.inserted += result["inserted"]
+                totals.updated += result["updated"]
+                totals.imported_projects += 1
+                totals.invalid += result["invalid"]
+                totals.discarded += result["discarded"]
+                print(f"[{totals.imported_projects}/{len(projects)}] {project.chain}:{project.ca} "
+                      f"{result['status']} 新增 {result['inserted']} 更新 {result['updated']}", flush=True)
+                submit_next()
 
     print("导入完成："
           f"处理项目 {totals.imported_projects}，异常项目 {totals.failed_projects}，"
           f"插入 {totals.inserted}，更新 {totals.updated}，"
-          f"标记无效 {totals.invalid}，丢弃不完整 {totals.discarded}。")
+          f"标记无效 {totals.invalid}，丢弃窗口外或不完整 {totals.discarded}。")
     record(dict(kind="summary", chains=chain_totals, totals=asdict(totals)))
     print(json.dumps(chain_totals, ensure_ascii=False))
     return 0

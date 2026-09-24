@@ -25,7 +25,7 @@ The importer requests 30s and 1m price/mcap from creation through creation + 24 
 
 Read every matching worksheet, normalize chain names, preserve SOL CA case and lowercase ROBIN/BSC CAs for both workbook and lookup matching. `--chains` limits both candles and signals; omitting it includes all workbook chains. Lookup main pair alone is fetched.
 
-Three-table imports require 所属链、合约地址、触发时间戳（毫秒）、触发时间（北京时间）、信号名称、信号代码、信号来源、信号ID、明细ID. Check milliseconds against UTC+08 display. Only `fomo_new_project` identities are accepted. Deduplicate by chain/CA/source/detail ID; conflicting identities stop before writes.
+Three-table imports require 所属链、合约地址、触发时间戳（毫秒）、触发时间（北京时间）、信号名称、信号代码、信号来源、信号ID、明细ID. Check milliseconds against UTC+08 display. Accept only `fomo_new_project` and `fomo_new_project_expanded`; preserve the actual signal code in `signal_source`, do not relabel expanded signals as the original source. Deduplicate by chain/CA/source/detail ID; conflicting identities stop before writes.
 
 Each small transaction synchronizes `meme_kline`, `token_info` and `token_signal_events`. Existing signals retain all distinct file provenance; the earliest signal updates every existing token_info pool for that CA, never replacing an earlier time with a later one. `created_at` remains ingestion time. An empty HTTP result can still synchronize valid project metadata and must be reported as no data. Connection interruptions reconnect and replay the complete idempotent transaction with exponential backoff, at most `--db-retries 5` retries per batch; `--db-batch-size 1000` limits transmission size. Replays also cover lost COMMIT replies: data remains deduplicated, but reported insert/update and signal counts describe acknowledged attempts, not exact physical changes across ambiguous attempts. Projects with retries record `db_reconnects` and `write_counts_may_include_replay`; disclose this when reporting counts. Non-connection errors and exhausted retries stop execution. No migration, deletion, historical report update or backtest execution is performed.
 
@@ -40,7 +40,7 @@ After interruption use `--resume-report previous.jsonl --report new.jsonl`. This
 - Do not import into the obsolete `public.xxyy_kline` relation.
 - Do not synthesize candles for periods where XXYY returns no data.
 - Do not treat a dry run as authorization for a later write.
-- Keep concurrency conservative unless the user asks to change it; `--workers 4` is the default.
+- Download projects in a bounded thread pool (`--workers 8` by default, at most 32). Limit simultaneous PostgreSQL writers separately (`--db-writers 2` by default, never above `--workers`); each writer commits small idempotent transactions. At most twice the worker count may be queued at once. Reduce workers if XXYY rate-limits requests or PostgreSQL becomes saturated.
 
 Run the bundled tests after changing the importer:
 
