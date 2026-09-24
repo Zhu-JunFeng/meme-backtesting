@@ -13,6 +13,7 @@ import { Pool, type PoolClient } from "pg";
 import { Queue } from "bullmq";
 import { createQueue, queuePrefix, RUNTIME_VERSION, enqueue, reconcile, actions, stopRun, retryRun, rerun } from '@meme/runtime';
 import type { BacktestConfig, Condition, ConditionDefinition, ConditionGroup, CreateBacktestRequest, DatasetConfig, StrategyConfig } from "@meme/domain";
+import {LiveController} from './live.js';
 
 type Validator = ((value: unknown) => boolean) & { errors?: unknown };
 type AjvInstance = { compile(schema: Record<string, unknown>): Validator; errorsText(errors?: unknown): string };
@@ -257,5 +258,5 @@ class AppController {
   @Get("tv/history") async history(@Query() query: Record<string,string>) { const [chain, ca, pairId, type] = (query.symbol ?? "").split(":"); const resolution: Record<string,string> = { "30S": "30s", "1": "1m", "5": "5m", "15": "15m", "60": "1h", "240": "4h", "D": "1d" }; const rows = await this.service.candles({ chain, ca, pairId, interval: resolution[query.resolution] ?? "30s", type: type ?? "mcap", runId:query.runId, from: query.countBack ? "0" : String(Number(query.from) * 1000), to: String(Number(query.to) * 1000 - 1), limit:query.countBack }); if (!rows.length) return { s: "no_data" }; return { s: "ok", t: rows.map((row:any) => Math.floor(row.time / 1000)), o: rows.map((row:any) => row.open), h: rows.map((row:any) => row.high), l: rows.map((row:any) => row.low), c: rows.map((row:any) => row.close), v: rows.map((row:any) => row.volume) }; }
 }
 
-@Module({ controllers: [AppController], providers: [AppService] }) class AppModule {}
-if (process.env.NODE_ENV !== "test" && process.env.BACKTEST_CLI !== '1') NestFactory.create(AppModule).then(app => { app.enableCors();app.enableShutdownHooks(); app.listen(Number(process.env.PORT ?? 3000)); });
+@Module({ controllers: [AppController,LiveController], providers: [AppService] }) class AppModule {}
+if (process.env.NODE_ENV !== "test" && process.env.BACKTEST_CLI !== '1') NestFactory.create(AppModule).then(app => { app.enableCors();app.enableShutdownHooks(); app.listen(Number(process.env.PORT ?? 3000),process.env.API_BIND_HOST??'0.0.0.0'); });

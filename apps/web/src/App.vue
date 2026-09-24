@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { ExperimentOutlined, FundOutlined } from "@ant-design/icons-vue";
+import { ExperimentOutlined, FundOutlined,PlayCircleOutlined, SafetyCertificateOutlined } from "@ant-design/icons-vue";
 import StrategyWorkspace from "./components/StrategyWorkspace.vue";
 import BacktestWorkspace from "./components/BacktestWorkspace.vue";
+import LiveWorkspace from "./components/LiveWorkspace.vue";
 import './responsive.css';
 
-const page = ref<"backtest"|"strategy">("backtest");
-const pageTitle = computed(() => page.value === "strategy" ? "策略配置" : "回测工作台");
-const pageDescription = computed(() => page.value === "strategy" ? "定义指标、组合规则，并保存不可变策略版本" : "选择策略版本与历史 K 线数据集，执行并复核回测结果");
+const page = ref<"backtest"|"strategy"|"paper"|"live">("backtest");
+const pageTitle = computed(() => ({strategy:"策略配置",backtest:"回测工作台",paper:"模拟盘",live:"实盘"})[page.value]);
+const pageDescription = computed(() => ({strategy:"定义指标、组合规则，并保存不可变策略版本",backtest:"选择策略版本与历史 K 线数据集，执行并复核回测结果",paper:"用实时信号和成交回放策略，记录模拟成交与权益",live:"绑定专用钱包、核对硬性限额后管理真实交易"})[page.value]);
 </script>
 
 <template>
@@ -18,13 +19,16 @@ const pageDescription = computed(() => page.value === "strategy" ? "定义指标
         <nav aria-label="主导航">
           <button :class="{active:page==='backtest'}" :aria-current="page==='backtest'?'page':undefined" @click="page='backtest'"><FundOutlined /><span>回测工作台</span></button>
           <button :class="{active:page==='strategy'}" :aria-current="page==='strategy'?'page':undefined" @click="page='strategy'"><ExperimentOutlined /><span>策略配置</span></button>
+          <button :class="{active:page==='paper'}" :aria-current="page==='paper'?'page':undefined" @click="page='paper'"><PlayCircleOutlined /><span>模拟盘</span></button>
+          <button :class="{active:page==='live'}" :aria-current="page==='live'?'page':undefined" @click="page='live'"><SafetyCertificateOutlined /><span>实盘</span></button>
         </nav>
         <div class="environment"><i></i><div><span>数据服务</span><strong>已连接</strong></div></div>
       </aside>
       <main>
-        <header class="page-header"><div><h1>{{ pageTitle }}</h1><p>{{ pageDescription }}</p></div><div class="scope-badge">历史 K 线 · 单周期 · 北京时间 UTC+8</div></header>
+        <header class="page-header"><div><h1>{{ pageTitle }}</h1><p>{{ pageDescription }}</p></div><div class="scope-badge">{{ page==='paper'||page==='live'?'实时成交 · 30s/1m · 北京时间 UTC+8':'历史 K 线 · 单周期 · 北京时间 UTC+8' }}</div></header>
         <BacktestWorkspace v-if="page==='backtest'" />
-        <StrategyWorkspace v-else />
+        <StrategyWorkspace v-else-if="page==='strategy'" />
+        <LiveWorkspace v-else :key="page" :mode="page" />
       </main>
     </div>
   </a-config-provider>

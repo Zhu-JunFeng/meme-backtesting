@@ -1,6 +1,7 @@
 import type { BacktestConfig, BacktestReport, Candle, Condition, ConditionGroup, EquityPoint, ImpulseConfig, Signal, SymbolRef, Trade } from "@meme/domain";
 export * from './resumable.js';
 export * from './invalidation.js';
+export * from './live.js';
 import { describeInvalidation } from './invalidation.js';
 import { createEntryGate } from './entry-gate.js';
 

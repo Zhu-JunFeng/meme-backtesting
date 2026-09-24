@@ -6,7 +6,7 @@ import { eventLabels as labels, marketValue, changePercent, formatNumber, precis
 import FibAudit from './FibAudit.vue';
 import { partitionMarkers } from '../chartMarkers';
 import {externalBuckets} from '../externalSignals';
-const props=defineProps<{symbol:string;interval:string;runId?:string;startTime?:number|null;endTime?:number|null;includeEndOfBacktest?:boolean;signalTypes?:string;anchor?:{tradeId?:string;from?:number;to?:number;start?:number;end?:number;empty?:boolean;fib?:any;fibFrom?:number;fibTo?:number}}>();
+const props=defineProps<{symbol:string;interval:string;runId?:string;liveRunId?:string;startTime?:number|null;endTime?:number|null;includeEndOfBacktest?:boolean;signalTypes?:string;anchor?:{tradeId?:string;from?:number;to?:number;start?:number;end?:number;empty?:boolean;fib?:any;fibFrom?:number;fibTo?:number}}>();
 const filters=()=>({includeEndOfBacktest:props.includeEndOfBacktest ?? false,signalTypes:props.signalTypes ?? ''});
 const showFib=ref(true),fibView=ref('full'),fib=ref<any>();let fibIds:any[]=[],fibEpoch=0;
 const selectedBuy=ref<any>(),cursorValue=ref<number>(),selectedEvent=ref<any>();
@@ -18,6 +18,7 @@ const markMap=new Map<string,any>(),shapeMap=new Map<any,any>();
 const fetching=ref(false);let focused:any,focusEpoch=0;
 const container=ref<HTMLDivElement>(),error=ref("");let widget:any,version=0,markerVersion=0;
 let controller=new AbortController(),rangeTimer:number|undefined;
+const liveSubscriptions=new Map<string,number>();
 let marksEpoch=0;
 const missingMarkers=ref(0);
 const showExternal=ref(true),externalRows=ref<any[]>([]),externalPage=ref(1),externalSelection=ref<any[]>(),externalMissing=ref(0),externalLoading=ref(false);
@@ -36,10 +37,10 @@ async function drawExternal(chart:any,v:number){
  }
 }
 async function loadExternal(v:number){
- if(!props.runId)return;const [chain,ca,pairId]=props.symbol.split(':'),rows:any[]=[];
+ if(!props.runId&&!props.liveRunId)return;const [chain,ca,pairId]=props.symbol.split(':'),rows:any[]=[];
  externalLoading.value=true;
  try{
- for(let page=1;;page++){const data=await get(`/api/backtests/${props.runId}/external-signals`,{chain,ca,pairId,page,pageSize:500});if(v!==version)return;rows.push(...data.items);if(page*500>=data.total)break;}
+ for(let page=1;;page++){const data=await get(props.liveRunId?`/api/live-runs/${props.liveRunId}/external-signals`:`/api/backtests/${props.runId}/external-signals`,{chain,ca,pairId,page,pageSize:500});if(v!==version)return;rows.push(...data.items);if(page*500>=data.total)break;}
  if(v===version){externalRows.value=rows;if(ready)await drawExternal(widget.activeChart(),v);}
  }finally{if(v===version)externalLoading.value=false;}
 }
@@ -83,7 +84,7 @@ function selectEvent(event:any){
 async function markerRows(from:number,to:number) {
  const [chain,ca,pairId]=props.symbol.split(":"),items:any[]=[];
  for(let page=1;;page++) {
-  const data=await get(`/api/backtests/${props.runId}/signals`,{chain,ca,pairId,from:Math.floor(from*1000),to:Math.ceil(to*1000),page,pageSize:500,...filters()});
+  const data=await get(props.liveRunId?`/api/live-runs/${props.liveRunId}/markers`:`/api/backtests/${props.runId}/signals`,{chain,ca,pairId,from:Math.floor(from*1000),to:Math.ceil(to*1000),page,pageSize:500,...filters()});
   items.push(...data.items);if(page*500>=data.total)return items;
  }
 }
@@ -92,13 +93,13 @@ async function get(path:string,params:Record<string,any>) {
  const response=await fetch(path+"?"+query,{signal:controller.signal});if(!response.ok)throw new Error("请求失败 "+response.status);return response.json();
 }
 async function loadMarkers(chart:any,v:number) {
- if(!props.runId || v!==version)return;
+ if((!props.runId&&!props.liveRunId) || v!==version)return;
  const mv=++markerVersion,range=chart.getVisibleRange(),[chain,ca,pairId]=props.symbol.split(":");
  if(!range || range.to<=range.from)return;
  const markers:any[]=[];
  try {
  for(let page=1;;page++){
-  const data=await get(`/api/backtests/${props.runId}/signals`,{chain,ca,pairId,from:Math.floor(range.from*1000),to:Math.ceil(range.to*1000),page,pageSize:500,...filters()});
+  const data=await get(props.liveRunId?`/api/live-runs/${props.liveRunId}/markers`:`/api/backtests/${props.runId}/signals`,{chain,ca,pairId,from:Math.floor(range.from*1000),to:Math.ceil(range.to*1000),page,pageSize:500,...filters()});
   if(v!==version || mv!==markerVersion)return;markers.push(...data.items);
   if(page*500>=data.total)break;
  }
@@ -113,7 +114,7 @@ async function loadMarkers(chart:any,v:number) {
  }
  }catch(e:any){if(v===version && e.name!=="AbortError")error.value="事件标注加载失败，可切换交易池重试";}
 }
-function reset(){clearSelection();fibEpoch++;fibIds=[];ready=false;version++;markerVersion++;marksEpoch++;loadedTimes.clear();missingMarkers.value=0;controller.abort();controller=new AbortController();window.clearTimeout(rangeTimer);widget?.remove();widget=undefined;shapeMap.clear();markMap.clear();}
+function reset(){clearSelection();fibEpoch++;fibIds=[];ready=false;version++;markerVersion++;marksEpoch++;loadedTimes.clear();missingMarkers.value=0;controller.abort();controller=new AbortController();window.clearTimeout(rangeTimer);for(const timer of liveSubscriptions.values())window.clearInterval(timer);liveSubscriptions.clear();widget?.remove();widget=undefined;shapeMap.clear();markMap.clear();}
 let loadedTimes=new Set<number>();
 async function drawFib(chart:any,v:number){
  const request=++fibEpoch;for(const id of fibIds)try{chart.removeEntity(id);}catch{}fibIds=[];
@@ -168,7 +169,7 @@ async function mountChart(){
  datafeed:{
   onReady:(cb:any)=>setTimeout(()=>cb({supported_resolutions:[resolutions[props.interval]],supports_time:false,supports_marks:true}),0),
   getMarks:(_info:any,from:number,to:number,cb:any)=>{
-   if(!props.runId){cb([]);return;}
+   if(!props.runId&&!props.liveRunId){cb([]);return;}
    const request=marksEpoch;
    markerRows(from,to).then(items=>{if(v!==version||request!==marksEpoch)return;const visible=ready?localWidget.activeChart().getVisibleRange():null;
     const {drawable}=partitionMarkers(items,loadedTimes,{from:Math.max(from,visible?.from ?? from),to:Math.min(to,visible?.to ?? to)});
@@ -184,7 +185,18 @@ async function mountChart(){
    .catch((e:any)=>{if(v===version && e.name!=="AbortError"){error.value="K 线加载失败";onError(String(e));}});
   },
   searchSymbols:(_i:any,_e:any,_t:any,cb:any)=>cb([]),
-  subscribeBars:()=>{},unsubscribeBars:()=>{}
+  subscribeBars:(_info:any,_resolution:string,onTick:any,subscriberUID:string)=>{
+   if(!props.liveRunId)return;
+   let lastEmitted=0;
+   const timer=window.setInterval(()=>{if(v!==version)return;
+    void get('/api/tv/history',{symbol,resolution:resolutions[props.interval],from:0,to:Math.floor(Date.now()/1000)+1,countBack:2})
+     .then(data=>{if(v!==version||!data.t?.length)return;const i=data.t.length-1,time=data.t[i]*1000;if(time<=lastEmitted)return;
+      lastEmitted=time;loadedTimes.add(time);onTick({time,open:data.o[i],high:data.h[i],low:data.l[i],close:data.c[i],volume:data.v[i]});scheduleMarkers(v);})
+     .catch(()=>{});
+   },5000);
+   liveSubscriptions.set(subscriberUID,timer);
+  },
+  unsubscribeBars:(subscriberUID:string)=>{const timer=liveSubscriptions.get(subscriberUID);if(timer!==undefined)window.clearInterval(timer);liveSubscriptions.delete(subscriberUID);}
  }});
  widget=localWidget;
  localWidget.onChartReady(()=>{
@@ -205,14 +217,15 @@ async function mountChart(){
 async function focusEvent(event:any){
  const v=version,request=++focusEpoch;
  try {
+  if(props.liveRunId){const t=Number(event.time),step=(seconds[props.interval]||30)*1000;focused={from:Math.max(0,t-step*100),to:t+step*100,start:t};const mountingVersion=version+1;await mountChart();if(request===focusEpoch&&version===mountingVersion)selectEvent(event);return;}
   const [chain,ca,pairId]=props.symbol.split(':');const data=await get(`/api/backtests/${props.runId}/locate`,{chain,ca,pairId,eventId:event.id,...filters()});if(v!==version || request!==focusEpoch)return;focused=data;const mountingVersion=version+1;await mountChart();if(request===focusEpoch && version===mountingVersion && data.eventId===event.id)selectEvent(event);
  } catch { if(v===version && request===focusEpoch)error.value="图表尚未完成加载，稍后再点击事件定位"; }
 }
 defineExpose({focusEvent});
 onBeforeUnmount(()=>{externalEpoch++;externalIds.clear();});
 watch(showExternal,()=>{if(!showExternal.value){externalSelection.value=undefined;externalMissing.value=0;}if(ready)void drawExternal(widget.activeChart(),version).catch(()=>{error.value='外部信号绘制失败';});});
-watch(()=>[props.symbol,props.runId],()=>{externalSelection.value=undefined;});
-onMounted(mountChart);watch(()=>[props.symbol,props.interval,props.runId,props.anchor],()=>{focused=undefined;void mountChart();});onBeforeUnmount(reset);
+watch(()=>[props.symbol,props.runId,props.liveRunId],()=>{externalSelection.value=undefined;});
+onMounted(mountChart);watch(()=>[props.symbol,props.interval,props.runId,props.liveRunId,props.anchor],()=>{focused=undefined;void mountChart();});onBeforeUnmount(reset);
 watch(()=>[props.includeEndOfBacktest,props.signalTypes],async()=>{
  reset();fib.value=undefined;focused=undefined;const v=version;
  if(!props.runId)return;const [chain,ca,pairId]=props.symbol.split(':');
