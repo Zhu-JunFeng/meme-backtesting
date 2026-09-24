@@ -1,12 +1,13 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {assertLocalDatabase,LocalCandleReader,evaluateWindow} from './offline-strategy-research.mjs';
+import {assertLocalDatabase,LocalCandleReader,evaluateWindow,realCandleAt} from './offline-strategy-research.mjs';
 import {normalizeCandles,runBacktest} from '../packages/engine/dist/index.js';
 const symbol={chain:'sol',ca:'test',pairId:'pool'};
 test('rejects remote database hosts',()=>{for(const host of ['47.251.140.83','example.com',undefined])assert.throws(()=>assertLocalDatabase({host}));for(const host of ['127.0.0.1','localhost','::1','/tmp/socket'])assert.doesNotThrow(()=>assertLocalDatabase({host}));});
 test('rejects a remote connection string overriding the local host',()=>assert.throws(()=>assertLocalDatabase({host:'localhost',connectionString:'postgres://example.com/database'})));
 test('lazy gaps use previous close and equal production normalization',()=>{const rows=[{time:0,closeTime:30000,open:2,high:3,low:1,close:2,volume:3},{time:90000,closeTime:120000,open:4,high:5,low:3,close:4,volume:4}];const reader=new LocalCandleReader({symbol,candles:rows},0,120000,30000),actual=[];let t;while(t=reader.peek()){actual.push({...t.candle,valid:true});reader.consume(t.candle);}assert.deepEqual(actual,normalizeCandles(rows,'30s').candles);});
 test('window is half-open and does not fabricate trailing candles',()=>{const rows=[0,30000,60000].map(time=>({time,closeTime:time+30000,open:1,high:1,low:1,close:1,volume:1}));const reader=new LocalCandleReader({symbol,candles:rows},30000,60000,30000);const t=reader.peek();assert.equal(t.candle.time,30000);assert.equal(t.last,true);reader.consume(t.candle);assert.equal(reader.peek(),undefined);});
+test('real candle audit distinguishes a gap-filled timestamp',()=>{const rows=[{time:0},{time:60000}];assert(realCandleAt(rows,0));assert(!realCandleAt(rows,30000));assert(realCandleAt(rows,60000));});
 test('empty evaluation keeps initial balance and reports no unsupported win rate',()=>{const config={name:'test',symbols:[symbol],interval:'30s',valueType:'mcap',impulseCondition:{type:'impulse_fractal_swing',leftBars:2,rightBars:2,lookbackBars:100,minGainPercent:80,maxDurationBars:30,requireVolumeExpansion:false},entryConditionGroup:{mode:'all',conditions:[{type:'fib_retracement',zoneLow:.618,zoneHigh:.786}]},invalidationConditionGroup:{mode:'all',enabled:false,conditions:[]},exitConfig:{stopLoss:{type:'percent',value:10},takeProfit:{type:'risk_reward',ratio:2},closeAtEnd:true},positionConfig:{mode:'single_entry',maxEntries:1,maxConcurrentPositions:1,allowReentry:true,sizing:{type:'fixed_percent',value:1}},executionConfig:{initialCapital:100000,feePercent:.3,slippagePercent:1,buyTaxPercent:1,sellTaxPercent:1,fillMode:'current_bar_close'}};const r=evaluateWindow({id:1,config},[{symbol,candles:[]}],0,86400000);assert.equal(r.accountReturn,0);assert.equal(r.normalReturn,0);assert.equal(r.normalTrades,0);assert.equal(r.winRate,null);assert.equal(config.entryConditionGroup.enabled,undefined);});
 function fixture(){
  const symbols=[symbol,{chain:'sol',ca:'b',pairId:'b'}];
@@ -19,6 +20,14 @@ test('offline cursor reproduces reference account and normal-closed results',()=
  assert(reference.report.totalTrades>0);assert.equal(actual.accountReturn,reference.report.returnPercent);assert.equal(actual.accountMaxDrawdown,reference.report.maxDrawdownPercent);
  const normal=reference.trades.filter(t=>t.exitReason!=='end_of_backtest');assert.equal(actual.normalTrades,normal.length);assert.equal(actual.normalNet,normal.reduce((n,t)=>n+t.netPnl,0));assert.deepEqual(config,before);
  const byCa=new Map();for(const t of normal){const k=`${t.symbol.chain}:${t.symbol.ca}`;byCa.set(k,(byCa.get(k)||0)+t.netPnl);}assert.equal(actual.topCaPnl,Math.max(0,...byCa.values()));if(actual.topCaPnl>0)assert.equal(byCa.get(actual.topCaKey),actual.topCaPnl);else assert.equal(actual.topCaKey,null);
+});
+test('detailed audit counts entries occurring on synthetic gap fills',()=>{
+ const {config,inputs}=fixture();config.entryAfterSignal=true;config.entrySignals=inputs.map(p=>({chain:p.symbol.chain,ca:p.symbol.ca,signalTime:0}));
+ const reference=runBacktest(config,inputs);
+ const actual=evaluateWindow({id:'audit',config},inputs,0,502*30000,{warmupBars:0,detail:true});
+ const synthetic=reference.trades.filter(t=>!realCandleAt(inputs.find(p=>p.symbol.ca===t.symbol.ca).candles,t.entryTime));
+ assert.equal(actual.audit.syntheticEntryTrades,synthetic.length);
+ assert(Math.abs(actual.audit.syntheticEntryNetPnl-synthetic.reduce((n,t)=>n+t.netPnl,0))<1e-8);
 });
 test('historical warm-up updates indicators but never opens positions',()=>{
  const {config,inputs}=fixture(),actual=evaluateWindow({id:1,config},inputs,502*30000,600*30000,{warmupBars:1500});

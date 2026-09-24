@@ -16,6 +16,12 @@ export function assertLocalDatabase(options){
 export function canonical(value){if(Array.isArray(value))return value.map(canonical);if(value&&typeof value==='object')return Object.fromEntries(Object.keys(value).sort().filter(k=>value[k]!==undefined).map(k=>[k,canonical(value[k])]));return value;}
 export const ledgerHash=rows=>createHash('sha256').update(rows.map(r=>JSON.stringify(canonical(r))).sort().join('\n')).digest('hex');
 
+export function realCandleAt(candles,time){
+ let lo=0,hi=candles.length-1;
+ while(lo<=hi){const mid=(lo+hi)>>>1,value=candles[mid].time;if(value===time)return true;if(value<time)lo=mid+1;else hi=mid-1;}
+ return false;
+}
+
 /** Gap semantics match FrozenReader; only the previous close fills a gap. */
 export class LocalCandleReader{
  constructor(input,from,to,step){this.symbol=input.symbol;this.rows=input.candles.filter(c=>c.time>=from&&c.time<to);this.i=0;this.previous=undefined;this.step=step;}
@@ -62,7 +68,12 @@ export function evaluateWindow(candidate,inputs,from,to,{interval='30s',valueTyp
  drain();const r=engine.finish();assert.equal(r.openPositions.length,0);
  const normalReturn=normalNet/capital*100,topCaPnl=Math.max(0,...byCa.values());
  const topCaKey=topCaPnl>0?[...byCa].find(([,pnl])=>pnl===topCaPnl)?.[0]:null;
- const audit=detail?{fees,slippageCost,taxCost,buyEvents,averageTradeReturn:tradeReturnCount?tradeReturnSum/tradeReturnCount:null,byCa:Object.fromEntries(allByCa),tradeHash:ledgerHash(auditTrades),signalHash:ledgerHash(auditSignals)}:undefined;
+ const realByPool=detail?new Map(inputs.map(p=>[poolKey(p.symbol),p.candles])):undefined;
+ const syntheticEntryEvents=detail?auditSignals.filter(s=>(s.type==='entry'||s.type==='add')&&!realCandleAt(realByPool.get(poolKey(s.symbol))??[],s.time)).length:undefined;
+ const syntheticEntryTrades=detail?auditTrades.filter(t=>!realCandleAt(realByPool.get(poolKey(t.symbol))??[],t.entryTime)):undefined;
+ const audit=detail?{fees,slippageCost,taxCost,buyEvents,syntheticEntryEvents,syntheticEntryTrades:syntheticEntryTrades.length,
+  syntheticEntryNetPnl:syntheticEntryTrades.reduce((n,t)=>n+t.netPnl,0),averageTradeReturn:tradeReturnCount?tradeReturnSum/tradeReturnCount:null,
+  byCa:Object.fromEntries(allByCa),tradeHash:ledgerHash(auditTrades),signalHash:ledgerHash(auditSignals)}:undefined;
  return{id:candidate.id,from:new Date(from).toISOString(),toExclusive:new Date(to).toISOString(),accountReturn:r.returnPercent,normalReturn,netPnl:r.netPnl,normalNet,totalTrades:r.totalTrades,accountWinRate:r.totalTrades?r.winRate:null,normalTrades,winRate:normalTrades?wins/normalTrades:null,accountMaxDrawdown:r.maxDrawdownPercent,profitFactor:Number.isFinite(r.profitFactor)?r.profitFactor:null,excludedCount,excludedNet,topCaPnl,topCaKey,withoutBestCaNormalReturn:(normalNet-topCaPnl)/capital*100,syntheticBars:r.dataQuality.syntheticBars,processedBars:engine.s.processed,seconds:(performance.now()-started)/1000,...(detail?{audit}: {})};
 }
 

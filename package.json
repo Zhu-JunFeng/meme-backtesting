@@ -5,7 +5,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
-    "test:research": "node --test scripts/offline-strategy-research.test.mjs scripts/explore-strategy-neighborhood.test.mjs scripts/signal-gated-research.test.mjs scripts/cohort-research.test.mjs scripts/small-set-research.test.mjs scripts/tri-chain-stability.test.mjs scripts/expanded-signal-research.test.mjs",
+    "test:research": "node --test scripts/offline-strategy-research.test.mjs scripts/explore-strategy-neighborhood.test.mjs scripts/signal-gated-research.test.mjs scripts/cohort-research.test.mjs scripts/small-set-research.test.mjs scripts/tri-chain-stability.test.mjs scripts/expanded-signal-research.test.mjs scripts/all-signal-research.test.mjs",
     "dev:api": "pnpm --filter @meme/api dev",
     "dev:web": "pnpm --filter @meme/web dev",
     "dev:worker": "pnpm --filter @meme/worker dev",
