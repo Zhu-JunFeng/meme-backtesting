@@ -118,7 +118,7 @@ export class LiveController {
    const conflict=(await this.pool.query("SELECT id FROM live_runs WHERE id<>$1 AND mode='live' AND chain=$2 AND lower(wallet_address)=lower($3) LIMIT 1",[id,existing.chain,existing.wallet_address])).rows;
    if(conflict.length)throw new ConflictException('该链钱包已被其他实盘任务占用');
   }
-  if(!process.env.MEMEINFO_SIGNAL_TOKEN || !process.env.XXYY_TRADE_CHANNEL_TEMPLATE || !process.env.XXYY_TRADE_EVENT)throw new ConflictException('实时信号或成交订阅配置尚未完成');
+  if(!process.env.MEMEINFO_SIGNAL_TOKEN)throw new ConflictException('实时信号令牌尚未配置');
   const result=await this.pool.query("UPDATE live_runs SET status='running',started_at=COALESCE(started_at,now()),error_message=NULL,updated_at=now() WHERE id=$1 AND status IN ('paused','running') RETURNING *",[id]);
   if(!result.rowCount)throw new ConflictException('任务不是可启动状态');
   return publicRow(result.rows[0]);

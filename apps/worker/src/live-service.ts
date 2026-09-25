@@ -4,10 +4,10 @@ import WebSocket from 'ws';
 import type {Pool,PoolClient} from 'pg';
 import {LiveCandleAggregator,LiveEvaluator,detectImpulse,type ClosedMarketBar,type LiveDecision,type MarketTrade} from '@meme/engine';
 import type {Candle,StrategyConfig} from '@meme/domain';
-import {parseMarketTrade,parseProjectSignal,type ProjectSignal} from './live-input.js';
+import {parseMarketTrades,parseProjectSignal,resolveLivePool,type ProjectSignal} from './live-input.js';
 
 type Run={id:string;mode:'paper'|'live';chain:string;signal_source:string;interval:'30s'|'1m';value_type:'price'|'mcap';status:string;strategy_json:StrategyConfig;cash:string;realized_pnl:string;wallet_address:string|null;risk_json:any;started_at:Date};
-type Watch={run_id:string;chain:string;ca:string;pair_id:string;signal_time:string;state_json:any;last_candle_time:string|null};
+type Watch={run_id:string;chain:string;ca:string;pair_id:string;dex_id:string|null;signal_time:string;state_json:any;last_candle_time:string|null};
 type Context={run:Run;watch:Watch;evaluator:LiveEvaluator;ready:boolean};
 const watchKey=(r:string,c:string,a:string)=>`${r}:${c}:${a}`;
 const pairKey=(c:string,p:string)=>`${c}:${p.toLowerCase()}`;
@@ -56,7 +56,7 @@ export class LiveService {
  constructor(private readonly pool:Pool){}
  private enqueue(fn:()=>Promise<void>){this.chain=this.chain.then(fn).catch(e=>console.error('live service:',redact(e)));}
  async start(){
-  if(!process.env.MEMEINFO_SIGNAL_TOKEN||!process.env.XXYY_TRADE_CHANNEL_TEMPLATE||!process.env.XXYY_TRADE_EVENT){console.log('live service disabled: signal or trade feed configuration missing');return;}
+  if(!process.env.MEMEINFO_SIGNAL_TOKEN){console.log('live service disabled: signal feed token missing');return;}
   const client=await this.pool.connect();
   const locked=(await client.query('SELECT pg_try_advisory_lock(63920924) AS acquired')).rows[0]?.acquired;
   if(!locked){client.release();console.log('live service standby: another owner holds advisory lock');return;}
@@ -99,15 +99,16 @@ export class LiveService {
   if(!response.ok)throw new Error(`MemeInfo lookup HTTP ${response.status}`);
   const data=await response.json() as any;
   const item=(data?.data?.caListTokenList??[]).find((p:any)=>String(p.chain??'').toLowerCase()===signal.chain && (signal.chain==='sol'?p.token_address===signal.ca:String(p.token_address??'').toLowerCase()===signal.ca));
-  return typeof item?.main_pair_id==='string'&&item.main_pair_id?item.main_pair_id as string:undefined;
+  return resolveLivePool(item);
  }
  private async onSignal(signal:ProjectSignal){
   if(!this.feedHealthy||signal.time>Date.now()+5_000)return;
   const runs=(await this.pool.query("SELECT id,signal_source,started_at FROM live_runs WHERE status='running' AND chain=$1 AND started_at IS NOT NULL AND signal_source IN ('all',$2)",[signal.chain,signal.source])).rows;
   const relevant=runs.filter(r=>acceptsNewSignal(r,signal));
   if(!relevant.length)return;
-  const pairId=await this.lookup(signal);
-  if(!pairId){await this.pool.query("INSERT INTO live_events(chain,ca,kind,event_time,payload) VALUES($1,$2,'lookup_unmatched',$3,$4)",[signal.chain,signal.ca,signal.time,JSON.stringify({source:signal.source})]);return;}
+  const pool=await this.lookup(signal);
+  if(!pool){await this.pool.query("INSERT INTO live_events(chain,ca,kind,event_time,payload) VALUES($1,$2,'lookup_unmatched',$3,$4)",[signal.chain,signal.ca,signal.time,JSON.stringify({source:signal.source})]);return;}
+  const {pairId,dexId}=pool;
   const c=await this.pool.connect();
   try{await c.query('BEGIN');
    await c.query(`INSERT INTO token_signal_events(chain,ca,signal_source,detail_id,signal_time,source_signal,provenance)
@@ -117,8 +118,8 @@ export class LiveService {
     source_signal=CASE WHEN token_info.signal_time IS NULL OR EXCLUDED.signal_time<token_info.signal_time THEN EXCLUDED.source_signal ELSE token_info.source_signal END,
     signal_time=LEAST(COALESCE(token_info.signal_time,EXCLUDED.signal_time),EXCLUDED.signal_time)`,[signal.chain,signal.ca,pairId,signal.source,JSON.stringify(signal.identity),signal.time]);
    for(const r of relevant){
-    await c.query(`INSERT INTO live_watches(run_id,chain,ca,pair_id,signal_source,signal_key,signal_time)
-      VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING RETURNING run_id`,[r.id,signal.chain,signal.ca,pairId,signal.source,signal.key,signal.time]);
+    await c.query(`INSERT INTO live_watches(run_id,chain,ca,pair_id,dex_id,signal_source,signal_key,signal_time)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING run_id`,[r.id,signal.chain,signal.ca,pairId,dexId,signal.source,signal.key,signal.time]);
     await c.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'external_signal',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[r.id,signal.chain,signal.ca,pairId,`${r.id}:${signal.key}`,signal.time,JSON.stringify(signal.identity)]);
    }
    await c.query('COMMIT');
@@ -126,14 +127,15 @@ export class LiveService {
   await this.refresh();
  }
  private subscribe(watch:Watch){
-  const template=process.env.XXYY_TRADE_CHANNEL_TEMPLATE!;
-  if(!template.includes('{pairId}'))throw new Error('XXYY_TRADE_CHANNEL_TEMPLATE 必须包含 {pairId}');
-  const channel=template.replaceAll('{pairId}',watch.pair_id).replaceAll('{chain}',watch.chain),event=process.env.XXYY_TRADE_EVENT!;
+  if(!watch.dex_id){this.enqueue(async()=>{for(const ctx of this.watches.values())if(ctx.watch.chain===watch.chain&&ctx.watch.pair_id===watch.pair_id)await this.needsAttention(ctx,'主池缺少 XXYY DEX 标识，无法订阅真实成交');});return;}
+  const template=process.env.XXYY_TRADE_CHANNEL_TEMPLATE||'D_TOKEN_DETAIL_{dexId}_{pairId}';
+  if(!template.includes('{pairId}')||!template.includes('{dexId}'))throw new Error('XXYY_TRADE_CHANNEL_TEMPLATE 必须包含 {pairId} 和 {dexId}');
+  const channel=template.replaceAll('{pairId}',watch.pair_id).replaceAll('{dexId}',watch.dex_id).replaceAll('{chain}',watch.chain),event=process.env.XXYY_TRADE_EVENT||'NEW_TRADE';
   const socket=io(process.env.XXYY_PUSH_URL??'wss://web-push.xxyy.io/data',{transports:['websocket'],forceNew:true,reconnection:true});
   const key=pairKey(watch.chain,watch.pair_id);this.sockets.set(key,socket);
   socket.on('connect',()=>socket.emit('SUBSCRIBE',channel,{}));
   socket.on('disconnect',()=>this.enqueue(()=>this.feedInterrupted(watch.chain,watch.pair_id)));
-  socket.on(event,raw=>{const trade=parseMarketTrade(raw,{chain:watch.chain,ca:watch.ca,pairId:watch.pair_id});if(trade)this.enqueue(()=>this.onTrade(trade));});
+  socket.on(event,(raw,receivedChannel)=>{for(const trade of parseMarketTrades(raw,receivedChannel,channel,{chain:watch.chain,ca:watch.ca,pairId:watch.pair_id}))this.enqueue(()=>this.onTrade(trade));});
   socket.on('connect_error',error=>console.error('XXYY trade connection:',redact(error)));
  }
  private async feedInterrupted(chain:string,pairId:string){
