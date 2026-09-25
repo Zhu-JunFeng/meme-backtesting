@@ -5,7 +5,9 @@ import type {StrategyConfig} from '@meme/domain';
 
 type Mode='paper'|'live';
 type Risk={maxOrderNative:number;maxTotalNative:number;maxDailyLossUsd:number;maxPositions:number;tip:number;slippagePercent:number};
-type RequestBody={name:string;mode:Mode;chain:'sol'|'bsc'|'robin';interval:'30s'|'1m';valueType:'price'|'mcap';strategyVersionId:string;initialCapital:number;walletAddress?:string;risk?:Risk};
+export type LiveSignalSource='all'|'top_cluster_first_buy'|'fomo_new_project_expanded';
+type RequestBody={name:string;mode:Mode;chain:'sol'|'bsc'|'robin';interval:'30s'|'1m';valueType:'price'|'mcap';strategyVersionId:string;initialCapital:number;signalSource?:LiveSignalSource;clientKey?:string;walletAddress?:string;risk?:Risk};
+export const validLiveSignalSource=(value:unknown):value is LiveSignalSource=>['all','top_cluster_first_buy','fomo_new_project_expanded'].includes(String(value));
 const positive=(value:unknown)=>typeof value==='number'&&Number.isFinite(value)&&value>0;
 const mask=(wallet:string|null)=>wallet?`${wallet.slice(0,5)}…${wallet.slice(-4)}`:null;
 const publicRow=(r:any)=>({...r,wallet_address:mask(r.wallet_address),risk_json:r.mode==='live'?undefined:r.risk_json});
@@ -34,11 +36,13 @@ export class LiveController {
  @Post('live-admin/check') check(@Headers('x-live-admin-password') password:string,@Req() request:any){requireLiveAdmin(password,request);return {ok:true};}
  @Get('live-runs') async list(@Query('mode') mode?:string){
   if(mode && !['paper','live'].includes(mode))throw new BadRequestException('模式无效');
-  const rows=(await this.pool.query('SELECT id,name,mode,chain,interval,value_type,strategy_version_id,initial_capital,wallet_address,risk_json,status,cash,realized_pnl,started_at,heartbeat_at,error_message,created_at,updated_at FROM live_runs WHERE ($1::text IS NULL OR mode=$1) ORDER BY created_at DESC LIMIT 300',[mode??null])).rows;
+  const rows=(await this.pool.query('SELECT id,name,mode,chain,interval,value_type,signal_source,strategy_version_id,initial_capital,wallet_address,risk_json,status,cash,realized_pnl,started_at,heartbeat_at,error_message,created_at,updated_at FROM live_runs WHERE ($1::text IS NULL OR mode=$1) ORDER BY created_at DESC LIMIT 300',[mode??null])).rows;
   return rows.map(publicRow);
  }
  @Post('live-runs') async create(@Body() body:RequestBody,@Headers('x-live-admin-password') password:string,@Req() request:any){
   if(!body || !body.name?.trim() || !['paper','live'].includes(body.mode) || !['sol','bsc','robin'].includes(body.chain) || !['30s','1m'].includes(body.interval)||!['price','mcap'].includes(body.valueType)||!positive(body.initialCapital))throw new BadRequestException('实时任务配置无效');
+  if(!validLiveSignalSource(body.signalSource??'all'))throw new BadRequestException('信号来源无效');
+  if(body.clientKey!==undefined && (body.mode!=='paper'||typeof body.clientKey!=='string'||!(/^[a-z0-9][a-z0-9:_-]{7,127}$/).test(body.clientKey)))throw new BadRequestException('模拟盘幂等键无效');
   if(body.mode==='live'){
    requireLiveAdmin(password,request);validateRisk(body.risk);
    if(body.chain==='robin')throw new BadRequestException('ROBIN 实盘接口尚未核验，只能使用模拟盘');
@@ -55,9 +59,14 @@ export class LiveController {
   strategy.entryAfterSignal=true;
   if(body.mode==='live' && strategy.positionConfig.maxConcurrentPositions>body.risk!.maxPositions)throw new BadRequestException('实盘硬性最大持仓数不能小于策略最大持仓数');
   let result;
-  try{result=await this.pool.query(`INSERT INTO live_runs(name,mode,chain,interval,value_type,strategy_version_id,strategy_json,initial_capital,wallet_address,risk_json,cash)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$8) RETURNING *`,[body.name.trim(),body.mode,body.chain,body.interval,body.valueType,body.strategyVersionId,JSON.stringify(strategy),body.initialCapital,body.mode==='live'?body.walletAddress!.trim():null,body.mode==='live'?JSON.stringify(body.risk):null]);}
+  try{result=await this.pool.query(`INSERT INTO live_runs(name,mode,chain,interval,value_type,signal_source,client_key,strategy_version_id,strategy_json,initial_capital,wallet_address,risk_json,cash)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$10) ON CONFLICT (client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING *`,[body.name.trim(),body.mode,body.chain,body.interval,body.valueType,body.signalSource??'all',body.clientKey??null,body.strategyVersionId,JSON.stringify(strategy),body.initialCapital,body.mode==='live'?body.walletAddress!.trim():null,body.mode==='live'?JSON.stringify(body.risk):null]);}
   catch(error:any){if(error?.code==='23505')throw new ConflictException('该链钱包已绑定其他实盘任务，必须使用独立钱包');throw error;}
+  if(!result.rowCount){
+   const existing=(await this.pool.query('SELECT * FROM live_runs WHERE client_key=$1',[body.clientKey])).rows[0];
+   if(!existing||existing.mode!==body.mode||existing.chain!==body.chain||existing.interval!==body.interval||existing.value_type!==body.valueType||existing.signal_source!==(body.signalSource??'all')||existing.strategy_version_id!==body.strategyVersionId||Number(existing.initial_capital)!==body.initialCapital)throw new ConflictException('幂等键已用于不同配置');
+   return publicRow(existing);
+  }
   return publicRow(result.rows[0]);
  }
  @Post('live-runs/emergency-stop') async emergency(@Headers('x-live-admin-password') password:string,@Req() request:any){

@@ -6,11 +6,13 @@ import {LiveCandleAggregator,LiveEvaluator,detectImpulse,type ClosedMarketBar,ty
 import type {Candle,StrategyConfig} from '@meme/domain';
 import {parseMarketTrade,parseProjectSignal,type ProjectSignal} from './live-input.js';
 
-type Run={id:string;mode:'paper'|'live';chain:string;interval:'30s'|'1m';value_type:'price'|'mcap';status:string;strategy_json:StrategyConfig;cash:string;realized_pnl:string;wallet_address:string|null;risk_json:any;started_at:Date};
+type Run={id:string;mode:'paper'|'live';chain:string;signal_source:string;interval:'30s'|'1m';value_type:'price'|'mcap';status:string;strategy_json:StrategyConfig;cash:string;realized_pnl:string;wallet_address:string|null;risk_json:any;started_at:Date};
 type Watch={run_id:string;chain:string;ca:string;pair_id:string;signal_time:string;state_json:any;last_candle_time:string|null};
 type Context={run:Run;watch:Watch;evaluator:LiveEvaluator;ready:boolean};
 const watchKey=(r:string,c:string,a:string)=>`${r}:${c}:${a}`;
 const pairKey=(c:string,p:string)=>`${c}:${p.toLowerCase()}`;
+export const acceptsNewSignal=(run:{signal_source:string;started_at:Date|string},signal:ProjectSignal)=>
+ (run.signal_source==='all'||run.signal_source===signal.source)&&signal.time>new Date(run.started_at).getTime();
 const redact=(error:unknown)=>String(error).replace(/Bearer\s+[^\s]+/gi,'Bearer [redacted]').slice(0,300);
 const wait=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
 
@@ -101,11 +103,11 @@ export class LiveService {
  }
  private async onSignal(signal:ProjectSignal){
   if(!this.feedHealthy||signal.time>Date.now()+5_000)return;
+  const runs=(await this.pool.query("SELECT id,signal_source,started_at FROM live_runs WHERE status='running' AND chain=$1 AND started_at IS NOT NULL AND signal_source IN ('all',$2)",[signal.chain,signal.source])).rows;
+  const relevant=runs.filter(r=>acceptsNewSignal(r,signal));
+  if(!relevant.length)return;
   const pairId=await this.lookup(signal);
   if(!pairId){await this.pool.query("INSERT INTO live_events(chain,ca,kind,event_time,payload) VALUES($1,$2,'lookup_unmatched',$3,$4)",[signal.chain,signal.ca,signal.time,JSON.stringify({source:signal.source})]);return;}
-  const runs=(await this.pool.query("SELECT id,started_at FROM live_runs WHERE status='running' AND chain=$1 AND started_at IS NOT NULL",[signal.chain])).rows;
-  const relevant=runs.filter(r=>signal.time>new Date(r.started_at).getTime());
-  if(!relevant.length)return;
   const c=await this.pool.connect();
   try{await c.query('BEGIN');
    await c.query(`INSERT INTO token_signal_events(chain,ca,signal_source,detail_id,signal_time,source_signal,provenance)

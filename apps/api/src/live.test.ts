@@ -1,6 +1,6 @@
 import {afterEach,describe,expect,it} from 'vitest';
 import {randomBytes,scryptSync} from 'node:crypto';
-import {requireLiveAdmin,validateRisk} from './live.js';
+import {requireLiveAdmin,validateRisk,validLiveSignalSource} from './live.js';
 
 const previousHash=process.env.LIVE_ADMIN_PASSWORD_HASH;
 const previousMode=process.env.NODE_ENV;
@@ -10,6 +10,12 @@ afterEach(()=>{
 });
 
 describe('live order safety boundaries',()=>{
+ it('accepts only the two configured signal sources and legacy all',()=>{
+  expect(validLiveSignalSource('top_cluster_first_buy')).toBe(true);
+  expect(validLiveSignalSource('fomo_new_project_expanded')).toBe(true);
+  expect(validLiveSignalSource('all')).toBe(true);
+  expect(validLiveSignalSource('fomo_new_project')).toBe(false);
+ });
  it('requires an administrator secret and HTTPS in production',()=>{
   const salt=randomBytes(16).toString('hex');
   process.env.LIVE_ADMIN_PASSWORD_HASH=`${salt}:${scryptSync('correct-password',salt,64).toString('hex')}`;

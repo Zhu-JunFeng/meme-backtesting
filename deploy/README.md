@@ -26,3 +26,13 @@ apps/web/public/charting_library/
 实盘额外需要 `XXYY_API_KEY`、`LIVE_ADMIN_PASSWORD_HASH`（`salt:scrypt64_hex`）和可信 HTTPS 反向代理。目前部署的公开 HTTP `:5173` 仅提供脱敏只读视图，不发送管理员口令；生产 API 只监听本机。实盘仅支持 SOL/BSC，ROBIN 无已核实的 XXYY 下单接口。即使单独打开下单开关，也必须先完成模拟盘持续观察、真实成交/钱包/美元成本对账及小额人工验收；已提交或状态不明的订单会使任务进入“待人工处理”，不会自动重发或冒充已确认持仓。
 
 管理员口令哈希可在受控终端生成，原文不得写入仓库或部署日志；只保存哈希到 Secret。服务器密钥配置与公网 HTTPS 均未随本次代码提交自动开通。
+# 按信号来源隔离的模拟盘实验
+
+`live_runs.signal_source` 将模拟盘任务限制为一个 MemeInfo 来源。旧任务保持 `all` 兼容行为；新建页面要求明确选择来源。ROBIN `1m-E0345` 和 BSC `30s-E0119` 的两个来源分别创建暂停任务，不混合样本，不代表实盘稳定盈利。上线并核对策略版本后，显式运行：
+
+```sh
+node scripts/seed-profitable-paper-runs.mjs --api=https://YOUR_HOST/api
+node scripts/seed-profitable-paper-runs.mjs --api=https://YOUR_HOST/api --execute
+```
+
+脚本使用幂等键，重复执行不会重复建任务；它不会启动任务。必须先轮换已暴露的 MemeInfo 令牌，并只在服务器配置中保存新令牌，核验 XXYY 成交频道及事件字段，再逐个手动启动模拟盘。没有可信实时成交时，不应把暂停任务显示为已开始交易。

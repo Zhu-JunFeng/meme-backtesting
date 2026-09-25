@@ -10,7 +10,9 @@ const props=defineProps<{mode:'paper'|'live'}>();
 const templates=ref<any[]>([]),versions=ref<any[]>([]),runs=ref<any[]>([]),detail=ref<any>();
 const templateId=ref<string>(),versionId=ref<string>(),selectedRunId=ref<string>(),selectedWatch=ref<string>();
 const password=ref(''),authorized=ref(false),loading=ref(false),busy=ref(false),chartEpoch=ref(0);
-const form=ref({name:'',chain:'sol',interval:'30s',valueType:'mcap',initialCapital:1000,walletAddress:'',maxOrderNative:0.01,maxTotalNative:0.05,maxDailyLossUsd:20,maxPositions:1,tip:0.001,slippagePercent:5});
+const form=ref({name:'',chain:'sol',signalSource:'fomo_new_project_expanded',interval:'30s',valueType:'mcap',initialCapital:1000,walletAddress:'',maxOrderNative:0.01,maxTotalNative:0.05,maxDailyLossUsd:20,maxPositions:1,tip:0.001,slippagePercent:5});
+const signalSources=[{label:'FOMO 新项目（扩大信号）',value:'fomo_new_project_expanded'},{label:'Top Cluster 首次买入',value:'top_cluster_first_buy'}];
+function signalSourceText(value:string){return signalSources.find(x=>x.value===value)?.label??'全部来源（旧任务）';}
 const columns=[{title:'时间',dataIndex:'created_at',key:'created_at'},{title:'CA / 交易池',dataIndex:'ca',key:'ca'},{title:'方向',dataIndex:'side',key:'side'},{title:'原因',dataIndex:'reason',key:'reason'},{title:'状态',dataIndex:'status',key:'status'},{title:'成交价',dataIndex:'fill_price',key:'fill_price'},{title:'数量',dataIndex:'quantity',key:'quantity'}];
 const current=computed(()=>runs.value.find(r=>r.id===selectedRunId.value));
 const secureAdminContext=window.location.protocol==='https:'||['localhost','127.0.0.1'].includes(window.location.hostname);
@@ -43,7 +45,7 @@ async function create(){
  if(real&&!authorized.value)return message.warning('先验证管理员口令');
  busy.value=true;
  try{
-  const body:any={name:form.value.name.trim()||`${real?'实盘':'模拟盘'} · ${form.value.chain.toUpperCase()}`,mode:props.mode,chain:form.value.chain,interval:form.value.interval,valueType:form.value.valueType,strategyVersionId:versionId.value,initialCapital:Number(form.value.initialCapital)};
+  const body:any={name:form.value.name.trim()||`${real?'实盘':'模拟盘'} · ${form.value.chain.toUpperCase()}`,mode:props.mode,chain:form.value.chain,signalSource:form.value.signalSource,interval:form.value.interval,valueType:form.value.valueType,strategyVersionId:versionId.value,initialCapital:Number(form.value.initialCapital)};
   if(real){body.walletAddress=form.value.walletAddress.trim();body.risk={maxOrderNative:Number(form.value.maxOrderNative),maxTotalNative:Number(form.value.maxTotalNative),maxDailyLossUsd:Number(form.value.maxDailyLossUsd),maxPositions:Number(form.value.maxPositions),tip:Number(form.value.tip),slippagePercent:Number(form.value.slippagePercent)};}
   const created=(await api.post('/live-runs',body,{headers:adminHeader()})).data;
   message.success('任务已创建，默认暂停；检查配置后手动启动');await refresh();selectedRunId.value=created.id;await loadDetail(created.id);
@@ -72,7 +74,7 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
 <template>
 <div class="live-workspace">
  <a-alert v-if="real" type="warning" show-icon class="live-notice" message="实盘默认禁止真实下单" description="需在服务器单独启用、配置 XXYY API Key、可信行情订阅和 HTTPS；当前仅支持 SOL/BSC。ROBIN 暂只可在模拟盘运行。订单与实际持仓未核对时会暂停。" />
- <a-alert v-else type="info" show-icon class="live-notice" message="模拟盘使用实时成交，不会连接交易钱包" description="只接收任务启动后的新信号；策略在 30s/1m K 线收盘后决策，模拟成交取决策后的下一笔有效交易。" />
+ <a-alert v-else type="info" show-icon class="live-notice" message="模拟盘使用实时成交，不会连接交易钱包" description="每个任务只接收指定来源、启动后的新信号；策略在 K 线收盘后决策，模拟成交取决策后的下一笔有效交易。历史收益不代表模拟盘或未来收益。" />
  <section v-if="real" class="live-auth" aria-label="实盘管理员验证"><div><strong>实盘管理员</strong><p>{{secureAdminContext?'口令只保留在当前页面内存中，不保存到浏览器或数据库。':'当前访问不是 HTTPS，仅提供脱敏只读视图；请先配置 HTTPS。'}}</p></div><a-input-password v-model:value="password" :disabled="!secureAdminContext" autocomplete="off" placeholder="管理员口令" aria-label="实盘管理员口令" @press-enter="checkPassword" /><a-button :type="authorized?'default':'primary'" :disabled="!secureAdminContext" @click="checkPassword">{{ authorized?'已验证 · 重新验证':'验证口令' }}</a-button><a-button danger :disabled="!authorized||busy" @click="emergency">紧急停止全部实盘任务</a-button></section>
  <div class="live-layout">
   <section class="live-create" aria-label="创建实时任务"><div class="live-section-head"><h2>新建{{real?'实盘':'模拟盘'}}任务</h2><span>创建后默认暂停</span></div>
@@ -80,6 +82,7 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
     <a-form-item label="任务名称"><a-input v-model:value="form.name" :placeholder="`${real?'实盘':'模拟盘'} · ${form.chain.toUpperCase()}`" /></a-form-item>
     <a-form-item label="策略模板"><a-select v-model:value="templateId" :options="templates.map(t=>({label:t.name,value:t.id}))" placeholder="选择策略模板" /></a-form-item>
     <a-form-item label="不可变版本"><a-select v-model:value="versionId" :options="versions.map(v=>({label:`v${v.version}`,value:v.id}))" placeholder="选择版本" /></a-form-item>
+    <a-form-item label="外部信号来源" extra="按来源隔离监控；不追收启动前的信号。"><a-select v-model:value="form.signalSource" :options="signalSources" /></a-form-item>
     <div class="live-form-row"><a-form-item label="链"><a-select v-model:value="form.chain" :options="(real?['sol','bsc']:['sol','bsc','robin']).map(x=>({label:x.toUpperCase(),value:x}))" /></a-form-item><a-form-item label="周期"><a-select v-model:value="form.interval" :options="[{label:'30s',value:'30s'},{label:'1m',value:'1m'}]" /></a-form-item></div>
     <div class="live-form-row"><a-form-item label="判断维度"><a-select v-model:value="form.valueType" :options="[{label:'市值',value:'mcap'},{label:'价格',value:'price'}]" /></a-form-item><a-form-item :label="real?'额度基准（USD）':'初始资金（USD）'"><a-input-number v-model:value="form.initialCapital" :min="1" :precision="2" /></a-form-item></div>
     <template v-if="real"><a-form-item label="专用 XXYY 钱包地址"><a-input v-model:value="form.walletAddress" placeholder="每条链、每个策略实例使用独立钱包" autocomplete="off" /></a-form-item>
@@ -92,10 +95,10 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
   </section>
   <section class="live-history" aria-label="实时任务列表"><div class="live-section-head"><h2>{{real?'实盘':'模拟盘'}}任务</h2><a-button size="small" :loading="loading" @click="refresh">刷新</a-button></div>
    <a-empty v-if="!runs.length" description="还没有任务。先选择策略版本，创建后再启动监控。" />
-   <div v-else class="live-run-list"><button v-for="r in runs" :key="r.id" class="live-run-row" :class="{selected:selectedRunId===r.id}" @click="selectedRunId=r.id"><span><strong>{{r.name}}</strong><small>{{r.chain.toUpperCase()}} · {{r.interval}} · {{r.value_type==='mcap'?'市值':'价格'}} · {{beijingTime(r.created_at)}}</small></span><a-tag :color="statusColor(r.status)">{{statusText(r.status)}}</a-tag></button></div>
+   <div v-else class="live-run-list"><button v-for="r in runs" :key="r.id" class="live-run-row" :class="{selected:selectedRunId===r.id}" @click="selectedRunId=r.id"><span><strong>{{r.name}}</strong><small>{{r.chain.toUpperCase()}} · {{r.interval}} · {{r.value_type==='mcap'?'市值':'价格'}} · {{signalSourceText(r.signal_source)}} · {{beijingTime(r.created_at)}}</small></span><a-tag :color="statusColor(r.status)">{{statusText(r.status)}}</a-tag></button></div>
   </section>
  </div>
- <section v-if="detail" class="live-detail" aria-label="实时任务详情"><div class="live-section-head"><div><h2>{{detail.run.name}}</h2><p>{{detail.run.chain.toUpperCase()}} · {{detail.run.interval}} · {{detail.run.value_type==='mcap'?'市值':'价格'}} · 仅新信号</p></div><a-tag :color="statusColor(detail.run.status)">{{statusText(detail.run.status)}}</a-tag></div>
+ <section v-if="detail" class="live-detail" aria-label="实时任务详情"><div class="live-section-head"><div><h2>{{detail.run.name}}</h2><p>{{detail.run.chain.toUpperCase()}} · {{detail.run.interval}} · {{detail.run.value_type==='mcap'?'市值':'价格'}} · {{signalSourceText(detail.run.signal_source)}} · 仅新信号</p></div><a-tag :color="statusColor(detail.run.status)">{{statusText(detail.run.status)}}</a-tag></div>
   <a-alert v-if="detail.run.error_message" type="warning" show-icon :message="detail.run.error_message" class="live-notice" />
   <div class="live-summary"><span>已监控项目 <strong>{{detail.watches.length}}</strong></span><span>模拟现金／额度基准 <strong>{{formatNumber(detail.run.cash)}}</strong></span><span>已实现盈亏 <strong :class="valueTone(detail.run.realized_pnl)">{{signedValue(detail.run.realized_pnl)}}</strong></span><span>最近心跳 <strong>{{beijingTime(detail.run.heartbeat_at)}}</strong></span></div>
   <div class="live-actions"><a-button type="primary" :disabled="busy||detail.run.status==='running'||detail.run.status==='stopped'||(real&&!authorized)" @click="action(detail.run.id,'start')">启动</a-button><a-button :disabled="busy||detail.run.status!=='running'||(real&&!authorized)" @click="action(detail.run.id,'pause')">暂停</a-button><a-button danger :disabled="busy||detail.run.status==='stopped'||(real&&!authorized)" @click="action(detail.run.id,'stop')">停止</a-button><span v-if="real">停止不代表平仓；已提交订单与钱包仓位必须单独核对。</span></div>
