@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {computed,onBeforeUnmount,onMounted,ref,watch} from 'vue';
+import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch} from 'vue';
 import {message,Modal} from 'ant-design-vue';
 import {api} from '../api';
 import {beijingTime} from '../time';
@@ -10,6 +10,7 @@ const props=defineProps<{mode:'paper'|'live'}>();
 const templates=ref<any[]>([]),versions=ref<any[]>([]),runs=ref<any[]>([]),detail=ref<any>();
 const templateId=ref<string>(),versionId=ref<string>(),selectedRunId=ref<string>(),selectedWatch=ref<string>();
 const password=ref(''),authorized=ref(false),loading=ref(false),busy=ref(false),chartEpoch=ref(0);
+const detailElement=ref<HTMLElement|null>(null);
 const form=ref({name:'',chain:'sol',signalSource:'fomo_new_project_expanded',interval:'30s',valueType:'mcap',initialCapital:1000,walletAddress:'',maxOrderNative:0.01,maxTotalNative:0.05,maxDailyLossUsd:20,maxPositions:1,tip:0.001,slippagePercent:5});
 const signalSources=[{label:'FOMO 新项目（扩大信号）',value:'fomo_new_project_expanded'},{label:'Top Cluster 首次买入',value:'top_cluster_first_buy'}];
 function signalSourceText(value:string){return signalSources.find(x=>x.value===value)?.label??'全部来源（旧任务）';}
@@ -66,7 +67,16 @@ async function emergency(){
  catch(e:any){message.error(e.response?.data?.message??'紧急停止失败');}finally{busy.value=false;}
 }
 watch(templateId,()=>void loadVersions().catch(()=>message.error('策略版本加载失败')));
-watch(selectedRunId,id=>{detail.value=undefined;selectedWatch.value=undefined;if(id)void loadDetail(id).catch(()=>message.error('任务详情加载失败'));});
+watch(selectedRunId,async id=>{
+ detail.value=undefined;selectedWatch.value=undefined;
+ if(!id)return;
+ try{
+  await loadDetail(id);
+  await nextTick();
+  if(id===selectedRunId.value&&window.matchMedia('(max-width: 900px)').matches)
+   detailElement.value?.scrollIntoView({block:'start',behavior:window.matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});
+ }catch{message.error('任务详情加载失败');}
+});
 onMounted(async()=>{try{templates.value=(await api.get('/strategy-templates')).data.filter((t:any)=>t.status==='active');templateId.value=templates.value[0]?.id;await refresh();timer=window.setInterval(()=>void refresh(),5000);}catch{message.error('实时工作台初始化失败');}});
 onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.value=false;request++;});
 </script>
@@ -98,7 +108,7 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
    <div v-else class="live-run-list"><button v-for="r in runs" :key="r.id" class="live-run-row" :class="{selected:selectedRunId===r.id}" @click="selectedRunId=r.id"><span><strong>{{r.name}}</strong><small>{{r.chain.toUpperCase()}} · {{r.interval}} · {{r.value_type==='mcap'?'市值':'价格'}} · {{signalSourceText(r.signal_source)}} · {{beijingTime(r.created_at)}}</small></span><a-tag :color="statusColor(r.status)">{{statusText(r.status)}}</a-tag></button></div>
   </section>
  </div>
- <section v-if="detail" class="live-detail" aria-label="实时任务详情"><div class="live-section-head"><div><h2>{{detail.run.name}}</h2><p>{{detail.run.chain.toUpperCase()}} · {{detail.run.interval}} · {{detail.run.value_type==='mcap'?'市值':'价格'}} · {{signalSourceText(detail.run.signal_source)}} · 仅新信号</p></div><a-tag :color="statusColor(detail.run.status)">{{statusText(detail.run.status)}}</a-tag></div>
+ <section v-if="detail" ref="detailElement" class="live-detail" aria-label="实时任务详情"><div class="live-section-head"><div><h2>{{detail.run.name}}</h2><p>{{detail.run.chain.toUpperCase()}} · {{detail.run.interval}} · {{detail.run.value_type==='mcap'?'市值':'价格'}} · {{signalSourceText(detail.run.signal_source)}} · 仅新信号</p></div><a-tag :color="statusColor(detail.run.status)">{{statusText(detail.run.status)}}</a-tag></div>
   <a-alert v-if="detail.run.error_message" type="warning" show-icon :message="detail.run.error_message" class="live-notice" />
   <div class="live-summary"><span>已监控项目 <strong>{{detail.watches.length}}</strong></span><span>模拟现金／额度基准 <strong>{{formatNumber(detail.run.cash)}}</strong></span><span>已实现盈亏 <strong :class="valueTone(detail.run.realized_pnl)">{{signedValue(detail.run.realized_pnl)}}</strong></span><span>最近心跳 <strong>{{beijingTime(detail.run.heartbeat_at)}}</strong></span></div>
   <div class="live-actions"><a-button type="primary" :disabled="busy||detail.run.status==='running'||detail.run.status==='stopped'||(real&&!authorized)" @click="action(detail.run.id,'start')">启动</a-button><a-button :disabled="busy||detail.run.status!=='running'||(real&&!authorized)" @click="action(detail.run.id,'pause')">暂停</a-button><a-button danger :disabled="busy||detail.run.status==='stopped'||(real&&!authorized)" @click="action(detail.run.id,'stop')">停止</a-button><span v-if="real">停止不代表平仓；已提交订单与钱包仓位必须单独核对。</span></div>
