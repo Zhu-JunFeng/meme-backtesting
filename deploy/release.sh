@@ -9,7 +9,6 @@ if [ "$legacy" != "0" ]; then
   echo "发布暂停：存在 $legacy 个无检查点的旧任务。请先盘点并明确处理，不自动重新执行。"
   exit 1
 fi
-docker run --rm --network host --env-file deploy/.env -v "$PWD:/app" -w /app postgres:18-alpine sh -ec 'for migration in apps/api/migrations/*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"; done'
 docker build -f deploy/Dockerfile.api -t meme-backtesting-api .
 docker build -f deploy/Dockerfile.worker -t meme-backtesting-worker .
 docker build -f deploy/Dockerfile.web -t meme-backtesting-web .
@@ -27,7 +26,19 @@ if [ "$legacy" != "0" ]; then
 fi
 # Grace period lets the executor finish one timestamp and atomically checkpoint before exit.
 for service in meme-backtesting-worker meme-backtesting-api meme-backtesting-web; do
-  if docker inspect "$service" >/dev/null 2>&1; then docker stop --time 90 "$service"; docker rm "$service"; fi
+  if docker inspect "$service" >/dev/null 2>&1; then docker stop --time 90 "$service"; fi
+done
+# Migrate only after the old Worker exits. Otherwise it could observe the new
+# running status for legacy attention tasks before the recovery code is live.
+if ! docker run --rm --network host --env-file deploy/.env -v "$PWD:/app" -w /app postgres:18-alpine sh -ec 'for migration in apps/api/migrations/*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"; done'; then
+  for service in meme-backtesting-api meme-backtesting-worker meme-backtesting-web; do
+    if docker inspect "$service" >/dev/null 2>&1; then docker start "$service"; fi
+  done
+  echo '发布失败：数据库迁移未完成，已尝试恢复原容器。'
+  exit 1
+fi
+for service in meme-backtesting-worker meme-backtesting-api meme-backtesting-web; do
+  if docker inspect "$service" >/dev/null 2>&1; then docker rm "$service"; fi
 done
 docker run -d --name meme-backtesting-api --restart unless-stopped --network host --env-file deploy/.env -e NODE_ENV=production -e API_BIND_HOST=127.0.0.1 -e BACKTEST_QUEUE_PREFIX=meme-production-v3 meme-backtesting-api:latest
 docker run -d --name meme-backtesting-worker --restart unless-stopped --stop-timeout 90 --network host --env-file deploy/.env -e NODE_ENV=production -e BACKTEST_QUEUE_PREFIX=meme-production-v3 meme-backtesting-worker:latest

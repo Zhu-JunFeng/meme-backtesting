@@ -26,6 +26,7 @@ describe('external realtime data validation',()=>{
  });
  it('derives Socket.IO dexId from the main pair rather than display name',()=>{
   expect(resolveLivePool({main_pair_id:'0xPAIR',dex_name:'Flap.sh',project_meta:{outer_pair_address:'0xpair',outer_dex:'pan2'}})).toEqual({pairId:'0xPAIR',dexId:'pan2'});
+  expect(resolveLivePool({main_pair_id:'0xPAIR',current_market_cap:'50000',project_meta:{outer_pair_address:'0xpair',outer_dex:'pan2'}})).toEqual({pairId:'0xPAIR',dexId:'pan2',marketCap:50_000});
   expect(resolveLivePool({main_pair_id:'0xPAIR',dex_name:'Pons',project_meta:{outer_pair_address:'0xpair',outer_dex:'uni4'}})).toEqual({pairId:'0xPAIR',dexId:'uni4'});
   expect(resolveLivePool({main_pair_id:'0xPAIR',project_meta:{outer_pair_address:'0xother',outer_dex:'pan2'}})).toBeUndefined();
  });

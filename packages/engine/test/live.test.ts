@@ -14,15 +14,42 @@ describe('live candle aggregation',()=>{
   a.accept(t('c',120_000,4));a.flush(150_000);
   expect(bars.filter(b=>b.interval==='30s'&&b.type==='price').map(b=>b.candle.time)).toEqual([30_000,120_000]);
  });
- it('rejects late trades and cannot invent market cap',()=>{
+ it('never rewrites finalized bars, while correcting still-open buckets',()=>{
   const bars:any[]=[];const a=new LiveCandleAggregator(bar=>bars.push(bar));
   a.accept({...t('a',0,1),mcap:undefined});a.flush(30_000);
-  expect(a.accept({...t('b',10_000,9),mcap:undefined})).toBe(false);
+  expect(a.acceptDetailed({...t('b',10_000,9),mcap:undefined})).toMatchObject({accepted:true,reason:undefined}); // 1m remains open
   expect(a.accept({...t('c',35_000,3),mcap:undefined})).toBe(true);
-  expect(a.accept({...t('d',34_000,9),mcap:undefined})).toBe(false);
+  expect(a.acceptDetailed({...t('d',34_000,9),mcap:undefined})).toMatchObject({accepted:true,late:true});
   a.flush(60_000);
   expect(bars.filter(b=>b.type==='mcap')).toHaveLength(0);
   expect(bars.find(b=>b.type==='price').candle.close).toBe(1);
+  expect(bars.find(b=>b.interval==='30s'&&b.candle.time===30_000).candle).toMatchObject({open:9,close:3,high:9,volume:20});
+  expect(a.acceptDetailed({...t('e',34_500,7),mcap:undefined}).reason).toBe('closed');
+ });
+ it('drops old cross-bucket ticks at the 30-second boundary and sorts equal-time IDs',()=>{
+  const bars:any[]=[];const a=new LiveCandleAggregator(bar=>bars.push(bar));
+  a.accept(t('b',31_000,2));a.accept(t('a',31_000,1));a.accept(t('c',31_000,3));
+  a.accept(t('later',61_000,4));
+  expect(a.acceptDetailed(t('old',29_999,9))).toMatchObject({accepted:false,late:true,reason:'too_old'});
+  a.flush(60_000);
+  expect(bars.find(b=>b.interval==='30s'&&b.type==='price').candle).toMatchObject({open:1,close:3});
+ });
+ it('does not reopen already closed buckets after a reconnect or restart backfill',()=>{
+  const bars:any[]=[];const a=new LiveCandleAggregator(bar=>bars.push(bar));
+  a.accept(t('first',30_000,2));a.discardPair('sol','PAIR');
+  a.markClosedThrough('sol','CA','PAIR',90_000);
+  expect(a.acceptDetailed(t('late',59_999,8))).toMatchObject({accepted:false,reason:'closed'});
+  expect(a.accept(t('fresh',90_000,3))).toBe(true);
+  a.flush(120_000);
+  expect(bars.filter(b=>b.interval==='30s'&&b.type==='price')).toHaveLength(1);
+ });
+ it('allows a >30s late tick only inside the same still-open 1m bucket',()=>{
+  const bars:any[]=[];const a=new LiveCandleAggregator(bar=>bars.push(bar));
+  a.accept(t('new',59_000,5));
+  expect(a.acceptDetailed(t('old',1_000,2))).toMatchObject({accepted:true,late:true});
+  a.flush(60_000);
+  expect(bars.find(b=>b.interval==='1m'&&b.type==='price').candle).toMatchObject({open:2,close:5,volume:20});
+  expect(bars.filter(b=>b.interval==='30s'&&b.type==='price')).toHaveLength(1);
  });
 });
 

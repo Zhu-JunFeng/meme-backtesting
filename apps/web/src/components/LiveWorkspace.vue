@@ -20,8 +20,9 @@ const secureAdminContext=window.location.protocol==='https:'||['localhost','127.
 const chosenWatch=computed(()=>detail.value?.watches?.find((w:any)=>`${w.chain}:${w.ca}:${w.pair_id}`===selectedWatch.value));
 const chartSymbol=computed(()=>chosenWatch.value?`${chosenWatch.value.chain}:${chosenWatch.value.ca}:${chosenWatch.value.pair_id}:${detail.value.run.value_type}`:'');
 const real=props.mode==='live';let timer:number|undefined,request=0;
-function statusText(s:string){return ({paused:'已暂停',running:'运行中',stopped:'已停止',attention:'待人工处理'} as Record<string,string>)[s]??s;}
-function statusColor(s:string){return ({paused:'default',running:'green',stopped:'default',attention:'red'} as Record<string,string>)[s]??'default';}
+function statusText(s:string){return ({paused:'已暂停',running:'运行中',stopped:'已停止'} as Record<string,string>)[s]??s;}
+function statusColor(s:string){return ({paused:'default',running:'green',stopped:'default'} as Record<string,string>)[s]??'default';}
+function feedText(s:string){return ({connecting:'连接中',recovering:'补行情',connected:'行情正常',paused:'已暂停'} as Record<string,string>)[s]??'连接中';}
 function adminHeader(){return real?{'x-live-admin-password':password.value}:{};}
 async function loadVersions(){if(!templateId.value)return;versions.value=(await api.get(`/strategy-templates/${templateId.value}/versions`)).data;versionId.value=templates.value.find(t=>t.id===templateId.value)?.currentVersionId??versions.value[0]?.id;}
 async function refresh(){
@@ -83,7 +84,7 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
 
 <template>
 <div class="live-workspace">
- <a-alert v-if="real" type="warning" show-icon class="live-notice" message="实盘默认禁止真实下单" description="需在服务器单独启用、配置 XXYY API Key、可信行情订阅和 HTTPS；当前仅支持 SOL/BSC。ROBIN 暂只可在模拟盘运行。订单与实际持仓未核对时会暂停。" />
+ <a-alert v-if="real" type="warning" show-icon class="live-notice" message="实盘默认禁止真实下单" description="需在服务器单独启用、配置 XXYY API Key、可信行情订阅和 HTTPS；当前仅支持 SOL/BSC。订单结果未核实时任务仍运行，但冻结新订单，绝不盲目重发。" />
  <a-alert v-else type="info" show-icon class="live-notice" message="模拟盘使用实时成交，不会连接交易钱包" description="每个任务只接收指定来源、启动后的新信号；策略在 K 线收盘后决策，模拟成交取决策后的下一笔有效交易。历史收益不代表模拟盘或未来收益。" />
  <section v-if="real" class="live-auth" aria-label="实盘管理员验证"><div><strong>实盘管理员</strong><p>{{secureAdminContext?'口令只保留在当前页面内存中，不保存到浏览器或数据库。':'当前访问不是 HTTPS，仅提供脱敏只读视图；请先配置 HTTPS。'}}</p></div><a-input-password v-model:value="password" :disabled="!secureAdminContext" autocomplete="off" placeholder="管理员口令" aria-label="实盘管理员口令" @press-enter="checkPassword" /><a-button :type="authorized?'default':'primary'" :disabled="!secureAdminContext" @click="checkPassword">{{ authorized?'已验证 · 重新验证':'验证口令' }}</a-button><a-button danger :disabled="!authorized||busy" @click="emergency">紧急停止全部实盘任务</a-button></section>
  <div class="live-layout">
@@ -105,17 +106,19 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
   </section>
   <section class="live-history" aria-label="实时任务列表"><div class="live-section-head"><h2>{{real?'实盘':'模拟盘'}}任务</h2><a-button size="small" :loading="loading" @click="refresh">刷新</a-button></div>
    <a-empty v-if="!runs.length" description="还没有任务。先选择策略版本，创建后再启动监控。" />
-   <div v-else class="live-run-list"><button v-for="r in runs" :key="r.id" class="live-run-row" :class="{selected:selectedRunId===r.id}" @click="selectedRunId=r.id"><span><strong>{{r.name}}</strong><small>{{r.chain.toUpperCase()}} · {{r.interval}} · {{r.value_type==='mcap'?'市值':'价格'}} · {{signalSourceText(r.signal_source)}} · {{beijingTime(r.created_at)}}</small></span><a-tag :color="statusColor(r.status)">{{statusText(r.status)}}</a-tag></button></div>
+   <div v-else class="live-run-list"><button v-for="r in runs" :key="r.id" class="live-run-row" :class="{selected:selectedRunId===r.id}" @click="selectedRunId=r.id"><span><strong>{{r.name}}</strong><small>{{r.chain.toUpperCase()}} · {{r.interval}} · {{r.value_type==='mcap'?'市值':'价格'}} · {{signalSourceText(r.signal_source)}} · {{Number(r.active_ca_count||0)}}/20 CA · {{beijingTime(r.created_at)}}</small></span><a-tag :color="statusColor(r.status)">{{statusText(r.status)}}</a-tag></button></div>
   </section>
  </div>
  <section v-if="detail" ref="detailElement" class="live-detail" aria-label="实时任务详情"><div class="live-section-head"><div><h2>{{detail.run.name}}</h2><p>{{detail.run.chain.toUpperCase()}} · {{detail.run.interval}} · {{detail.run.value_type==='mcap'?'市值':'价格'}} · {{signalSourceText(detail.run.signal_source)}} · 仅新信号</p></div><a-tag :color="statusColor(detail.run.status)">{{statusText(detail.run.status)}}</a-tag></div>
   <a-alert v-if="detail.run.error_message" type="warning" show-icon :message="detail.run.error_message" class="live-notice" />
-  <div class="live-summary"><span>已监控项目 <strong>{{detail.watches.length}}</strong></span><span>模拟现金／额度基准 <strong>{{formatNumber(detail.run.cash)}}</strong></span><span>已实现盈亏 <strong :class="valueTone(detail.run.realized_pnl)">{{signedValue(detail.run.realized_pnl)}}</strong></span><span>最近心跳 <strong>{{beijingTime(detail.run.heartbeat_at)}}</strong></span></div>
+  <a-alert v-if="detail.run.execution_hold_reason" type="warning" show-icon :message="`订单核验中：${detail.run.execution_hold_reason}`" description="任务保持运行，但所有新订单已冻结；未知订单不会自动重发。" class="live-notice" />
+  <div class="live-summary"><span>活动 CA <strong>{{detail.run.active_ca_count}} / 20</strong></span><span>行情状态 <strong>{{feedText(detail.run.feed_state)}}</strong></span><span>模拟现金／额度基准 <strong>{{formatNumber(detail.run.cash)}}</strong></span><span>已实现盈亏 <strong :class="valueTone(detail.run.realized_pnl)">{{signedValue(detail.run.realized_pnl)}}</strong></span><span>最近心跳 <strong>{{beijingTime(detail.run.heartbeat_at)}}</strong></span><span>最近信号 <strong>{{beijingTime(detail.run.last_signal_at,true)}}</strong></span><span>最近成交 <strong>{{beijingTime(detail.run.last_trade_at,true)}}</strong></span><span>重连 / 乱序 / 丢弃 <strong>{{detail.run.reconnect_count}} / {{detail.run.late_trade_count}} / {{detail.run.dropped_trade_count}}</strong></span></div>
+  <p v-if="detail.run.feed_reason" class="live-context">行情提示：{{detail.run.feed_reason}}</p>
   <div class="live-actions"><a-button type="primary" :disabled="busy||detail.run.status==='running'||detail.run.status==='stopped'||(real&&!authorized)" @click="action(detail.run.id,'start')">启动</a-button><a-button :disabled="busy||detail.run.status!=='running'||(real&&!authorized)" @click="action(detail.run.id,'pause')">暂停</a-button><a-button danger :disabled="busy||detail.run.status==='stopped'||(real&&!authorized)" @click="action(detail.run.id,'stop')">停止</a-button><span v-if="real">停止不代表平仓；已提交订单与钱包仓位必须单独核对。</span></div>
   <a-divider orientation="left">监控项目与成交</a-divider>
   <a-empty v-if="!detail.watches.length" description="等待符合来源与链筛选的新信号；历史信号不会追加入场。" />
   <template v-else><div class="live-watch-picker"><label for="live-watch">项目 / 主池</label><a-select id="live-watch" v-model:value="selectedWatch" show-search option-filter-prop="label" :options="detail.watches.map((w:any)=>({value:`${w.chain}:${w.ca}:${w.pair_id}`,label:`${w.chain.toUpperCase()} · ${w.ca} · ${w.pair_id}`}))" /><a-button @click="chartEpoch++">刷新 K 线</a-button></div>
-   <p v-if="chosenWatch" class="live-context">首次监控 {{beijingTime(chosenWatch.signal_time,true)}} · {{chosenWatch.signal_source}} · {{chosenWatch.status}}</p>
+   <p v-if="chosenWatch" class="live-context">首次监控 {{beijingTime(chosenWatch.signal_time,true)}} · {{chosenWatch.signal_source}} · {{chosenWatch.status}} · 市值 {{chosenWatch.current_mcap==null?'未知':formatNumber(chosenWatch.current_mcap)}} USD <span v-if="chosenWatch.recovery_reason">· {{chosenWatch.recovery_reason}}</span></p>
    <TradingViewChart v-if="chartSymbol" :key="`${chartSymbol}:${chartEpoch}`" :symbol="chartSymbol" :interval="detail.run.interval" :live-run-id="detail.run.id" />
   </template>
   <a-divider orientation="left">订单与成交</a-divider>

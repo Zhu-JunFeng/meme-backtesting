@@ -36,7 +36,9 @@ export class LiveController {
  @Post('live-admin/check') check(@Headers('x-live-admin-password') password:string,@Req() request:any){requireLiveAdmin(password,request);return {ok:true};}
  @Get('live-runs') async list(@Query('mode') mode?:string){
   if(mode && !['paper','live'].includes(mode))throw new BadRequestException('模式无效');
-  const rows=(await this.pool.query('SELECT id,name,mode,chain,interval,value_type,signal_source,strategy_version_id,initial_capital,wallet_address,risk_json,status,cash,realized_pnl,started_at,heartbeat_at,error_message,created_at,updated_at FROM live_runs WHERE ($1::text IS NULL OR mode=$1) ORDER BY created_at DESC LIMIT 300',[mode??null])).rows;
+  const rows=(await this.pool.query(`SELECT r.id,r.name,r.mode,r.chain,r.interval,r.value_type,r.signal_source,r.strategy_version_id,r.initial_capital,r.wallet_address,r.risk_json,r.status,r.cash,r.realized_pnl,r.started_at,r.heartbeat_at,r.error_message,r.feed_state,r.feed_reason,r.execution_hold_reason,r.reconnect_count,r.late_trade_count,r.dropped_trade_count,r.last_signal_at,r.last_trade_at,r.created_at,r.updated_at,
+   (SELECT COUNT(*)::int FROM live_watches w WHERE w.run_id=r.id AND w.status IN ('monitoring','recovering','pending_eviction')) AS active_ca_count
+   FROM live_runs r WHERE ($1::text IS NULL OR r.mode=$1) ORDER BY r.created_at DESC LIMIT 300`,[mode??null])).rows;
   return rows.map(publicRow);
  }
  @Post('live-runs') async create(@Body() body:RequestBody,@Headers('x-live-admin-password') password:string,@Req() request:any){
@@ -71,17 +73,18 @@ export class LiveController {
  }
  @Post('live-runs/emergency-stop') async emergency(@Headers('x-live-admin-password') password:string,@Req() request:any){
   requireLiveAdmin(password,request);
-  const result=await this.pool.query("UPDATE live_runs SET status='paused',updated_at=now(),error_message='管理员紧急停止：不再产生新订单' WHERE mode='live' AND status='running' RETURNING id");
+  const result=await this.pool.query("UPDATE live_runs SET status='paused',feed_state='paused',updated_at=now(),error_message='管理员紧急停止：不再产生新订单' WHERE mode='live' AND status='running' RETURNING id");
   return {stopped:result.rows.map(r=>r.id)};
  }
  @Get('live-runs/:id') async one(@Param('id') id:string){
   const result=await this.pool.query('SELECT * FROM live_runs WHERE id=$1',[id]);
   if(!result.rowCount)throw new BadRequestException('实时任务不存在');
   const [watches,orders,events]=await Promise.all([
-   this.pool.query('SELECT chain,ca,pair_id,signal_source,signal_time,status,last_candle_time,state_json FROM live_watches WHERE run_id=$1 ORDER BY created_at DESC LIMIT 500',[id]),
+   this.pool.query('SELECT chain,ca,pair_id,signal_source,signal_time,status,last_candle_time,last_trade_at,current_mcap,recovery_reason,state_json FROM live_watches WHERE run_id=$1 ORDER BY created_at DESC LIMIT 500',[id]),
    this.pool.query('SELECT o.*,f.fill_time,f.fill_price,f.quantity,f.gross_amount,f.fee,f.slippage_cost,f.tax_cost FROM live_orders o LEFT JOIN live_fills f ON f.order_id=o.id WHERE o.run_id=$1 ORDER BY o.created_at DESC LIMIT 500',[id]),
    this.pool.query('SELECT kind,chain,ca,pair_id,event_time,payload FROM live_events WHERE run_id=$1 ORDER BY event_time DESC LIMIT 200',[id])]);
-  return {run:publicRow(result.rows[0]),watches:watches.rows.map(r=>({...r,state_json:{position:r.state_json?.position??null}})),orders:orders.rows.map(r=>({...r,raw_result:undefined})),events:events.rows};
+  const run=result.rows[0],activeCaCount=watches.rows.filter(w=>['monitoring','recovering','pending_eviction'].includes(w.status)).length;
+  return {run:publicRow({...run,active_ca_count:activeCaCount,active_ca_limit:20}),watches:watches.rows.map(r=>({...r,state_json:{position:r.state_json?.position??null}})),orders:orders.rows.map(r=>({...r,raw_result:undefined})),events:events.rows};
  }
  @Get('live-runs/:id/markers') async markers(@Param('id') id:string,@Query() q:Record<string,string>){
   const run=(await this.pool.query('SELECT id FROM live_runs WHERE id=$1',[id])).rows[0];if(!run)throw new BadRequestException('任务不存在');
@@ -119,20 +122,20 @@ export class LiveController {
    if(conflict.length)throw new ConflictException('该链钱包已被其他实盘任务占用');
   }
   if(!process.env.MEMEINFO_SIGNAL_TOKEN)throw new ConflictException('实时信号令牌尚未配置');
-  const result=await this.pool.query("UPDATE live_runs SET status='running',started_at=COALESCE(started_at,now()),error_message=NULL,updated_at=now() WHERE id=$1 AND status IN ('paused','running') RETURNING *",[id]);
+  const result=await this.pool.query("UPDATE live_runs SET status='running',feed_state='connecting',started_at=COALESCE(started_at,now()),error_message=NULL,updated_at=now() WHERE id=$1 AND status IN ('paused','running') RETURNING *",[id]);
   if(!result.rowCount)throw new ConflictException('任务不是可启动状态');
   return publicRow(result.rows[0]);
  }
  @Post('live-runs/:id/pause') async pause(@Param('id') id:string,@Headers('x-live-admin-password') password:string,@Req() request:any){
   const current=(await this.pool.query('SELECT mode FROM live_runs WHERE id=$1',[id])).rows[0];if(!current)throw new BadRequestException('任务不存在');
   if(current.mode==='live')requireLiveAdmin(password,request);
-  const result=await this.pool.query("UPDATE live_runs SET status='paused',updated_at=now() WHERE id=$1 AND status IN ('running','paused') RETURNING *",[id]);
+  const result=await this.pool.query("UPDATE live_runs SET status='paused',feed_state='paused',updated_at=now() WHERE id=$1 AND status IN ('running','paused') RETURNING *",[id]);
   if(!result.rowCount)throw new ConflictException('任务不能暂停');return publicRow(result.rows[0]);
  }
  @Post('live-runs/:id/stop') async stop(@Param('id') id:string,@Headers('x-live-admin-password') password:string,@Req() request:any){
   const current=(await this.pool.query('SELECT mode FROM live_runs WHERE id=$1',[id])).rows[0];if(!current)throw new BadRequestException('任务不存在');
   if(current.mode==='live')requireLiveAdmin(password,request);
-  const result=await this.pool.query("UPDATE live_runs SET status='stopped',updated_at=now() WHERE id=$1 AND status<>'stopped' RETURNING *",[id]);
+  const result=await this.pool.query("UPDATE live_runs SET status='stopped',feed_state='paused',updated_at=now() WHERE id=$1 AND status<>'stopped' RETURNING *",[id]);
   return publicRow(result.rows[0]??(await this.pool.query('SELECT * FROM live_runs WHERE id=$1',[id])).rows[0]);
  }
 }

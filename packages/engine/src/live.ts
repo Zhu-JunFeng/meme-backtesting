@@ -3,7 +3,8 @@ import { detectImpulse, evaluateConditionGroup, stopPrice, targetPrice, type Imp
 
 export interface MarketTrade { id:string; chain:string; ca:string; pairId:string; time:number; price:number; mcap?:number; volumeUsd:number }
 export interface ClosedMarketBar { symbol:SymbolRef; interval:'30s'|'1m'; type:'price'|'mcap'; candle:Candle; tradeCount:number }
-type Bucket = {symbol:SymbolRef;interval:'30s'|'1m';type:'price'|'mcap';candle:Candle;firstAt:number;lastAt:number;tradeCount:number};
+type Bucket = {symbol:SymbolRef;interval:'30s'|'1m';type:'price'|'mcap';candle:Candle;firstAt:number;lastAt:number;firstId:string;lastId:string;tradeCount:number};
+export type TradeAcceptance={accepted:boolean;late:boolean;reason?:'invalid'|'duplicate'|'too_old'|'closed'};
 const period = (interval:'30s'|'1m') => interval==='30s'?30_000:60_000;
 export class LiveCandleAggregator {
   private buckets=new Map<string,Bucket>();
@@ -11,19 +12,21 @@ export class LiveCandleAggregator {
   private seen=new Map<string,number>();
   private lastTradeTime=new Map<string,number>();
   constructor(private readonly onClose:(bar:ClosedMarketBar)=>void){}
-  accept(trade:MarketTrade){
-    if(!trade.id || !trade.chain || !trade.ca || !trade.pairId || !Number.isSafeInteger(trade.time) || trade.time<0 || !Number.isFinite(trade.price) || trade.price<=0 || !Number.isFinite(trade.volumeUsd) || trade.volumeUsd<0)return false;
+  accept(trade:MarketTrade){return this.acceptDetailed(trade).accepted;}
+  acceptDetailed(trade:MarketTrade):TradeAcceptance{
+    if(!trade.id || !trade.chain || !trade.ca || !trade.pairId || !Number.isSafeInteger(trade.time) || trade.time<0 || !Number.isFinite(trade.price) || trade.price<=0 || !Number.isFinite(trade.volumeUsd) || trade.volumeUsd<0)return {accepted:false,late:false,reason:'invalid'};
     const identity=`${trade.chain}:${trade.pairId}:${trade.id}`;
-    if(this.seen.has(identity))return false;
+    if(this.seen.has(identity))return {accepted:false,late:false,reason:'duplicate'};
     const marketKey=`${trade.chain}:${trade.pairId}`;
-    // Out-of-order ticks must never execute an order after a newer market event.
-    if(trade.time<(this.lastTradeTime.get(marketKey)??-1))return false;
-    const priceBucket=`${trade.chain}:${trade.ca}:${trade.pairId}:30s:price`;
-    if(Math.floor(trade.time/30_000)*30_000<=(this.finalized.get(priceBucket)??-1))return false;
-    this.lastTradeTime.set(marketKey,trade.time);
+    const latest=this.lastTradeTime.get(marketKey)??-1,late=trade.time<latest;
+    const sameMinute=Math.floor(trade.time/60_000)===Math.floor(latest/60_000);
+    if(late && latest-trade.time>=30_000 && !sameMinute)return {accepted:false,late:true,reason:'too_old'};
+    this.lastTradeTime.set(marketKey,Math.max(latest,trade.time));
     this.seen.set(identity,trade.time);
-    if(this.seen.size>50_000)for(const [key,time] of this.seen)if(time<trade.time-300_000)this.seen.delete(key);
+    if(this.seen.size>50_000)for(const [key,time] of this.seen)if(time<Math.max(latest,trade.time)-300_000)this.seen.delete(key);
+    while(this.seen.size>100_000)this.seen.delete(this.seen.keys().next().value!);
     const symbol={chain:trade.chain,ca:trade.ca,pairId:trade.pairId};
+    let accepted=false;
     for(const interval of ['30s','1m'] as const)for(const type of ['price','mcap'] as const){
       const value=type==='price'?trade.price:trade.mcap;
       if(value===undefined || !Number.isFinite(value) || value<=0)continue;
@@ -33,18 +36,25 @@ export class LiveCandleAggregator {
       if(prior && prior.candle.time<start){this.finish(key,prior);}
       const current=this.buckets.get(key);
       if(current && current.candle.time===start){
+        accepted=true;
         current.candle.high=Math.max(current.candle.high,value);current.candle.low=Math.min(current.candle.low,value);
-        if(trade.time<current.firstAt){current.firstAt=trade.time;current.candle.open=value;}
-        if(trade.time>=current.lastAt){current.lastAt=trade.time;current.candle.close=value;}
+        if(trade.time<current.firstAt || (trade.time===current.firstAt&&trade.id<current.firstId)){current.firstAt=trade.time;current.firstId=trade.id;current.candle.open=value;}
+        if(trade.time>current.lastAt || (trade.time===current.lastAt&&trade.id>current.lastId)){current.lastAt=trade.time;current.lastId=trade.id;current.candle.close=value;}
         current.candle.volume+=trade.volumeUsd;current.tradeCount++;
-      }else if(!current || current.candle.time<start){this.buckets.set(key,{symbol,interval,type,candle:{time:start,closeTime:start+period(interval),open:value,high:value,low:value,close:value,volume:trade.volumeUsd,valid:true},firstAt:trade.time,lastAt:trade.time,tradeCount:1});}
+      }else if(!current || current.candle.time<start){accepted=true;this.buckets.set(key,{symbol,interval,type,candle:{time:start,closeTime:start+period(interval),open:value,high:value,low:value,close:value,volume:trade.volumeUsd,valid:true},firstAt:trade.time,lastAt:trade.time,firstId:trade.id,lastId:trade.id,tradeCount:1});}
     }
-    return true;
+    return {accepted,late,reason:accepted?undefined:'closed'};
   }
   flush(now:number){for(const [key,bucket] of this.buckets)if(bucket.candle.closeTime<=now)this.finish(key,bucket);}
+  markClosedThrough(chain:string,ca:string,pairId:string,now:number){
+    for(const interval of ['30s','1m'] as const)for(const type of ['price','mcap'] as const){
+      const key=`${chain}:${ca}:${pairId}:${interval}:${type}`,lastClosed=Math.floor(now/period(interval))*period(interval)-period(interval);
+      this.finalized.set(key,Math.max(this.finalized.get(key)??-1,lastClosed));
+      const bucket=this.buckets.get(key);if(bucket&&bucket.candle.time<=lastClosed)this.buckets.delete(key);
+    }
+  }
   discardPair(chain:string,pairId:string){
     for(const [key,bucket] of this.buckets)if(bucket.symbol.chain===chain&&bucket.symbol.pairId===pairId)this.buckets.delete(key);
-    this.lastTradeTime.delete(`${chain}:${pairId}`);
   }
   private finish(key:string,bucket:Bucket){this.buckets.delete(key);this.finalized.set(key,bucket.candle.time);this.onClose({symbol:bucket.symbol,interval:bucket.interval,type:bucket.type,candle:{...bucket.candle},tradeCount:bucket.tradeCount});}
 }
