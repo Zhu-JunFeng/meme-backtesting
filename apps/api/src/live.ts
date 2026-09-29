@@ -2,6 +2,7 @@ import {BadRequestException,ConflictException,Controller,Get,Headers,Param,Post,
 import {scryptSync,timingSafeEqual} from 'node:crypto';
 import {Pool} from 'pg';
 import type {StrategyConfig} from '@meme/domain';
+import {buildLivePortfolio} from './live-portfolio.js';
 
 type Mode='paper'|'live';
 type Risk={maxOrderNative:number;maxTotalNative:number;maxDailyLossUsd:number;maxPositions:number;tip:number;slippagePercent:number};
@@ -85,6 +86,31 @@ export class LiveController {
    this.pool.query('SELECT kind,chain,ca,pair_id,event_time,payload FROM live_events WHERE run_id=$1 ORDER BY event_time DESC LIMIT 200',[id])]);
   const run=result.rows[0],activeCaCount=watches.rows.filter(w=>['monitoring','recovering','pending_eviction'].includes(w.status)).length;
   return {run:publicRow({...run,active_ca_count:activeCaCount,active_ca_limit:20}),watches:watches.rows.map(r=>({...r,state_json:{position:r.state_json?.position??null}})),orders:orders.rows.map(r=>({...r,raw_result:undefined})),events:events.rows};
+ }
+ @Get('live-runs/:id/portfolio') async portfolio(@Param('id') id:string,@Query() q:Record<string,string>){
+  const tab=q.tab??'current';if(!['current','history','signals'].includes(tab))throw new BadRequestException('持仓视图无效');
+  const page=Number(q.page??1),pageSize=Number(q.pageSize??20);
+  if(!Number.isInteger(page)||page<1||!Number.isInteger(pageSize)||pageSize<1||pageSize>100)throw new BadRequestException('分页参数无效');
+  const run=(await this.pool.query('SELECT id,mode,interval,value_type,strategy_json,realized_pnl FROM live_runs WHERE id=$1',[id])).rows[0];
+  if(!run)throw new BadRequestException('实时任务不存在');
+  const [fills,watches,signalCounts,unverified]=await Promise.all([
+   this.pool.query(`SELECT o.id,o.position_id,o.chain,o.ca,o.pair_id,o.side,o.reason,o.decision_time,f.fill_time,f.fill_value,f.fill_price,f.market_cap,f.quantity,f.gross_amount,f.fee,f.slippage_cost,f.tax_cost
+    FROM live_orders o JOIN live_fills f ON f.order_id=o.id WHERE o.run_id=$1 AND o.status='filled' ORDER BY f.fill_time,o.decision_time,o.id`,[id]),
+   this.pool.query('SELECT chain,ca,last_trade_at,state_json FROM live_watches WHERE run_id=$1',[id]),
+   this.pool.query("SELECT COUNT(*) FILTER(WHERE side='buy')::int AS buys,COUNT(*) FILTER(WHERE side='sell')::int AS sells FROM live_orders WHERE run_id=$1",[id]),
+   this.pool.query("SELECT COUNT(*)::int AS count FROM live_orders WHERE run_id=$1 AND status IN ('pending','submitted','unknown')",[id])
+  ]);
+  const portfolio=buildLivePortfolio(fills.rows,watches.rows,run.strategy_json,run.value_type,run.interval);
+  const summary={...portfolio.summary,buySignalCount:signalCounts.rows[0].buys,sellSignalCount:signalCounts.rows[0].sells,unverifiedOrderCount:unverified.rows[0].count,accountRealizedPnl:Number(run.realized_pnl)};
+  if(tab==='signals'){
+   const [rows,total]=await Promise.all([
+    this.pool.query('SELECT id,chain,ca,pair_id,side,reason,status,decision_time,decision_value,created_at FROM live_orders WHERE run_id=$1 ORDER BY decision_time DESC,id DESC LIMIT $2 OFFSET $3',[id,pageSize,(page-1)*pageSize]),
+    this.pool.query('SELECT COUNT(*)::int AS count FROM live_orders WHERE run_id=$1',[id])
+   ]);
+   return {items:rows.rows,total:total.rows[0].count,page,pageSize,summary,valueType:run.value_type};
+  }
+  const rows=tab==='current'?portfolio.open:portfolio.closed;
+  return {items:rows.slice((page-1)*pageSize,page*pageSize),total:rows.length,page,pageSize,summary,valueType:run.value_type};
  }
  @Get('live-runs/:id/markers') async markers(@Param('id') id:string,@Query() q:Record<string,string>){
   const run=(await this.pool.query('SELECT id FROM live_runs WHERE id=$1',[id])).rows[0];if(!run)throw new BadRequestException('任务不存在');

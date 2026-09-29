@@ -3,8 +3,9 @@ import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch} from 'vue';
 import {message,Modal} from 'ant-design-vue';
 import {api} from '../api';
 import {beijingTime} from '../time';
-import {formatNumber,signedValue,valueTone,preciseValue} from '../format';
+import {eventLabels,formatNumber,signedValue,valueTone} from '../format';
 import TradingViewChart from './TradingViewChart.vue';
+import LivePortfolio from './LivePortfolio.vue';
 
 const props=defineProps<{mode:'paper'|'live'}>();
 const templates=ref<any[]>([]),versions=ref<any[]>([]),runs=ref<any[]>([]),detail=ref<any>();
@@ -14,7 +15,6 @@ const detailElement=ref<HTMLElement|null>(null);
 const form=ref({name:'',chain:'sol',signalSource:'fomo_new_project_expanded',interval:'30s',valueType:'mcap',initialCapital:1000,walletAddress:'',maxOrderNative:0.01,maxTotalNative:0.05,maxDailyLossUsd:20,maxPositions:1,tip:0.001,slippagePercent:5});
 const signalSources=[{label:'FOMO 新项目（扩大信号）',value:'fomo_new_project_expanded'},{label:'Top Cluster 首次买入',value:'top_cluster_first_buy'}];
 function signalSourceText(value:string){return signalSources.find(x=>x.value===value)?.label??'全部来源（旧任务）';}
-const columns=[{title:'时间',dataIndex:'created_at',key:'created_at'},{title:'CA / 交易池',dataIndex:'ca',key:'ca'},{title:'方向',dataIndex:'side',key:'side'},{title:'原因',dataIndex:'reason',key:'reason'},{title:'状态',dataIndex:'status',key:'status'},{title:'成交价',dataIndex:'fill_price',key:'fill_price'},{title:'数量',dataIndex:'quantity',key:'quantity'}];
 const current=computed(()=>runs.value.find(r=>r.id===selectedRunId.value));
 const secureAdminContext=window.location.protocol==='https:'||['localhost','127.0.0.1'].includes(window.location.hostname);
 const chosenWatch=computed(()=>detail.value?.watches?.find((w:any)=>`${w.chain}:${w.ca}:${w.pair_id}`===selectedWatch.value));
@@ -23,6 +23,9 @@ const real=props.mode==='live';let timer:number|undefined,request=0;
 function statusText(s:string){return ({paused:'已暂停',running:'运行中',stopped:'已停止'} as Record<string,string>)[s]??s;}
 function statusColor(s:string){return ({paused:'default',running:'green',stopped:'default'} as Record<string,string>)[s]??'default';}
 function feedText(s:string){return ({connecting:'连接中',recovering:'补行情',connected:'行情正常',paused:'已暂停'} as Record<string,string>)[s]??'连接中';}
+function watchText(s:string){return ({monitoring:'监控中',recovering:'补行情中',pending_eviction:'等待平仓后移除',evicted:'已移除',paused:'已暂停'} as Record<string,string>)[s]??'状态未识别';}
+function eventText(s:string){return ({external_signal:'外部信号',decision:'买卖决策',fill:'成交',order_rejected:'订单被拒绝',feed_disconnect:'行情断开',feed_reconnected:'行情已重连',late_trade:'乱序成交',eviction:'退出监控'} as Record<string,string>)[s]??'运行事件';}
+function eventReason(payload:any){const reason=payload?.reason;return reason?eventLabels[reason]??(typeof reason==='string'&&reason.includes('_')?'原因未识别':reason):signalSourceText(payload?.source);}
 function adminHeader(){return real?{'x-live-admin-password':password.value}:{};}
 async function loadVersions(){if(!templateId.value)return;versions.value=(await api.get(`/strategy-templates/${templateId.value}/versions`)).data;versionId.value=templates.value.find(t=>t.id===templateId.value)?.currentVersionId??versions.value[0]?.id;}
 async function refresh(){
@@ -118,12 +121,11 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
   <a-divider orientation="left">监控项目与成交</a-divider>
   <a-empty v-if="!detail.watches.length" description="等待符合来源与链筛选的新信号；历史信号不会追加入场。" />
   <template v-else><div class="live-watch-picker"><label for="live-watch">项目 / 主池</label><a-select id="live-watch" v-model:value="selectedWatch" show-search option-filter-prop="label" :options="detail.watches.map((w:any)=>({value:`${w.chain}:${w.ca}:${w.pair_id}`,label:`${w.chain.toUpperCase()} · ${w.ca} · ${w.pair_id}`}))" /><a-button @click="chartEpoch++">刷新 K 线</a-button></div>
-   <p v-if="chosenWatch" class="live-context">首次监控 {{beijingTime(chosenWatch.signal_time,true)}} · {{chosenWatch.signal_source}} · {{chosenWatch.status}} · 市值 {{chosenWatch.current_mcap==null?'未知':formatNumber(chosenWatch.current_mcap)}} USD <span v-if="chosenWatch.recovery_reason">· {{chosenWatch.recovery_reason}}</span></p>
+   <p v-if="chosenWatch" class="live-context">首次监控 {{beijingTime(chosenWatch.signal_time,true)}} · {{signalSourceText(chosenWatch.signal_source)}} · {{watchText(chosenWatch.status)}} · 市值 {{chosenWatch.current_mcap==null?'未知':formatNumber(chosenWatch.current_mcap)}} USD <span v-if="chosenWatch.recovery_reason">· {{chosenWatch.recovery_reason}}</span></p>
    <TradingViewChart v-if="chartSymbol" :key="`${chartSymbol}:${chartEpoch}`" :symbol="chartSymbol" :interval="detail.run.interval" :live-run-id="detail.run.id" />
   </template>
-  <a-divider orientation="left">订单与成交</a-divider>
-  <a-table :columns="columns" :data-source="detail.orders" row-key="id" size="small" :scroll="{x:980}" :pagination="{pageSize:20}" :locale="{emptyText:'尚无买卖决策或成交'}"><template #bodyCell="{column,record}"><template v-if="column.key==='created_at'">{{beijingTime(record.created_at)}}</template><template v-else-if="column.key==='ca'"><span class="live-address">{{record.ca}}</span><small class="live-pair">{{record.pair_id}}</small></template><template v-else-if="column.key==='side'">{{record.side==='buy'?'买入':'卖出'}}</template><template v-else-if="column.key==='fill_price'">{{record.fill_price==null?'—':preciseValue(record.fill_price)}}</template><template v-else-if="column.key==='quantity'">{{record.quantity==null?'—':preciseValue(record.quantity)}}</template></template></a-table>
-  <a-divider orientation="left">运行事件</a-divider><a-empty v-if="!detail.events.length" description="暂无运行事件" /><ol v-else class="live-event-list"><li v-for="(e,i) in detail.events" :key="i"><time>{{beijingTime(e.event_time,true)}}</time><strong>{{e.kind}}</strong><span>{{e.ca||'系统'}} · {{e.payload?.reason||e.payload?.source||''}}</span></li></ol>
+  <LivePortfolio :key="detail.run.id" :run-id="detail.run.id" :value-type="detail.run.value_type" />
+  <a-divider orientation="left">运行事件</a-divider><a-empty v-if="!detail.events.length" description="暂无运行事件" /><ol v-else class="live-event-list"><li v-for="(e,i) in detail.events" :key="i"><time>{{beijingTime(e.event_time,true)}}</time><strong>{{eventText(e.kind)}}</strong><span>{{e.ca||'系统'}} · {{eventReason(e.payload)}}</span></li></ol>
  </section>
 </div>
 </template>

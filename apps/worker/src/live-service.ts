@@ -374,8 +374,8 @@ export class LiveService {
    sizing.type==='fixed_amount'?Math.min(sizing.value,available):available*sizing.value/100;
   if(!Number.isFinite(amount)||amount<=0)return;
   if(ctx.run.mode==='live' && (process.env.LIVE_TRADING_ENABLED!=='true'||!this.xxyy||ctx.run.chain==='robin'))return;
-  const result=await this.pool.query(`INSERT INTO live_orders(run_id,chain,ca,pair_id,intent_key,side,reason,status,decision_time,decision_value,requested_amount,raw_result)
-    VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11) ON CONFLICT(intent_key) DO NOTHING RETURNING id`,[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,key,d.side,d.reason,d.time,d.value,amount,JSON.stringify({impulse:d.impulse??null})]);
+  const result=await this.pool.query(`INSERT INTO live_orders(run_id,chain,ca,pair_id,intent_key,side,reason,status,decision_time,decision_value,requested_amount,raw_result,position_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12) ON CONFLICT(intent_key) DO NOTHING RETURNING id`,[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,key,d.side,d.reason,d.time,d.value,amount,JSON.stringify({impulse:d.impulse??null}),position?.positionId??null]);
   if(!result.rowCount)return;
   await this.pool.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'decision',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,`decision:${key}`,d.time,JSON.stringify({side:d.side,reason:d.reason,value:d.value})]);
   if(ctx.run.mode==='live')await this.submitLive(ctx,result.rows[0].id,d,amount);
@@ -394,7 +394,7 @@ export class LiveService {
    const value=ctx.run.value_type==='price'?trade.price:trade.mcap;
    if(!value || value<=0)return;
    if(s.position){const p=s.position,total=p.quantity+quantity;p.entryPrice=(p.entryPrice*p.quantity+value*quantity)/total;p.quantity=total;p.entries++;p.costBasisUsd=(p.costBasisUsd??0)+gross+fee+slip+tax;}
-   else{const impulse=o.raw_result?.impulse??detectImpulseAtDecision(ctx,o.decision_time);if(!impulse)throw new Error('模拟订单缺少可核验拉升依据');s.position={entryPrice:value,quantity,entries:1,entryTime:trade.time,entryBar:s.history.length-1,impulse,tradeNo:s.trades+1,costBasisUsd:gross+fee+slip+tax};}
+   else{const impulse=o.raw_result?.impulse??detectImpulseAtDecision(ctx,o.decision_time);if(!impulse)throw new Error('模拟订单缺少可核验拉升依据');s.position={entryPrice:value,quantity,entries:1,entryTime:trade.time,entryBar:s.history.length-1,impulse,tradeNo:s.trades+1,costBasisUsd:gross+fee+slip+tax,positionId:o.id};}
   }else{
    if(!s.position)return;quantity=Math.min(s.position.quantity,Number(o.requested_amount));gross=quantity*trade.price;
    fee=gross*feeRate;slip=gross*slipRate;tax=gross*taxRate;newCash=Number(ctx.run.cash)+gross-fee-slip-tax;
@@ -403,9 +403,11 @@ export class LiveService {
    if(s.position.quantity<=1e-12){s.position=undefined;s.trades++;s.lastEntryMatch=true;}
   }
   const c=await this.pool.connect();try{await c.query('BEGIN');
+   const claimed=await c.query("UPDATE live_orders SET status='filled',updated_at=now() WHERE id=$1 AND status='pending' RETURNING id",[o.id]);
+   if(!claimed.rowCount){await c.query('ROLLBACK');return;}
    const fillValue=ctx.run.value_type==='price'?trade.price:trade.mcap!;
-   await c.query("INSERT INTO live_fills(order_id,fill_time,fill_price,fill_value,quantity,gross_amount,fee,slippage_cost,tax_cost) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",[o.id,trade.time,trade.price,fillValue,quantity,gross,fee,slip,tax]);
-   await c.query("UPDATE live_orders SET status='filled',updated_at=now() WHERE id=$1 AND status='pending'",[o.id]);
+   await c.query("INSERT INTO live_fills(order_id,fill_time,fill_price,fill_value,quantity,gross_amount,fee,slippage_cost,tax_cost,market_cap) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",[o.id,trade.time,trade.price,fillValue,quantity,gross,fee,slip,tax,trade.mcap??null]);
+   if(o.side==='buy'&&!o.position_id&&!ctx.evaluator.state.position)await c.query('UPDATE live_orders SET position_id=$2 WHERE id=$1',[o.id,o.id]);
    await c.query('UPDATE live_runs SET cash=$2,realized_pnl=$3,updated_at=now() WHERE id=$1',[ctx.run.id,newCash,newPnl]);
    await c.query('UPDATE live_watches SET state_json=$2 WHERE run_id=$1 AND chain=$3 AND ca=$4',[ctx.run.id,JSON.stringify(s),ctx.watch.chain,ctx.watch.ca]);
    await c.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'fill',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,`fill:${o.id}`,trade.time,JSON.stringify({side:o.side,reason:o.reason,price:trade.price,value:fillValue,quantity})]);
