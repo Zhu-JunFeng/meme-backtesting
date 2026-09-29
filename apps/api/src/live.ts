@@ -161,7 +161,7 @@ export class LiveController {
   const rows=(await this.pool.query(`SELECT o.id,o.chain,o.ca,o.pair_id,o.side,o.reason,o.status,o.position_id,o.decision_time,o.decision_value,
     f.fill_time,f.fill_value,f.quantity FROM live_orders o LEFT JOIN live_fills f ON f.order_id=o.id
     WHERE o.run_id=$1 AND ($2::text IS NULL OR o.chain=$2) AND ($3::text IS NULL OR o.ca=$3) AND ($4::text IS NULL OR o.pair_id=$4)
-    AND (f.fill_time BETWEEN $5 AND ($6+$7) OR (f.fill_time IS NULL AND o.status<>'filled' AND o.decision_time BETWEEN ($5-$7) AND ($6+$7)))
+    AND (f.fill_time BETWEEN $5::bigint AND ($6::bigint+$7::bigint) OR (f.fill_time IS NULL AND o.status<>'filled' AND o.decision_time BETWEEN ($5::bigint-$7::bigint) AND ($6::bigint+$7::bigint)))
     ORDER BY COALESCE(f.fill_time,o.decision_time),o.id`,[id,q.chain??null,q.ca??null,q.pairId??null,from,to,step])).rows;
   const items=rows.map(o=>{const filled=o.fill_time!=null,actual=Number(filled?o.fill_time:o.decision_time),time=filled?Math.floor(actual/step)*step:decisionBucket(actual,o.reason,step);
    const side=o.side==='buy'?'买入':'卖出',label=filled?(o.reason==='add'?'加仓':o.side==='buy'?'买入':'卖出'):`${side}决策（${({pending:'待执行',submitted:'已提交',unknown:'待核实',failed:'失败',cancelled:'已取消'} as Record<string,string>)[o.status]??'未成交'}）`;
