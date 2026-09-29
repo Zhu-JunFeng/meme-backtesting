@@ -68,8 +68,8 @@ function scheduleMarkers(v:number){
 }
 const resolutions:Record<string,string>={"30s":"30S","1m":"1","5m":"5","15m":"15","1h":"60","4h":"240","1d":"D"};
 const seconds:Record<string,number>={"30s":30,"1m":60,"5m":300,"15m":900,"1h":3600,"4h":14400,"1d":86400};
-const markText=(m:any)=>`${m.event_label ?? ''} ${exitLabel(m)} · ${isMcap.value?"市值":"价格"} ${displayValue(Number(m.price))} · 数量 ${preciseValue(m.quantity)}${props.includeEndOfBacktest===false && m.excluded_end?' · 不计入当前统计':''}\n${m.signal_type==='invalidation'?invalidationEvidence(m.invalidation_detail ?? m.reason_json?.invalidation).join('\n'):JSON.stringify(m.reason_json)}`;
-const eventSummary=(m:any)=>`${m.event_label ?? ''} ${exitLabel(m)} · ${beijingTime(m.time,true)} · ${isMcap.value?'市值':'价格'} ${displayValue(Number(m.price))} · 数量 ${preciseValue(m.quantity)} · ${m.signal_type==='invalidation'?invalidationEvidence(m.invalidation_detail ?? m.reason_json?.invalidation).join('；'):m.reason_json?.message || labels[m.reason_json?.priority] || '策略条件满足'}${props.includeEndOfBacktest===false && m.excluded_end?' · 不计入当前统计':''}`;
+const markText=(m:any)=>`${m.event_label ?? ''} ${m.signal_type==='decision'?'· 未成交决策':exitLabel(m)} · ${isMcap.value?"市值":"价格"} ${displayValue(Number(m.price))}${m.quantity==null?'':` · 数量 ${preciseValue(m.quantity)}`}${props.includeEndOfBacktest===false && m.excluded_end?' · 不计入当前统计':''}\n${m.signal_type==='invalidation'?invalidationEvidence(m.invalidation_detail ?? m.reason_json?.invalidation).join('\n'):JSON.stringify(m.reason_json)}`;
+const eventSummary=(m:any)=>`${m.event_label ?? ''} ${m.signal_type==='decision'?'· 未成交决策':exitLabel(m)} · ${beijingTime(m.actual_time??m.time,true)} · ${isMcap.value?'市值':'价格'} ${displayValue(Number(m.price))}${m.quantity==null?'':` · 数量 ${preciseValue(m.quantity)}`} · ${m.signal_type==='invalidation'?invalidationEvidence(m.invalidation_detail ?? m.reason_json?.invalidation).join('；'):m.reason_json?.message || labels[m.reason_json?.priority] || '策略条件满足'}${props.includeEndOfBacktest===false && m.excluded_end?' · 不计入当前统计':''}`;
 function clearSelection(){selectedBuy.value=undefined;selectedEvent.value=undefined;cursorValue.value=undefined;referenceEpoch++;if(referenceId&&ready)try{widget.activeChart().removeEntity(referenceId);}catch{}referenceId=undefined;}
 async function drawReference(){
  if(!ready||!selectedBuy.value||!loadedTimes.has(Number(selectedBuy.value.time)))return;const request=++referenceEpoch,chart=widget.activeChart();
@@ -108,7 +108,7 @@ async function loadMarkers(chart:any,v:number) {
  for(const marker of eligible.drawable){
   if(v!==version || mv!==markerVersion)return;
   const text=marker.event_label || labels[marker.signal_type] || marker.signal_type;
-  const id=await chart.createShape({time:Number(marker.time)/1000,price:Number(marker.price)},{shape:marker.signal_type==="risk_event"?"flag":["entry","add"].includes(marker.signal_type)?"arrow_up":"arrow_down",text,lock:true,disableSave:true,disableUndo:true,overrides:{color:marker.signal_type==="risk_event"?"#b7791f":["entry","add"].includes(marker.signal_type)?"#176b5b":"#c2413b"}});
+  const id=await chart.createShape({time:Number(marker.time)/1000,price:Number(marker.price)},{shape:["risk_event","decision"].includes(marker.signal_type)?"flag":["entry","add"].includes(marker.signal_type)?"arrow_up":"arrow_down",text,lock:true,disableSave:true,disableUndo:true,overrides:{color:marker.signal_type==="decision"?"#376a9f":marker.signal_type==="risk_event"?"#b7791f":["entry","add"].includes(marker.signal_type)?"#176b5b":"#c2413b"}});
   if(v!==version || mv!==markerVersion) { try { chart.removeEntity(id); } catch {} return; }
   shapeMap.set(id,marker);markMap.set(String(marker.id),marker);
  }
@@ -173,7 +173,7 @@ async function mountChart(){
    const request=marksEpoch;
    markerRows(from,to).then(items=>{if(v!==version||request!==marksEpoch)return;const visible=ready?localWidget.activeChart().getVisibleRange():null;
     const {drawable}=partitionMarkers(items,loadedTimes,{from:Math.max(from,visible?.from ?? from),to:Math.min(to,visible?.to ?? to)});
-    drawable.forEach(m=>markMap.set(String(m.id),m));cb(drawable.map(m=>({id:m.id,time:Number(m.time)/1000,color:m.signal_type==="risk_event"?"yellow":["entry","add"].includes(m.signal_type)?"green":"red",text:markText(m).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"),label:m.event_label || (m.signal_type==="risk_event"?"!":m.signal_type==="entry"?"买":m.signal_type==="add"?"加":"卖"),labelFontColor:"white",minSize:28})));}).catch(()=>{if(v===version&&request===marksEpoch)cb([]);});
+    drawable.forEach(m=>markMap.set(String(m.id),m));cb(drawable.map(m=>({id:m.id,time:Number(m.time)/1000,color:m.signal_type==="decision"?"blue":m.signal_type==="risk_event"?"yellow":["entry","add"].includes(m.signal_type)?"green":"red",text:markText(m).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"),label:m.event_label || (m.signal_type==="decision"?"决":m.signal_type==="risk_event"?"!":m.signal_type==="entry"?"买":m.signal_type==="add"?"加":"卖"),labelFontColor:"white",minSize:28})));}).catch(()=>{if(v===version&&request===marksEpoch)cb([]);});
   },
   resolveSymbol:(_s:any,cb:any,onError:any)=>get("/api/tv/symbols",{symbol}).then(data=>{if(v===version)cb({...data,supported_resolutions:[resolutions[props.interval]]});}).catch(onError),
   getBars:(_info:any,_resolution:string,range:any,onResult:any,onError:any)=>{

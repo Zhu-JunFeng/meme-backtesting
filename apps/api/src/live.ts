@@ -3,6 +3,7 @@ import {scryptSync,timingSafeEqual} from 'node:crypto';
 import {Pool} from 'pg';
 import type {StrategyConfig} from '@meme/domain';
 import {buildLivePortfolio} from './live-portfolio.js';
+import {liveFib,decisionBucket} from './live-locator.js';
 
 type Mode='paper'|'live';
 type Risk={maxOrderNative:number;maxTotalNative:number;maxDailyLossUsd:number;maxPositions:number;tip:number;slippagePercent:number};
@@ -100,32 +101,87 @@ export class LiveController {
    this.pool.query("SELECT COUNT(*) FILTER(WHERE side='buy')::int AS buys,COUNT(*) FILTER(WHERE side='sell')::int AS sells FROM live_orders WHERE run_id=$1",[id]),
    this.pool.query("SELECT COUNT(*)::int AS count FROM live_orders WHERE run_id=$1 AND status IN ('pending','submitted','unknown')",[id])
   ]);
-  const portfolio=buildLivePortfolio(fills.rows,watches.rows,run.strategy_json,run.value_type,run.interval);
+  const asOf=Date.now();
+  const portfolio=buildLivePortfolio(fills.rows,watches.rows,run.strategy_json,run.value_type,run.interval,asOf);
   const summary={...portfolio.summary,buySignalCount:signalCounts.rows[0].buys,sellSignalCount:signalCounts.rows[0].sells,unverifiedOrderCount:unverified.rows[0].count,accountRealizedPnl:Number(run.realized_pnl)};
   if(tab==='signals'){
    const [rows,total]=await Promise.all([
     this.pool.query('SELECT id,chain,ca,pair_id,side,reason,status,decision_time,decision_value,created_at FROM live_orders WHERE run_id=$1 ORDER BY decision_time DESC,id DESC LIMIT $2 OFFSET $3',[id,pageSize,(page-1)*pageSize]),
     this.pool.query('SELECT COUNT(*)::int AS count FROM live_orders WHERE run_id=$1',[id])
    ]);
-   return {items:rows.rows,total:total.rows[0].count,page,pageSize,summary,valueType:run.value_type};
+   return {items:rows.rows,total:total.rows[0].count,page,pageSize,summary,valueType:run.value_type,asOf};
   }
   const rows=tab==='current'?portfolio.open:portfolio.closed;
-  return {items:rows.slice((page-1)*pageSize,page*pageSize),total:rows.length,page,pageSize,summary,valueType:run.value_type};
+  return {items:rows.slice((page-1)*pageSize,page*pageSize),total:rows.length,page,pageSize,summary,valueType:run.value_type,asOf};
+ }
+ @Get('live-runs/:id/locate') async locate(@Param('id') id:string,@Query() q:Record<string,string>){
+  if((!!q.positionId)===(!!q.orderId))throw new BadRequestException('请选择一笔持仓或一条信号');
+  const run=(await this.pool.query('SELECT id,interval,value_type,strategy_json FROM live_runs WHERE id=$1',[id])).rows[0];
+  if(!run)throw new BadRequestException('任务不存在');
+  const orders=(await this.pool.query(`SELECT o.id,o.position_id,o.chain,o.ca,o.pair_id,o.side,o.reason,o.status,o.decision_time,o.decision_value,o.raw_result,
+    f.fill_time,f.fill_value,f.fill_price,f.market_cap,f.quantity,f.gross_amount,f.fee,f.slippage_cost,f.tax_cost FROM live_orders o LEFT JOIN live_fills f ON f.order_id=o.id WHERE o.run_id=$1 ORDER BY o.decision_time,o.id`,[id])).rows;
+  const selected=q.orderId?orders.find(o=>o.id===q.orderId):undefined;
+  if(q.orderId&&!selected)throw new BadRequestException('信号不存在');
+  const filled=orders.filter(o=>o.status==='filled'&&o.fill_time!=null);
+  const watches=(await this.pool.query('SELECT chain,ca,last_trade_at,state_json FROM live_watches WHERE run_id=$1',[id])).rows;
+  const portfolio=buildLivePortfolio(filled,watches,run.strategy_json,run.value_type,run.interval);
+  const cycle=q.positionId?portfolio.cycles.find(c=>c.id===q.positionId):
+   selected?.status==='filled'?portfolio.cycles.find(c=>c.orderIds.includes(selected.id)):undefined;
+  if(q.positionId&&!cycle)throw new BadRequestException('持仓不存在或成交关联不完整');
+  const related=cycle?filled.filter(o=>cycle.orderIds.includes(o.id)):[];
+  const pairIds=cycle?.pairIds??[selected!.pair_id];
+  const pairId=q.pairId??(cycle?.pairId??selected!.pair_id);
+  if(!pairIds.includes(pairId))throw new BadRequestException('交易池不属于所选持仓');
+  const first=related.find(o=>o.side==='buy');
+  const event=cycle?first!:selected!;
+  const pairEvents=related.filter(o=>o.pair_id===pairId);
+  const start=cycle?Number(pairEvents[0]?.fill_time??first!.fill_time):decisionBucket(Number(selected!.decision_time),selected!.reason,run.interval==='30s'?30_000:60_000);
+  const end=cycle?(cycle.sellTime==null?Date.now():Number(pairEvents.at(-1)?.fill_time??cycle.sellTime)):start;
+  const impulse=first?.raw_result?.impulse;
+  const buys=related.filter(o=>o.side==='buy').map((o,index)=>({...o,label:index===0?`买${cycle!.tradeNo}`:`加${cycle!.tradeNo}.${index}`}));
+  const fib=cycle?(pairId===first!.pair_id?liveFib(run.strategy_json,impulse,Number(first!.decision_time),cycle.sellTime,buys):{status:'unavailable',reason:'Fib 锚点属于首次入场交易池；当前池只显示自身 K 线和成交事件'}):null;
+  const fibStart=fib?.status==='available'&&'low' in fib?Math.min(start,Number(fib.low.time)):start;
+  const boundsFor=async(begin:number)=>this.pool.query(`SELECT
+    (SELECT min(open_time) FROM (SELECT open_time FROM public.meme_kline WHERE chain=$1 AND ca=$2 AND pair_id=$3 AND interval=$4 AND type=$5 AND valid IS DISTINCT FROM false AND open_time<=$6 ORDER BY open_time DESC LIMIT 100) b) AS before,
+    (SELECT max(open_time) FROM (SELECT open_time FROM public.meme_kline WHERE chain=$1 AND ca=$2 AND pair_id=$3 AND interval=$4 AND type=$5 AND valid IS DISTINCT FROM false AND open_time>=$7 ORDER BY open_time LIMIT 100) a) AS after`,[event.chain,event.ca,pairId,run.interval,run.value_type,begin,end]);
+  const [bounds,fibBounds]=await Promise.all([boundsFor(start),fibStart===start?Promise.resolve(null):boundsFor(fibStart)]);
+  const step=run.interval==='30s'?30_000:60_000;
+  const from=Number(bounds.rows[0].before??Math.max(0,start-step*100)),to=Number(bounds.rows[0].after??end);
+  const fibFrom=Number(fibBounds?.rows[0].before??from);
+  return {symbol:`${event.chain}:${event.ca}:${pairId}:${run.value_type}`,pairIds,positionId:cycle?.id??null,orderId:selected?.id??null,
+   from,to:Math.max(to,from+step),start,end,fib,fibFrom,fibTo:Math.max(to,fibFrom+step),
+   events:pairEvents.map(o=>({id:o.id,pairId:o.pair_id,side:o.side,reason:o.reason,time:Number(o.fill_time),value:Number(o.fill_value),quantity:Number(o.quantity),status:'filled'})),
+   decision:cycle?null:{id:selected.id,status:selected.status,side:selected.side,reason:selected.reason,time:Number(selected.decision_time),bucket:start,value:Number(selected.decision_value),pairId:selected.pair_id}};
  }
  @Get('live-runs/:id/markers') async markers(@Param('id') id:string,@Query() q:Record<string,string>){
   const run=(await this.pool.query('SELECT id FROM live_runs WHERE id=$1',[id])).rows[0];if(!run)throw new BadRequestException('任务不存在');
   const from=Number(q.from??0),to=Number(q.to??Date.now());if(!Number.isFinite(from)||!Number.isFinite(to)||to<from)throw new BadRequestException('时间范围无效');
   const page=Math.max(1,Number(q.page)||1),size=Math.min(500,Math.max(1,Number(q.pageSize)||500));
-  const rows=(await this.pool.query(`SELECT o.id,o.chain,o.ca,o.pair_id,
-    (f.fill_time / CASE WHEN r.interval='30s' THEN 30000::bigint ELSE 60000::bigint END)
-      * CASE WHEN r.interval='30s' THEN 30000::bigint ELSE 60000::bigint END AS time,
-    f.fill_time AS actual_time,f.fill_value AS price,f.quantity,COUNT(*) OVER() AS total,
-    CASE WHEN o.side='buy' THEN CASE WHEN o.reason='add' THEN 'add' ELSE 'entry' END ELSE o.reason END AS signal_type,
-    o.reason AS event_label FROM live_orders o JOIN live_runs r ON r.id=o.run_id JOIN live_fills f ON f.order_id=o.id
+  const step=(await this.pool.query('SELECT interval FROM live_runs WHERE id=$1',[id])).rows[0].interval==='30s'?30_000:60_000;
+  const rows=(await this.pool.query(`SELECT o.id,o.chain,o.ca,o.pair_id,o.side,o.reason,o.status,o.position_id,o.decision_time,o.decision_value,
+    f.fill_time,f.fill_value,f.quantity FROM live_orders o LEFT JOIN live_fills f ON f.order_id=o.id
     WHERE o.run_id=$1 AND ($2::text IS NULL OR o.chain=$2) AND ($3::text IS NULL OR o.ca=$3) AND ($4::text IS NULL OR o.pair_id=$4)
-    AND f.fill_time BETWEEN $5 AND ($6 + CASE WHEN r.interval='30s' THEN 29999 ELSE 59999 END)
-    ORDER BY f.fill_time,o.id LIMIT $7 OFFSET $8`,[id,q.chain??null,q.ca??null,q.pairId??null,from,to,size,(page-1)*size])).rows;
-  return {items:rows.map(r=>({...r,reason_json:{message:`${r.event_label} · 实际成交时间 ${new Date(Number(r.actual_time)).toISOString()}`}})),total:Number(rows[0]?.total??0)};
+    AND (f.fill_time BETWEEN $5 AND ($6+$7) OR (f.fill_time IS NULL AND o.status<>'filled' AND o.decision_time BETWEEN ($5-$7) AND ($6+$7)))
+    ORDER BY COALESCE(f.fill_time,o.decision_time),o.id`,[id,q.chain??null,q.ca??null,q.pairId??null,from,to,step])).rows;
+  const items=rows.map(o=>{const filled=o.fill_time!=null,actual=Number(filled?o.fill_time:o.decision_time),time=filled?Math.floor(actual/step)*step:decisionBucket(actual,o.reason,step);
+   const side=o.side==='buy'?'买入':'卖出',label=filled?(o.reason==='add'?'加仓':o.side==='buy'?'买入':'卖出'):`${side}决策（${({pending:'待执行',submitted:'已提交',unknown:'待核实',failed:'失败',cancelled:'已取消'} as Record<string,string>)[o.status]??'未成交'}）`;
+   return {id:o.id,chain:o.chain,ca:o.ca,pair_id:o.pair_id,time,actual_time:actual,price:Number(filled?o.fill_value:o.decision_value),quantity:filled?Number(o.quantity):null,
+    signal_type:filled?(o.side==='buy'?(o.reason==='add'?'add':'entry'):o.reason):'decision',event_label:label,status:o.status,
+    reason_json:{message:`${label} · ${filled?'实际成交':'策略决策'}时间 ${new Date(actual).toISOString()} · ${o.reason}`}};
+  }).filter(o=>o.time>=from&&o.time<=to);
+  if(q.chain&&q.ca){
+   const history=(await this.pool.query(`SELECT o.id,o.chain,o.ca,o.position_id,o.side,o.reason FROM live_orders o JOIN live_fills f ON f.order_id=o.id
+    WHERE o.run_id=$1 AND o.chain=$2 AND o.ca=$3 AND o.status='filled' ORDER BY f.fill_time,o.decision_time,o.id`,[id,q.chain,q.ca])).rows;
+   const sequence=new Map<string,number>(),labels=new Map<string,string>(),cycleLabels=new Map<string,{no:number;adds:number}>();
+   for(const o of history){const key=`${o.chain}:${o.ca}`,cycleKey=String(o.position_id??o.id);let cycle=cycleLabels.get(cycleKey);
+    if(o.side==='buy'&&(!cycle||o.reason!=='add'&&!o.position_id)){cycle={no:(sequence.get(key)??0)+1,adds:0};sequence.set(key,cycle.no);cycleLabels.set(cycleKey,cycle);}
+    if(!cycle)continue;
+    if(o.side==='buy'&&o.reason==='add')labels.set(o.id,`加${cycle.no}.${++cycle.adds}`);
+    else labels.set(o.id,`${o.side==='buy'?'买':'卖'}${cycle.no}`);
+   }
+   for(const item of items)if(item.status==='filled'&&labels.has(item.id))item.event_label=labels.get(item.id)!;
+  }
+  return {items:items.slice((page-1)*size,page*size),total:items.length};
  }
  @Get('live-runs/:id/external-signals') async externalSignals(@Param('id') id:string,@Query() q:Record<string,string>){
   const page=Math.max(1,Number(q.page)||1),size=Math.min(500,Math.max(1,Number(q.pageSize)||500));

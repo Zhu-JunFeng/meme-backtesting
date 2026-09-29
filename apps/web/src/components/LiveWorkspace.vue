@@ -10,16 +10,18 @@ import LivePortfolio from './LivePortfolio.vue';
 const props=defineProps<{mode:'paper'|'live'}>();
 const templates=ref<any[]>([]),versions=ref<any[]>([]),runs=ref<any[]>([]),detail=ref<any>();
 const templateId=ref<string>(),versionId=ref<string>(),selectedRunId=ref<string>(),selectedWatch=ref<string>();
-const password=ref(''),authorized=ref(false),loading=ref(false),busy=ref(false),chartEpoch=ref(0);
+const password=ref(''),authorized=ref(false),loading=ref(false),busy=ref(false),chartEpoch=ref(0),chartAnchor=ref<any>(),locating=ref(false);
 const detailElement=ref<HTMLElement|null>(null);
+const chartElement=ref<HTMLElement|null>(null);
 const form=ref({name:'',chain:'sol',signalSource:'fomo_new_project_expanded',interval:'30s',valueType:'mcap',initialCapital:1000,walletAddress:'',maxOrderNative:0.01,maxTotalNative:0.05,maxDailyLossUsd:20,maxPositions:1,tip:0.001,slippagePercent:5});
 const signalSources=[{label:'FOMO 新项目（扩大信号）',value:'fomo_new_project_expanded'},{label:'Top Cluster 首次买入',value:'top_cluster_first_buy'}];
 function signalSourceText(value:string){return signalSources.find(x=>x.value===value)?.label??'全部来源（旧任务）';}
 const current=computed(()=>runs.value.find(r=>r.id===selectedRunId.value));
 const secureAdminContext=window.location.protocol==='https:'||['localhost','127.0.0.1'].includes(window.location.hostname);
 const chosenWatch=computed(()=>detail.value?.watches?.find((w:any)=>`${w.chain}:${w.ca}:${w.pair_id}`===selectedWatch.value));
-const chartSymbol=computed(()=>chosenWatch.value?`${chosenWatch.value.chain}:${chosenWatch.value.ca}:${chosenWatch.value.pair_id}:${detail.value.run.value_type}`:'');
-const real=props.mode==='live';let timer:number|undefined,request=0;
+const chartSymbol=computed(()=>selectedWatch.value&&detail.value?`${selectedWatch.value}:${detail.value.run.value_type}`:'');
+const watchOptions=computed(()=>{const options=(detail.value?.watches??[]).map((w:any)=>({value:`${w.chain}:${w.ca}:${w.pair_id}`,label:`${w.chain.toUpperCase()} · ${w.ca} · ${w.pair_id}`}));for(const pair of chartAnchor.value?.pairIds??[]){const [chain,ca]=String(chartAnchor.value.symbol).split(':');const value=`${chain}:${ca}:${pair}`;if(!options.some((o:any)=>o.value===value))options.push({value,label:`${chain.toUpperCase()} · ${ca} · ${pair}（历史交易池）`});}return options;});
+const real=props.mode==='live';let timer:number|undefined,request=0,locateRequest=0;
 function statusText(s:string){return ({paused:'已暂停',running:'运行中',stopped:'已停止'} as Record<string,string>)[s]??s;}
 function statusColor(s:string){return ({paused:'default',running:'green',stopped:'default'} as Record<string,string>)[s]??'default';}
 function feedText(s:string){return ({connecting:'连接中',recovering:'补行情',connected:'行情正常',paused:'已暂停'} as Record<string,string>)[s]??'连接中';}
@@ -35,10 +37,12 @@ async function refresh(){
  }catch{message.error('实时任务状态读取失败');}
 }
 async function loadDetail(id:string){const epoch=++request;const data=(await api.get(`/live-runs/${id}`)).data;if(epoch!==request)return;detail.value=data;
- if(!data.watches.some((w:any)=>`${w.chain}:${w.ca}:${w.pair_id}`===selectedWatch.value)){
+ if(!data.watches.some((w:any)=>`${w.chain}:${w.ca}:${w.pair_id}`===selectedWatch.value)&&!chartAnchor.value?.pairIds?.includes(selectedWatch.value?.split(':').slice(2).join(':'))){
   const w=data.watches.find((x:any)=>x.state_json?.position)||data.watches[0];selectedWatch.value=w?`${w.chain}:${w.ca}:${w.pair_id}`:undefined;
  }
 }
+async function locate(kind:'positionId'|'orderId',id:string,pairId?:string){const epoch=++locateRequest;locating.value=true;try{const data=(await api.get(`/live-runs/${detail.value.run.id}/locate`,{params:{[kind]:id,...(pairId?{pairId}:{})}})).data;if(epoch!==locateRequest)return;chartAnchor.value=data;selectedWatch.value=data.symbol.slice(0,data.symbol.lastIndexOf(':'));await nextTick();chartElement.value?.scrollIntoView({block:'start',behavior:window.matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'});}catch(e:any){if(epoch===locateRequest)message.error(e.response?.data?.message??'点位定位失败');}finally{if(epoch===locateRequest)locating.value=false;}}
+async function selectPair(value:string){selectedWatch.value=value;if(chartAnchor.value){const [chain,ca,...rest]=value.split(':'),pairId=rest.join(':'),[anchorChain,anchorCa]=String(chartAnchor.value.symbol).split(':');if(chain!==anchorChain||ca!==anchorCa||!chartAnchor.value.pairIds.includes(pairId)){locateRequest++;chartAnchor.value=undefined;return;}const id=chartAnchor.value.positionId,order=chartAnchor.value.orderId;await locate(id?'positionId':'orderId',id??order,pairId);}}
 async function checkPassword(){
  if(!secureAdminContext)return message.error('当前页面不是 HTTPS，禁止发送管理员口令');
  if(!password.value)return message.warning('请输入实盘管理员口令');
@@ -72,7 +76,7 @@ async function emergency(){
 }
 watch(templateId,()=>void loadVersions().catch(()=>message.error('策略版本加载失败')));
 watch(selectedRunId,async id=>{
- detail.value=undefined;selectedWatch.value=undefined;
+ locateRequest++;chartAnchor.value=undefined;detail.value=undefined;selectedWatch.value=undefined;
  if(!id)return;
  try{
   await loadDetail(id);
@@ -82,7 +86,7 @@ watch(selectedRunId,async id=>{
  }catch{message.error('任务详情加载失败');}
 });
 onMounted(async()=>{try{templates.value=(await api.get('/strategy-templates')).data.filter((t:any)=>t.status==='active');templateId.value=templates.value[0]?.id;await refresh();timer=window.setInterval(()=>void refresh(),5000);}catch{message.error('实时工作台初始化失败');}});
-onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.value=false;request++;});
+onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.value=false;request++;locateRequest++;});
 </script>
 
 <template>
@@ -119,12 +123,13 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
   <p v-if="detail.run.feed_reason" class="live-context">行情提示：{{detail.run.feed_reason}}</p>
   <div class="live-actions"><a-button type="primary" :disabled="busy||detail.run.status==='running'||detail.run.status==='stopped'||(real&&!authorized)" @click="action(detail.run.id,'start')">启动</a-button><a-button :disabled="busy||detail.run.status!=='running'||(real&&!authorized)" @click="action(detail.run.id,'pause')">暂停</a-button><a-button danger :disabled="busy||detail.run.status==='stopped'||(real&&!authorized)" @click="action(detail.run.id,'stop')">停止</a-button><span v-if="real">停止不代表平仓；已提交订单与钱包仓位必须单独核对。</span></div>
   <a-divider orientation="left">监控项目与成交</a-divider>
-  <a-empty v-if="!detail.watches.length" description="等待符合来源与链筛选的新信号；历史信号不会追加入场。" />
-  <template v-else><div class="live-watch-picker"><label for="live-watch">项目 / 主池</label><a-select id="live-watch" v-model:value="selectedWatch" show-search option-filter-prop="label" :options="detail.watches.map((w:any)=>({value:`${w.chain}:${w.ca}:${w.pair_id}`,label:`${w.chain.toUpperCase()} · ${w.ca} · ${w.pair_id}`}))" /><a-button @click="chartEpoch++">刷新 K 线</a-button></div>
+  <a-empty v-if="!detail.watches.length&&!chartAnchor" description="等待符合来源与链筛选的新信号；历史信号不会追加入场。" />
+  <template v-else><div ref="chartElement" class="live-watch-picker"><label for="live-watch">项目 / 主池</label><a-select id="live-watch" :value="selectedWatch" show-search option-filter-prop="label" :options="watchOptions" @change="selectPair" /><a-button @click="chartEpoch++">刷新 K 线</a-button></div>
+   <p v-if="locating" class="live-context">正在定位原始 K 线与成交点位…</p><p v-if="chartAnchor?.pairIds?.length>1" class="live-context">该笔持仓涉及 {{chartAnchor.pairIds.length}} 个交易池；当前仅绘制所选交易池的行情和点位，不拼接不同池 K 线。</p><p v-if="chartAnchor?.decision" class="live-context">当前定位的是{{chartAnchor.decision.status==='filled'?'成交':'未成交'}}决策；决策标记不代表实际成交。</p>
    <p v-if="chosenWatch" class="live-context">首次监控 {{beijingTime(chosenWatch.signal_time,true)}} · {{signalSourceText(chosenWatch.signal_source)}} · {{watchText(chosenWatch.status)}} · 市值 {{chosenWatch.current_mcap==null?'未知':formatNumber(chosenWatch.current_mcap)}} USD <span v-if="chosenWatch.recovery_reason">· {{chosenWatch.recovery_reason}}</span></p>
-   <TradingViewChart v-if="chartSymbol" :key="`${chartSymbol}:${chartEpoch}`" :symbol="chartSymbol" :interval="detail.run.interval" :live-run-id="detail.run.id" />
+   <TradingViewChart v-if="chartSymbol" :key="`${chartSymbol}:${chartEpoch}`" :symbol="chartSymbol" :interval="detail.run.interval" :live-run-id="detail.run.id" :anchor="chartAnchor" />
   </template>
-  <LivePortfolio :key="detail.run.id" :run-id="detail.run.id" :value-type="detail.run.value_type" />
+  <LivePortfolio :key="detail.run.id" :run-id="detail.run.id" :value-type="detail.run.value_type" @select-position="id=>locate('positionId',id)" @select-signal="id=>locate('orderId',id)" />
   <a-divider orientation="left">运行事件</a-divider><a-empty v-if="!detail.events.length" description="暂无运行事件" /><ol v-else class="live-event-list"><li v-for="(e,i) in detail.events" :key="i"><time>{{beijingTime(e.event_time,true)}}</time><strong>{{eventText(e.kind)}}</strong><span>{{e.ca||'系统'}} · {{eventReason(e.payload)}}</span></li></ol>
  </section>
 </div>

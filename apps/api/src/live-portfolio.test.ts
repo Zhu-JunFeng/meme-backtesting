@@ -12,6 +12,7 @@ describe('live portfolio accounting',()=>{
   const result=buildLivePortfolio(orders,[],strategy,'mcap','30s',baseTime+3000);
   expect(result.open).toHaveLength(0);expect(result.closed).toHaveLength(1);
   expect(result.closed[0]).toMatchObject({buyAmount:150,buyCost:2,entryCount:2,sellAmount:178,realizedPnl:26});
+  expect(result.closed[0]).toMatchObject({tradeNo:1,pairIds:['P'],orderIds:['b1','b2','s1']});
   expect(result.summary).toMatchObject({closedCount:1,realizedPnl:26,winRate:100});
  });
  it('keeps a later re-entry independent from the first completed position',()=>{
@@ -19,6 +20,7 @@ describe('live portfolio accounting',()=>{
   const watches=[{chain:'sol',ca:'A',last_trade_at:new Date(baseTime+3000).toISOString(),state_json:{position:{quantity:5,entryPrice:10,impulse:{low:5,high:20}},lastTokenPrice:12}}];
   const result=buildLivePortfolio(orders,watches,strategy,'price','30s',baseTime+4000);
   expect(result.closed[0].id).toBe('b1');expect(result.open[0].id).toBe('b2');
+  expect(result.closed[0].tradeNo).toBe(1);expect(result.open[0].tradeNo).toBe(2);
   expect(result.open[0].unrealizedPnl).toBeCloseTo(8.2);expect(result.open[0].takeProfitValue).toBe(15);expect(result.open[0].stopLossValue).toBe(9);
  });
  it('does not invent current profit from stale quotes or contradictory fills',()=>{

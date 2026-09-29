@@ -405,6 +405,8 @@ export class LiveService {
   const c=await this.pool.connect();try{await c.query('BEGIN');
    const claimed=await c.query("UPDATE live_orders SET status='filled',updated_at=now() WHERE id=$1 AND status='pending' RETURNING id",[o.id]);
    if(!claimed.rowCount){await c.query('ROLLBACK');return;}
+   if(o.side==='buy'&&!ctx.evaluator.state.position&&s.position?.impulse)
+    await c.query("UPDATE live_orders SET raw_result=jsonb_set(COALESCE(raw_result,'{}'::jsonb),'{impulse}',$2::jsonb) WHERE id=$1",[o.id,JSON.stringify(s.position.impulse)]);
    const fillValue=ctx.run.value_type==='price'?trade.price:trade.mcap!;
    await c.query("INSERT INTO live_fills(order_id,fill_time,fill_price,fill_value,quantity,gross_amount,fee,slippage_cost,tax_cost,market_cap) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",[o.id,trade.time,trade.price,fillValue,quantity,gross,fee,slip,tax,trade.mcap??null]);
    if(o.side==='buy'&&!o.position_id&&!ctx.evaluator.state.position)await c.query('UPDATE live_orders SET position_id=$2 WHERE id=$1',[o.id,o.id]);

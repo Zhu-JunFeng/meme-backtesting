@@ -5,27 +5,31 @@ import {beijingTime} from '../time';
 import {eventLabels,formatNumber,preciseValue,signedValue,valueTone} from '../format';
 
 const props=defineProps<{runId:string;valueType:'price'|'mcap'}>();
+const emit=defineEmits<{selectPosition:[id:string];selectSignal:[id:string]}>();
 type Tab='current'|'history'|'signals';
 const tab=ref<Tab>('current'),page=ref(1),loading=ref(false),error=ref(''),items=ref<any[]>([]),total=ref(0),summary=ref<any>();
-let timer:number|undefined,epoch=0;
+let timer:number|undefined,clockTimer:number|undefined,epoch=0,receivedAt=0;
+const clock=ref(Date.now()),serverAsOf=ref(Date.now());
 const dimension=computed(()=>props.valueType==='mcap'?'市值':'价格');
 const headers=computed(()=>tab.value==='current'?[
- {title:'CA',dataIndex:'ca',key:'ca',width:240},{title:`买入${dimension.value}`,key:'buyValue'},{title:'买入金额（USD）',key:'buyAmount'},{title:'Token 数',key:'quantity'},{title:'首次买入时间',key:'buyTime',width:178},{title:'当前估算盈亏（USD）',key:'unrealizedPnl'},{title:'行情时间',key:'valuationTime',width:178},{title:`预计止盈${dimension.value}`,key:'takeProfitValue'},{title:`预计止损${dimension.value}`,key:'stopLossValue'}
+ {title:'CA',dataIndex:'ca',key:'ca',width:240},{title:`买入${dimension.value}`,key:'buyValue'},{title:'买入金额（USD）',key:'buyAmount'},{title:'Token 数',key:'quantity'},{title:'首次买入时间',key:'buyTime',width:178},{title:'持仓时间',key:'holdDuration'},{title:'当前估算盈亏（USD）',key:'unrealizedPnl'},{title:'行情时间',key:'valuationTime',width:178},{title:`预计止盈${dimension.value}`,key:'takeProfitValue'},{title:`预计止损${dimension.value}`,key:'stopLossValue'},{title:'K 线',key:'locate'}
 ]:tab.value==='history'?[
- {title:'CA',dataIndex:'ca',key:'ca',width:240},{title:'买入金额（USD）',key:'buyAmount'},{title:`买入${dimension.value}`,key:'buyValue'},{title:'首次买入时间',key:'buyTime',width:178},{title:`卖出${dimension.value}`,key:'sellValue'},{title:'卖出时间',key:'sellTime',width:178},{title:'卖出净额（USD）',key:'sellAmount'},{title:'净盈亏（USD / %）',key:'realizedPnl'},{title:'买入 / 卖出原因',key:'reason',width:190}
+ {title:'CA',dataIndex:'ca',key:'ca',width:240},{title:'买入金额（USD）',key:'buyAmount'},{title:`买入${dimension.value}`,key:'buyValue'},{title:'首次买入时间',key:'buyTime',width:178},{title:'持仓时间',key:'holdDuration'},{title:`卖出${dimension.value}`,key:'sellValue'},{title:'卖出时间',key:'sellTime',width:178},{title:'卖出净额（USD）',key:'sellAmount'},{title:'净盈亏（USD / %）',key:'realizedPnl'},{title:'买入 / 卖出原因',key:'reason',width:190},{title:'K 线',key:'locate'}
 ]:[
- {title:'CA',dataIndex:'ca',key:'ca',width:240},{title:'信号类型',key:'side'},{title:`决策${dimension.value}`,key:'decision_value'},{title:'信号时间',key:'decision_time',width:178},{title:'原因',key:'reason'},{title:'执行状态',key:'status'}
+ {title:'CA',dataIndex:'ca',key:'ca',width:240},{title:'信号类型',key:'side'},{title:`决策${dimension.value}`,key:'decision_value'},{title:'信号时间',key:'decision_time',width:178},{title:'原因',key:'reason'},{title:'执行状态',key:'status'},{title:'K 线',key:'locate'}
 ]);
 const statusLabels:Record<string,string>={pending:'待执行',submitted:'已提交',filled:'已成交',failed:'失败',unknown:'结果待核实',cancelled:'已取消'};
 function reasonText(value:string){return eventLabels[value]??({entry:'首次买入',add:'加仓'} as Record<string,string>)[value]??'原因未记录';}
 function value(value:unknown){return value==null?'不可用':preciseValue(value);}
 function pnlPercent(row:any){const basis=Number(row.buyAmount)+Number(row.buyCost);return basis>0?Number(row.realizedPnl)/basis*100:null;}
+function duration(row:any){const start=Number(row.buyTime),end=row.sellTime==null?serverAsOf.value+Math.max(0,clock.value-receivedAt):Number(row.sellTime);if(!Number.isFinite(start)||!Number.isFinite(end)||end<start)return '不可用';const seconds=Math.floor((end-start)/1000),days=Math.floor(seconds/86400),hours=Math.floor(seconds%86400/3600),minutes=Math.floor(seconds%3600/60);return `${days?days+' 天 ':''}${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:${String(seconds%60).padStart(2,'0')}`;}
 function cell(row:any,key:string):string{
  if(key==='ca')return row.ca;
  if(key==='buyTime'||key==='sellTime'||key==='decision_time'||key==='valuationTime')return beijingTime(row[key]);
  if(key==='side')return row.side==='buy'?'买入':'卖出';
  if(key==='reason')return tab.value==='history'?`${reasonText(row.buyReason)}${row.entryCount>1?`（含 ${row.entryCount-1} 次加仓）`:''} / ${reasonText(row.sellReason)}`:reasonText(row.reason);
  if(key==='status')return statusLabels[row.status]??'状态未识别';
+ if(key==='holdDuration')return duration(row);
  if(key==='buyAmount')return formatNumber(row.buyAmount);
  if(key==='quantity')return preciseValue(row.quantity);
  if(key==='unrealizedPnl')return row.unrealizedPnl==null?'不可用':signedValue(row.unrealizedPnl);
@@ -37,12 +41,12 @@ function cell(row:any,key:string):string{
 function cellTone(key:string,row:any){return key==='unrealizedPnl'||key==='realizedPnl'?valueTone(row[key]):'';}
 async function load(){const id=++epoch;loading.value=true;error.value='';try{
  const data=(await api.get(`/live-runs/${props.runId}/portfolio`,{params:{tab:tab.value,page:page.value,pageSize:20}})).data;
- if(id!==epoch)return;items.value=data.items;total.value=data.total;summary.value=data.summary;
+ if(id!==epoch)return;items.value=data.items;total.value=data.total;summary.value=data.summary;serverAsOf.value=Number(data.asOf)||Date.now();receivedAt=Date.now();clock.value=receivedAt;
 }catch{if(id===epoch)error.value='持仓与信号加载失败，请重试';}finally{if(id===epoch)loading.value=false;}}
 watch([()=>props.runId,tab],()=>{page.value=1;items.value=[];void load();});
 watch(page,()=>void load());
-onMounted(()=>{void load();timer=window.setInterval(()=>void load(),5000);});
-onBeforeUnmount(()=>{epoch++;window.clearInterval(timer);});
+onMounted(()=>{void load();timer=window.setInterval(()=>void load(),5000);clockTimer=window.setInterval(()=>{clock.value=Date.now();},1000);});
+onBeforeUnmount(()=>{epoch++;window.clearInterval(timer);window.clearInterval(clockTimer);});
 </script>
 
 <template>
@@ -66,10 +70,10 @@ onBeforeUnmount(()=>{epoch++;window.clearInterval(timer);});
    <a-tab-pane key="signals" :tab="`买／卖信号${summary?` (${summary.buySignalCount+summary.sellSignalCount})`:''}`" />
   </a-tabs>
   <a-table class="portfolio-table" :columns="headers" :data-source="items" row-key="id" size="small" :loading="loading" :scroll="{x:tab==='history'?1500:1200}" :pagination="{current:page,pageSize:20,total,showSizeChanger:false,showTotal:(n:number)=>`共 ${n} 条`}" :locale="{emptyText:tab==='current'?'暂无已核实的当前持仓':tab==='history'?'暂无已完成的历史持仓':'暂无买卖决策'}" @change="(p:any)=>page=p.current??1">
-   <template #bodyCell="{column,record}"><span :class="cellTone(String(column.key),record)" :title="column.key==='unrealizedPnl'&&record.valuationTime?`行情时间：${beijingTime(record.valuationTime)}`:undefined">{{cell(record,String(column.key))}}</span></template>
+   <template #bodyCell="{column,record}"><a-button v-if="column.key==='locate'" type="link" size="small" @click="tab==='signals'?emit('selectSignal',record.id):emit('selectPosition',record.id)">查看点位</a-button><span v-else :class="cellTone(String(column.key),record)" :title="column.key==='unrealizedPnl'&&record.valuationTime?`行情时间：${beijingTime(record.valuationTime)}`:undefined">{{cell(record,String(column.key))}}</span></template>
   </a-table>
   <div class="portfolio-mobile" :aria-busy="loading"><a-empty v-if="!items.length&&!loading" :description="tab==='current'?'暂无已核实的当前持仓':tab==='history'?'暂无已完成的历史持仓':'暂无买卖决策'" />
-   <article v-for="row in items" :key="row.id" class="portfolio-mobile-row"><strong class="portfolio-ca">{{row.ca}}</strong><dl><template v-for="column in headers.filter(c=>c.key!=='ca')" :key="column.key"><dt>{{column.title}}</dt><dd :class="cellTone(String(column.key),row)">{{cell(row,String(column.key))}}</dd></template></dl></article>
+   <article v-for="row in items" :key="row.id" class="portfolio-mobile-row"><strong class="portfolio-ca">{{row.ca}}</strong><dl><template v-for="column in headers.filter(c=>c.key!=='ca')" :key="column.key"><dt>{{column.title}}</dt><dd v-if="column.key==='locate'"><a-button type="link" size="small" @click="tab==='signals'?emit('selectSignal',row.id):emit('selectPosition',row.id)">查看点位</a-button></dd><dd v-else :class="cellTone(String(column.key),row)">{{cell(row,String(column.key))}}</dd></template></dl></article>
    <a-pagination v-if="total>20" v-model:current="page" :page-size="20" :total="total" simple />
   </div>
  </section>
