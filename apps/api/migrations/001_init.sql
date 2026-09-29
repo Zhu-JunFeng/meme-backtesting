@@ -2,7 +2,8 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 ALTER TABLE IF EXISTS public.meme_kline ADD COLUMN IF NOT EXISTS valid boolean NOT NULL DEFAULT true;
 ALTER TABLE IF EXISTS public.meme_kline ADD COLUMN IF NOT EXISTS invalid_reason text;
 UPDATE public.meme_kline SET valid = false, invalid_reason = COALESCE(invalid_reason, 'invalid_ohlc')
-WHERE high < GREATEST(open, close) OR low > LEAST(open, close) OR high < low OR open < 0 OR high < 0 OR low < 0 OR close < 0 OR volume < 0;
+WHERE (high < GREATEST(open, close) OR low > LEAST(open, close) OR high < low OR open < 0 OR high < 0 OR low < 0 OR close < 0 OR volume < 0)
+  AND (valid IS DISTINCT FROM false OR invalid_reason IS NULL);
 CREATE TABLE IF NOT EXISTS backtest_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, status text NOT NULL, config_json jsonb NOT NULL,
   progress numeric NOT NULL DEFAULT 0, error_message text, created_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz

@@ -12,6 +12,9 @@ fi
 docker build -f deploy/Dockerfile.api -t meme-backtesting-api .
 docker build -f deploy/Dockerfile.worker -t meme-backtesting-worker .
 docker build -f deploy/Dockerfile.web -t meme-backtesting-web .
+# Only dangling, unreferenced images are removed; running/rollback containers
+# keep their image references. This leaves space for PostgreSQL migration WAL.
+docker image prune -f
 # Wait for any in-flight coordinator transaction before replacing the API.
 # The timer remains enabled; ticks during this critical section safely skip.
 exec 9>/run/lock/meme-backtest-batch.lock
@@ -30,7 +33,7 @@ for service in meme-backtesting-worker meme-backtesting-api meme-backtesting-web
 done
 # Migrate only after the old Worker exits. Otherwise it could observe the new
 # running status for legacy attention tasks before the recovery code is live.
-if ! docker run --rm --network host --env-file deploy/.env -v "$PWD:/app" -w /app postgres:18-alpine sh -ec 'for migration in apps/api/migrations/*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration"; done'; then
+if ! docker run --rm --network host --env-file deploy/.env -v "$PWD:/app" -w /app postgres:18-alpine sh deploy/apply-migrations.sh; then
   for service in meme-backtesting-api meme-backtesting-worker meme-backtesting-web; do
     if docker inspect "$service" >/dev/null 2>&1; then docker start "$service"; fi
   done
