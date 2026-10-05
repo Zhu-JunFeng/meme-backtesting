@@ -64,25 +64,30 @@ export function compareTrades(orders,trades,step,cutoff){
  const items=[];
  for(const cycle of cycles){
   const rows=byPool.get(`${cycle.chain}:${cycle.ca}:${cycle.pairId}`)??[];
-  const candleTime=Math.floor(number(cycle.buy.decision_time)/step)*step;
+  // Live entry decisions are emitted at bar close; historical entry_time is bar open.
+  const candleTime=Math.floor((number(cycle.buy.decision_time)-1)/step)*step;
   let best=-1,bestDistance=Infinity;
   for(let i=0;i<rows.length;i++){const distance=Math.abs(number(rows[i].entry_time)-candleTime);if(distance<bestDistance){best=i;bestDistance=distance;}}
   const backtest=best<0?null:rows.splice(best,1)[0];
   const entryDeltaBars=backtest?Math.round((number(backtest.entry_time)-candleTime)/step):null;
+  const exitDeltaBars=backtest&&cycle.sell?Math.round((number(backtest.exit_time)-Math.floor(number(cycle.sell.decision_time)/step)*step)/step):null;
   const liveReason=cycle.sell?.reason??null,backtestReason=backtest?.exit_reason??null;
-  let status='数据不足';
+  const invested=[cycle.buy,...cycle.adds].reduce((sum,o)=>sum+number(o.gross_amount)+number(o.fee)+number(o.slippage_cost)+number(o.tax_cost),0);
+  const received=cycle.sell?number(cycle.sell.gross_amount)-number(cycle.sell.fee)-number(cycle.sell.slippage_cost)-number(cycle.sell.tax_cost):null;
+  const liveNetPnl=received===null?null:received-invested;
+  let status='回测未触发';
   if(backtest){
    if(Math.abs(entryDeltaBars)<=1&&liveReason===backtestReason)status='吻合';
    else if(backtestReason==='end_of_backtest')status='可解释差异';
    else status='疑似异常';
   }
   items.push({status,chain:cycle.chain,ca:cycle.ca,pairId:cycle.pairId,
-   live:{buyDecisionTime:number(cycle.buy.decision_time),buyFillTime:number(cycle.buy.fill_time),buyValue:number(cycle.buy.fill_value),sellDecisionTime:number(cycle.sell?.decision_time),sellFillTime:number(cycle.sell?.fill_time),sellValue:number(cycle.sell?.fill_value),exitReason:liveReason,positionId:cycle.buy.position_id??cycle.buy.id},
+   live:{buyDecisionTime:number(cycle.buy.decision_time),buyFillTime:number(cycle.buy.fill_time),buyValue:number(cycle.buy.fill_value),sellDecisionTime:number(cycle.sell?.decision_time),sellFillTime:number(cycle.sell?.fill_time),sellValue:number(cycle.sell?.fill_value),exitReason:liveReason,netPnl:liveNetPnl,positionId:cycle.buy.position_id??cycle.buy.id},
    backtest:backtest?{tradeNo:number(backtest.trade_no),entryTime:number(backtest.entry_time),entryValue:number(backtest.entry_price),exitTime:number(backtest.exit_time),exitValue:number(backtest.exit_price),exitReason:backtestReason,netPnl:number(backtest.net_pnl)}:null,
-   entryDeltaBars,reasonMatches:liveReason===backtestReason});
+   entryDeltaBars,exitDeltaBars,reasonMatches:liveReason===backtestReason,pnlDelta:backtest&&liveNetPnl!==null?liveNetPnl-number(backtest.net_pnl):null});
  }
  const backtestOnly=[...byPool.values()].flat().map(t=>({chain:t.chain,ca:t.ca,pairId:t.pair_id,entryTime:number(t.entry_time),exitTime:number(t.exit_time),exitReason:t.exit_reason,netPnl:number(t.net_pnl)}));
- return {items,backtestOnly,summary:{liveCycles:cycles.length,matched:items.filter(i=>i.status==='吻合').length,explainable:items.filter(i=>i.status==='可解释差异').length,suspected:items.filter(i=>i.status==='疑似异常').length,insufficient:items.filter(i=>i.status==='数据不足').length,backtestOnly:backtestOnly.length}};
+ return {items,backtestOnly,summary:{liveCycles:cycles.length,liveNetPnl:items.reduce((sum,i)=>sum+(i.live.netPnl??0),0),matched:items.filter(i=>i.status==='吻合').length,exitOutsideOneBar:items.filter(i=>i.exitDeltaBars!==null&&Math.abs(i.exitDeltaBars)>1).length,explainable:items.filter(i=>i.status==='可解释差异').length,suspected:items.filter(i=>i.status==='疑似异常').length,unmatched:items.filter(i=>i.status==='回测未触发').length,backtestOnly:backtestOnly.length}};
 }
 
 async function snapshotEvidence(db,paperId,cutoff){
