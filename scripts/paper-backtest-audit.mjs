@@ -32,13 +32,13 @@ export function selectBoughtPools(orders,watches,events,cutoff){
  return {pairs,gates,filledBuys};
 }
 
-export function auditOrders(orders,gates,cutoff){
+export function auditOrders(orders,gates,cutoff,step=60_000){
  const byCa=new Map(gates.map(g=>[key(g),g.signalTime]));
  const filled=orders.filter(o=>o.status==='filled'&&number(o.fill_time)<=cutoff);
  const issues=[];
  for(const order of filled){
   if(!Number.isFinite(number(order.decision_time))||!Number.isFinite(number(order.fill_time))||number(order.fill_time)<number(order.decision_time))issues.push({orderId:order.id,issue:'成交早于决策或时间无效'});
-  if(order.side==='buy'&&number(order.decision_time)<=byCa.get(key(order)))issues.push({orderId:order.id,issue:'买入未严格晚于任务信号'});
+  if(order.side==='buy'&&Math.floor((number(order.decision_time)-1)/step)*step<=byCa.get(key(order)))issues.push({orderId:order.id,issue:'买入决策所属 K 线开盘未严格晚于任务信号'});
   if(!(number(order.fill_value)>0)||!(number(order.fill_price)>0)||!(number(order.quantity)>0))issues.push({orderId:order.id,issue:'成交值、币价或数量无效'});
  }
  return {filledOrders:filled.length,filledBuys:filled.filter(o=>o.side==='buy').length,filledSells:filled.filter(o=>o.side==='sell').length,issues};
@@ -98,7 +98,7 @@ async function snapshotEvidence(db,paperId,cutoff){
  const events=(await db.query("SELECT id,chain,ca,pair_id,kind,event_time,payload FROM live_events WHERE run_id=$1 AND kind='external_signal' AND event_time<=$2 ORDER BY event_time,id",[paperId,cutoff])).rows;
  const selected=selectBoughtPools(orders,watches,events,cutoff);
  if(!selected.pairs.length)throw Error('当前任务无实际买入，不能创建空对照回测');
- const orderAudit=auditOrders(orders,selected.gates,cutoff);
+ const orderAudit=auditOrders(orders,selected.gates,cutoff,run.interval==='30s'?30_000:60_000);
  if(orderAudit.issues.length)throw Error(`模拟盘订单时序或成交字段存在 ${orderAudit.issues.length} 项问题，暂停提交：${JSON.stringify(orderAudit.issues)}`);
  const evidenceHash=hash({paperId,cutoff,strategyVersionId:run.strategy_version_id,strategyJson:run.strategy_json,pairs:selected.pairs,gates:selected.gates,orders});
  return {run,watches,orders,events,selected,orderAudit,evidenceHash};

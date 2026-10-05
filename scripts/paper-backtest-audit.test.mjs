@@ -19,6 +19,7 @@ test('selects only filled-buy pools and uses the paper task signal, not an unrel
 test('refuses missing signal or a buy decision at the signal boundary',()=>{
  assert.throws(()=>selectBoughtPools([buy],[],[],300000),/缺少/);
  assert.throws(()=>selectBoughtPools([{...buy,decision_time:'100123'}],[],[signal],300000),/未严格晚于/);
+ assert.equal(auditOrders([{...buy,decision_time:'120000',fill_time:'120004'}],[{chain:'robin',ca:'0xabc',signalTime:100123}],300000).issues[0].issue,'买入决策所属 K 线开盘未严格晚于任务信号');
 });
 
 test('compares entry bucket and exit reason, keeps historical terminal close distinct',()=>{
