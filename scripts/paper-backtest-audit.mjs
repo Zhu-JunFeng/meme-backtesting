@@ -132,7 +132,7 @@ async function prepare(db,paperId,cutoff,{submit=false,api='http://127.0.0.1:300
    const chunks=[];for(let n=0;n<candles.length;n+=256)chunks.push(candles.slice(n,n+256));
    for(let n=0;n<chunks.length;n+=64){const batch=chunks.slice(n,n+64),values=batch.flatMap((chunk,j)=>[id,poolKey(symbol),n+j,JSON.stringify(chunk)]);await db.query(`INSERT INTO backtest_input_chunks(run_id,pool_key,chunk_no,candles_json) VALUES ${batch.map((_,j)=>`($${j*4+1},$${j*4+2},$${j*4+3},$${j*4+4})`).join(',')}`,values);}
    let normalized=0;for(let n=0;n<candles.length;n++)normalized+=n?Math.max(1,Math.ceil((candles[n].time-candles[n-1].time)/step)):1;
-   await db.query('INSERT INTO backtest_input_pools(run_id,pool_key,symbol_json,chunk_count,real_count,normalized_count,invalid_count) VALUES($1,$2,$3,$4,$5,$6,0)',[id,poolKey(symbol),JSON.stringify(symbol),chunks.length,candles.length,normalized]);
+   await db.query('INSERT INTO backtest_input_pools(run_id,pool_key,symbol_json,chunk_count,candle_count,normalized_count,invalid_count) VALUES($1,$2,$3,$4,$5,$6,0)',[id,poolKey(symbol),JSON.stringify(symbol),chunks.length,candles.length,normalized]);
   }
   await db.query("UPDATE backtest_runs SET input_ready=true,phase='computing' WHERE id=$1",[id]);
   await db.query('COMMIT');
