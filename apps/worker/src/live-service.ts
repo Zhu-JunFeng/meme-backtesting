@@ -2,16 +2,23 @@ import {createHash} from 'node:crypto';
 import {io,type Socket} from 'socket.io-client';
 import WebSocket from 'ws';
 import type {Pool,PoolClient} from 'pg';
-import {LiveCandleAggregator,LiveEvaluator,detectImpulse,type ClosedMarketBar,type LiveDecision,type MarketTrade} from '@meme/engine';
+import {LiveCandleAggregator,LiveEvaluator,detectImpulse,validCandle,type ClosedMarketBar,type LiveDecision,type MarketTrade} from '@meme/engine';
 import type {Candle,StrategyConfig} from '@meme/domain';
 import {parseMarketTrades,parseProjectSignal,resolveLivePool,type ProjectSignal} from './live-input.js';
 
-type Run={id:string;mode:'paper'|'live';chain:string;signal_source:string;interval:'30s'|'1m';value_type:'price'|'mcap';status:string;execution_hold_reason:string|null;strategy_json:StrategyConfig;cash:string;realized_pnl:string;wallet_address:string|null;risk_json:any;started_at:Date};
+type Run={id:string;mode:'paper'|'live';chain:string;signal_source:string;interval:'30s'|'1m';value_type:'price'|'mcap';status:string;execution_hold_reason:string|null;strategy_json:StrategyConfig;cash:string;realized_pnl:string;wallet_address:string|null;risk_json:any;started_at:Date;execution_version:string;execution_switched_at:Date|null};
 type Watch={run_id:string;chain:string;ca:string;pair_id:string;dex_id:string|null;signal_time:string;state_json:any;last_candle_time:string|null;status:string;current_mcap:string|null;last_trade_at:string|null};
 type Context={run:Run;watch:Watch;evaluator:LiveEvaluator;ready:boolean;nextRecoveryAt:number;noOrdersBefore:number};
 const watchKey=(r:string,c:string,a:string)=>`${r}:${c}:${a}`;
 const pairKey=(c:string,p:string)=>`${c}:${p.toLowerCase()}`;
 export const LIVE_CA_LIMIT=20,MIN_MARKET_CAP=50_000;
+export const LIVE_EXECUTION_VERSION='closed-bar-v2';
+export function simulatedBarPrice(valueType:'price'|'mcap',value:number,bar:ClosedMarketBar,price:ClosedMarketBar|undefined){
+ if(!price || !validCandle(price.candle) || !validCandle(bar.candle) || price.type!=='price' || price.interval!==bar.interval || price.candle.time!==bar.candle.time || price.candle.closeTime!==bar.candle.closeTime || price.symbol.ca!==bar.symbol.ca || price.symbol.pairId!==bar.symbol.pairId || price.symbol.chain!==bar.symbol.chain)return;
+ if(valueType==='mcap' && (!bar.closeTradeId || !Number.isSafeInteger(bar.closeTradeTime) || price.closeTradeId!==bar.closeTradeId || price.closeTradeTime!==bar.closeTradeTime || !!price.candle.synthetic!==!!bar.candle.synthetic))return;
+ const result=valueType==='price'?value:price.candle.close*value/bar.candle.close;
+ return Number.isFinite(result)&&result>0?result:undefined;
+}
 export const eligibleMarketCap=(value:unknown)=>Number.isFinite(Number(value))&&value!==null&&value!==undefined&&Number(value)>=MIN_MARKET_CAP;
 export const canMonitor=(active:number,existing:boolean)=>existing||active<LIVE_CA_LIMIT;
 export function* backfillWindows(from:number,to:number,step:number):Generator<{from:number;to:number}>{
@@ -67,10 +74,15 @@ export class XxyyTradeClient {
 }
 
 export class LiveService {
- private readonly aggregator=new LiveCandleAggregator(bar=>this.enqueue(()=>this.onBar(bar)));
+ private closedBars:ClosedMarketBar[]=[];
+ private readonly aggregator=new LiveCandleAggregator(bar=>this.closedBars.push(bar));
+ private executionClient?:PoolClient;
+ private get db(){return this.executionClient??this.pool;}
+ private submissions:Array<{ctx:Context;id:string;decision:LiveDecision;amount:number}>=[];
  private readonly watches=new Map<string,Context>();
  private readonly sockets=new Map<string,Socket>();
  private readonly connected=new Set<string>();
+ private readonly confirmedFeeds=new Set<string>();
  private readonly telemetry=new Map<string,{late:number;dropped:number;closed:number;tooOld:number;reconnect:number;lastTradeAt:number}>();
  private readonly dirtyWatches=new Set<string>();
  private lastMcapCheck=0;
@@ -88,19 +100,34 @@ export class LiveService {
   this.lock=client;
   await this.refresh();this.connectSignals();
   this.refreshTimer=setInterval(()=>this.enqueue(()=>this.refresh()),5_000);
-  this.flushTimer=setInterval(()=>this.aggregator.flush(Date.now()),1_000);
+  this.flushTimer=setInterval(()=>{const receivedAt=Date.now();this.enqueue(()=>this.flushBars(receivedAt));},1_000);
   console.log('live service started; real orders',process.env.LIVE_TRADING_ENABLED==='true'?'armed by server configuration':'disabled');
  }
  async close(){this.stopped=true;if(this.refreshTimer)clearInterval(this.refreshTimer);if(this.flushTimer)clearInterval(this.flushTimer);this.signal?.close();for(const socket of this.sockets.values()){socket.removeAllListeners();socket.disconnect();}await this.chain;await this.flushTelemetry();if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(63920924)');this.lock.release();}}
+ private async switchExecution(){
+  const c=await this.pool.connect();try{await c.query('BEGIN');
+   const switched=await c.query("UPDATE live_runs SET execution_version=$1,execution_switched_at=now() WHERE status='running' AND execution_version<>$1 RETURNING id,mode",[LIVE_EXECUTION_VERSION]);
+   for(const r of switched.rows){
+    if(r.mode==='paper')await c.query("UPDATE live_orders SET status='cancelled',raw_result=COALESCE(raw_result,'{}'::jsonb)||$2::jsonb,updated_at=now() WHERE run_id=$1 AND status='pending'",[r.id,JSON.stringify({cancelReason:'切换收盘规则，旧待成交模拟订单不追溯成交'})]);
+    await c.query("INSERT INTO live_events(run_id,kind,event_key,event_time,payload) VALUES($1,'execution_switched',$2,$3,$4) ON CONFLICT(event_key) DO NOTHING",[r.id,`${r.id}:${LIVE_EXECUTION_VERSION}`,Date.now(),JSON.stringify({version:LIVE_EXECUTION_VERSION,reason:'改为完整K线收盘后决策；模拟按回测阈值撮合；实盘以真实成交为准'})]);
+   }
+   // A crash between durable intent and network submission has an uncertain outcome.
+   // Fail closed rather than ever resending it automatically.
+   await c.query("UPDATE live_orders o SET status='unknown',updated_at=now() FROM live_runs r WHERE o.run_id=r.id AND r.mode='live' AND r.status='running' AND o.status='pending'");
+   await c.query("UPDATE live_runs r SET execution_hold_reason=COALESCE(execution_hold_reason,'存在待核验实盘订单，禁止自动重发') WHERE mode='live' AND status='running' AND EXISTS(SELECT 1 FROM live_orders o WHERE o.run_id=r.id AND o.status IN ('submitted','unknown'))");
+   await c.query('COMMIT');
+  }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
+ }
  private async refresh(){
   if(this.stopped)return;
+  await this.switchExecution();
   const rows=(await this.pool.query("SELECT * FROM live_runs WHERE status='running'")).rows as Run[];
   const active=new Set(rows.map(r=>r.id));
   const watchRows=(await this.pool.query("SELECT w.* FROM live_watches w JOIN live_runs r ON r.id=w.run_id WHERE r.status='running' AND w.status IN ('monitoring','recovering','pending_eviction')")).rows as Watch[];
   const runMap=new Map(rows.map(r=>[r.id,r]));
   for(const w of watchRows){const key=watchKey(w.run_id,w.chain,w.ca);const old=this.watches.get(key);if(old){old.run=runMap.get(w.run_id)!;old.watch={...w,last_trade_at:old.watch.last_trade_at??w.last_trade_at,current_mcap:old.watch.current_mcap??w.current_mcap};continue;}
    const run=runMap.get(w.run_id);if(!run)continue;
-   const ctx:Context={run,watch:w,evaluator:new LiveEvaluator(run.strategy_json,Number(w.signal_time),w.state_json?.history?w.state_json:undefined),ready:false,nextRecoveryAt:0,noOrdersBefore:Date.now()};
+   const ctx:Context={run,watch:w,evaluator:new LiveEvaluator(run.strategy_json,Number(w.signal_time),w.state_json?.history?w.state_json:undefined),ready:false,nextRecoveryAt:0,noOrdersBefore:Math.max(Date.now(),new Date(run.execution_switched_at??0).getTime())};
    this.watches.set(key,ctx);
    await this.markRecovering(ctx,'服务启动，等待行情订阅并补数');
   }
@@ -189,28 +216,31 @@ export class LiveService {
   if(!template.includes('{pairId}')||!template.includes('{dexId}'))throw new Error('XXYY_TRADE_CHANNEL_TEMPLATE 必须包含 {pairId} 和 {dexId}');
   const channel=template.replaceAll('{pairId}',watch.pair_id).replaceAll('{dexId}',watch.dex_id).replaceAll('{chain}',watch.chain),event=process.env.XXYY_TRADE_EVENT||'NEW_TRADE';
   const key=pairKey(watch.chain,watch.pair_id);
-  const previous=this.sockets.get(key);if(previous){previous.removeAllListeners();previous.disconnect();this.connected.delete(key);}
+  const previous=this.sockets.get(key);if(previous){previous.removeAllListeners();previous.disconnect();this.connected.delete(key);}this.confirmedFeeds.delete(key);
   const socket=io(process.env.XXYY_PUSH_URL??'wss://web-push.xxyy.io/data',{transports:['websocket'],forceNew:true,reconnection:true});
   this.sockets.set(key,socket);
   socket.on('connect',()=>{this.connected.add(key);socket.emit('SUBSCRIBE',channel,{});this.enqueue(async()=>{for(const ctx of this.watches.values())if(pairKey(ctx.watch.chain,ctx.watch.pair_id)===key){ctx.ready=false;ctx.noOrdersBefore=Date.now();ctx.nextRecoveryAt=0;await this.markRecovering(ctx,'连接成功，补齐断线期间行情');}await this.refresh();});});
-  socket.on('disconnect',()=>this.enqueue(()=>this.feedInterrupted(watch.chain,watch.pair_id)));
+  socket.on('disconnect',()=>{this.connected.delete(key);this.confirmedFeeds.delete(key);this.enqueue(()=>this.feedInterrupted(watch.chain,watch.pair_id));});
   socket.on(event,(raw,receivedChannel)=>{for(const trade of parseMarketTrades(raw,receivedChannel,channel,{chain:watch.chain,ca:watch.ca,pairId:watch.pair_id}))this.enqueue(()=>this.onTrade(trade));});
   socket.on('connect_error',error=>console.error('XXYY trade connection:',redact(error)));
  }
  private async feedInterrupted(chain:string,pairId:string){
   if(this.stopped)return;
   this.connected.delete(pairKey(chain,pairId));
+  this.confirmedFeeds.delete(pairKey(chain,pairId));
   this.aggregator.discardPair(chain,pairId);
   const contexts=[...this.watches.values()].filter(c=>c.watch.chain===chain&&c.watch.pair_id===pairId);
   for(const ctx of contexts){ctx.ready=false;ctx.noOrdersBefore=Date.now();await this.markRecovering(ctx,'实时成交连接断开，自动重连中');if(ctx.run.mode==='paper')await this.pool.query("UPDATE live_orders SET status='cancelled',updated_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3 AND status='pending'",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);this.bump(ctx.run.id,'reconnect');}
  }
  private async onTrade(trade:MarketTrade){
-  if(this.stopped || trade.time>Date.now()+5_000)return;
+  if(this.stopped || !Number.isSafeInteger(trade.time) || trade.time<0 || trade.time>Date.now()+5_000)return;
   const contexts=[...this.watches.values()].filter(c=>c.watch.chain===trade.chain&&c.watch.pair_id===trade.pairId&&c.run.status==='running');
   if(!contexts.length)return;
+  await this.flushBars(Math.min(Date.now(),trade.time));
   const result=this.aggregator.acceptDetailed(trade);
   if(result.late)for(const ctx of contexts)this.bump(ctx.run.id,'late');
   if(!result.accepted){if(result.reason==='closed'||result.reason==='too_old')for(const ctx of contexts)this.bump(ctx.run.id,result.reason==='closed'?'closed':'tooOld');return;}
+  if(this.connected.has(pairKey(trade.chain,trade.pairId)))this.confirmedFeeds.add(pairKey(trade.chain,trade.pairId));
   if(result.late)return; // May update an open candle, but never simulate a fill or a tick exit.
   for(const ctx of contexts){
    if(trade.time<=Number(ctx.watch.last_trade_at??0))continue;
@@ -222,36 +252,76 @@ export class LiveService {
    if(!ctx.ready)continue;
    if(ctx.run.value_type==='mcap'&&(!trade.mcap||trade.mcap<=0)){await this.markRecovering(ctx,'实时成交缺少可靠市值');continue;}
    ctx.evaluator.state.lastTokenPrice=trade.price;
-   if(ctx.run.mode==='paper'&&trade.time>ctx.noOrdersBefore)await this.paperFill(ctx,trade);
-   const decision=ctx.evaluator.onTrade(trade,ctx.run.value_type);
-   if(decision && trade.time>ctx.noOrdersBefore && !await this.pending(ctx))await this.createDecision(ctx,decision);
   }
  }
- private async onBar(bar:ClosedMarketBar){
-  let c=bar.candle;
-  const inserted=await this.pool.query(`INSERT INTO meme_kline(chain,ca,pair_id,interval,open_time,close_time,open,high,low,close,volume,trade_count,type,source,raw_data,valid)
+ private async saveBar(bar:ClosedMarketBar){
+  const c=bar.candle;
+  await this.pool.query(`INSERT INTO meme_kline(chain,ca,pair_id,interval,open_time,close_time,open,high,low,close,volume,trade_count,type,source,raw_data,valid)
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'xxyy_socket',$14,true)
     ON CONFLICT(chain,pair_id,interval,open_time,type) DO NOTHING RETURNING open_time`,
-    [bar.symbol.chain,bar.symbol.ca,bar.symbol.pairId,bar.interval,c.time,c.closeTime,c.open,c.high,c.low,c.close,c.volume,bar.tradeCount,bar.type,JSON.stringify({feed:'xxyy_socket',closed:true})]);
-  if(!inserted.rowCount){
-   const existing=(await this.pool.query('SELECT open_time,close_time,open,high,low,close,volume,valid FROM meme_kline WHERE chain=$1 AND pair_id=$2 AND interval=$3 AND open_time=$4 AND type=$5',[bar.symbol.chain,bar.symbol.pairId,bar.interval,c.time,bar.type])).rows[0];
-   if(!existing||existing.valid===false)return;
-   c={time:Number(existing.open_time),closeTime:Number(existing.close_time),open:Number(existing.open),high:Number(existing.high),low:Number(existing.low),close:Number(existing.close),volume:Number(existing.volume)};
+    [bar.symbol.chain,bar.symbol.ca,bar.symbol.pairId,bar.interval,c.time,c.closeTime,c.open,c.high,c.low,c.close,c.volume,bar.tradeCount,bar.type,JSON.stringify({feed:'xxyy_socket',closed:true,synthetic:!!c.synthetic,closeTradeId:bar.closeTradeId,closeTradeTime:bar.closeTradeTime})]);
+ }
+ private async flushBars(now:number){
+  this.aggregator.flush(now,(bar,time)=>this.connected.has(pairKey(bar.symbol.chain,bar.symbol.pairId))&&this.confirmedFeeds.has(pairKey(bar.symbol.chain,bar.symbol.pairId))&&[...this.watches.values()].some(ctx=>ctx.ready&&ctx.watch.chain===bar.symbol.chain&&ctx.watch.pair_id===bar.symbol.pairId&&time>=ctx.noOrdersBefore));
+  while(this.closedBars.length){
+   const end=Math.min(...this.closedBars.map(b=>b.candle.closeTime));
+   if(end>now)break;
+   const bars=this.closedBars.filter(b=>b.candle.closeTime===end);
+   for(const bar of bars)await this.saveBar(bar);
+   await this.executeBars(bars);
+   this.closedBars=this.closedBars.filter(b=>b.candle.closeTime!==end);
   }
-  const contexts=[...this.watches.values()].filter(ctx=>ctx.run.status==='running'&&ctx.watch.chain===bar.symbol.chain&&ctx.watch.pair_id===bar.symbol.pairId&&ctx.run.interval===bar.interval&&ctx.run.value_type===bar.type);
-  for(const ctx of contexts){
-   if(!ctx.ready)continue;
-   const decision=ctx.evaluator.onClosedCandle(c);
-   if(decision && c.time>=ctx.noOrdersBefore && !await this.pending(ctx))await this.createDecision(ctx,decision);
-   await this.pool.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',[ctx.run.id,JSON.stringify(ctx.evaluator.snapshot()),c.time,ctx.watch.chain,ctx.watch.ca]);
-   if(ctx.run.mode==='paper')await this.recordEquity(ctx.run,c.closeTime);
+ }
+ private async executeBars(bars:ClosedMarketBar[]){
+  const work:Array<{ctx:Context;bar:ClosedMarketBar;price:ClosedMarketBar}>=[];
+  for(const ctx of this.watches.values()){
+   if(!ctx.ready || ctx.run.status!=='running' || !this.connected.has(pairKey(ctx.watch.chain,ctx.watch.pair_id)))continue;
+   const matches=(b:ClosedMarketBar)=>b.symbol.chain===ctx.watch.chain&&b.symbol.ca===ctx.watch.ca&&b.symbol.pairId===ctx.watch.pair_id&&b.interval===ctx.run.interval;
+   const bar=bars.find(b=>matches(b)&&b.type===ctx.run.value_type),price=bars.find(b=>matches(b)&&b.type==='price');
+   if(!bar){if(price&&ctx.run.value_type==='mcap')await this.markRecovering(ctx,'收盘缺少配对市值K线，禁止成交');continue;}
+   if(bar.candle.time<ctx.noOrdersBefore || bar.candle.time<=(ctx.evaluator.state.lastCandleTime??-1))continue;
+   if(simulatedBarPrice(ctx.run.value_type,bar.candle.close,bar,price)===undefined){await this.markRecovering(ctx,'收盘价格／市值无法可靠配对，禁止成交');continue;}
+   work.push({ctx,bar,price:price!});
   }
+  work.sort((a,b)=>{const x=`${a.ctx.run.id}:${a.ctx.watch.chain}:${a.ctx.watch.ca}:${a.ctx.watch.pair_id}`,y=`${b.ctx.run.id}:${b.ctx.watch.chain}:${b.ctx.watch.ca}:${b.ctx.watch.pair_id}`;return x<y?-1:x>y?1:0;});
+  if(!work.length)return;
+  const backups=work.map(({ctx})=>({ctx,state:ctx.evaluator.snapshot(),run:{...ctx.run},watch:{...ctx.watch}}));
+  const client=await this.pool.connect();this.executionClient=client;this.submissions=[];
+  try{await client.query('BEGIN');
+   const ids=[...new Set(work.map(x=>x.ctx.run.id))];
+   for(const id of ids){const row=(await client.query('SELECT * FROM live_runs WHERE id=$1 FOR UPDATE',[id])).rows[0];for(const {ctx} of work)if(ctx.run.id===id)Object.assign(ctx.run,row);}
+   const decisions=[];
+   for(const item of work){const {ctx,bar,price}=item;if(ctx.run.status!=='running'||!this.connected.has(pairKey(ctx.watch.chain,ctx.watch.pair_id)))continue;
+    const saved=(await client.query('SELECT state_json,last_candle_time FROM live_watches WHERE run_id=$1 AND chain=$2 AND ca=$3 FOR UPDATE',[ctx.run.id,ctx.watch.chain,ctx.watch.ca])).rows[0];
+    if(!saved)continue;
+    if(saved.state_json?.history)ctx.evaluator=new LiveEvaluator(ctx.run.strategy_json,Number(ctx.watch.signal_time),saved.state_json);
+    if(saved.last_candle_time!==null && Number(saved.last_candle_time)>=bar.candle.time)continue;
+    ctx.evaluator.state.lastTokenPrice=price.candle.close;
+    const decision=ctx.evaluator.onClosedCandle(bar.candle);
+    decisions.push({...item,decision});
+   }
+   // Same timestamp: exits release cash/capacity before deterministic entries.
+   for(const side of ['sell','buy'] as const)for(const {ctx,bar,price,decision} of decisions){
+    if(!decision||decision.side!==side||await this.pending(ctx))continue;
+    await this.createDecision(ctx,decision,bar,price);
+   }
+   for(const {ctx,bar} of decisions){ctx.evaluator.confirmClose(bar.candle);
+    ctx.watch.last_candle_time=String(bar.candle.time);
+    await client.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',[ctx.run.id,JSON.stringify(ctx.evaluator.snapshot()),bar.candle.time,ctx.watch.chain,ctx.watch.ca]);
+   }
+   for(const id of ids){const run=work.find(w=>w.ctx.run.id===id)!.ctx.run;if(run.mode==='paper')await this.recordEquity(run,bars[0]!.candle.closeTime);}
+   await client.query('COMMIT');
+  }catch(e){await client.query('ROLLBACK');for(const b of backups){b.ctx.evaluator=new LiveEvaluator(b.ctx.run.strategy_json,Number(b.ctx.watch.signal_time),b.state);Object.assign(b.ctx.run,b.run);Object.assign(b.ctx.watch,b.watch);}this.submissions=[];throw e;
+  }finally{this.executionClient=undefined;client.release();}
+  const submissions=this.submissions;this.submissions=[];
+  for(const s of submissions)await this.submitLive(s.ctx,s.id,s.decision,s.amount);
+  for(const {ctx} of work)if(ctx.run.mode==='paper'&&!ctx.evaluator.state.position&&ctx.watch.status==='pending_eviction')await this.evictOrRetain(ctx,'低市值持仓已平仓');
  }
  private async recordEquity(run:Run,time:number){
   const watches=[...this.watches.values()].filter(c=>c.run.id===run.id),cash=Number(run.cash);
   const held=watches.reduce((sum,ctx)=>sum+(ctx.evaluator.state.position?.quantity??0)*(ctx.evaluator.state.lastTokenPrice??0),0);
   const basis=watches.reduce((sum,ctx)=>sum+(ctx.evaluator.state.position?.costBasisUsd??0),0);
-  await this.pool.query(`INSERT INTO live_equity_curve(run_id,time,equity,cash,unrealized) VALUES($1,$2,$3,$4,$5)
+  await this.db.query(`INSERT INTO live_equity_curve(run_id,time,equity,cash,unrealized) VALUES($1,$2,$3,$4,$5)
    ON CONFLICT(run_id,time) DO UPDATE SET equity=EXCLUDED.equity,cash=EXCLUDED.cash,unrealized=EXCLUDED.unrealized`,[run.id,time,cash+held,cash,held-basis]);
  }
  private async catchup(ctx:Context){
@@ -277,12 +347,17 @@ export class LiveService {
      SELECT $1,$2,$3,$4,x.time,x.time+$5,x.open,x.high,x.low,x.close,x.volume,0,$6,'xxyy',null,true
      FROM jsonb_to_recordset($7::jsonb) AS x(time bigint,open numeric,high numeric,low numeric,close numeric,volume numeric)
      ON CONFLICT(chain,pair_id,interval,open_time,type) DO NOTHING`,[ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,step,ctx.run.value_type,JSON.stringify(batch)]);
-    for(const row of batch)ctx.evaluator.onClosedCandle({...row,closeTime:row.time+step,valid:true}); // Indicator warmup only.
+    for(const row of batch){
+     const prior=ctx.evaluator.state.history.at(-1);
+     if(prior)for(let time=prior.time+step;time<row.time;time+=step)ctx.evaluator.onClosedCandle({time,closeTime:time+step,open:prior.close,high:prior.close,low:prior.close,close:prior.close,volume:0,synthetic:true,valid:true},true);
+     ctx.evaluator.onClosedCandle({...row,closeTime:row.time+step,valid:true},true); // Warmup only: never issue missed orders or activate historical locks.
+    }
    }
    if(rows.length){ctx.watch.last_candle_time=String(rows.at(-1)!.time);await this.pool.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',[ctx.run.id,JSON.stringify(ctx.evaluator.snapshot()),rows.at(-1)!.time,ctx.watch.chain,ctx.watch.ca]);}
   }
  }
- /** Do not trust candles preceding this uninterrupted socket connection if web history is blocked. */
+ /** A connected socket is the only source we can trust when the web history endpoint is challenged.
+  * Never replay old bars as orders, and never reset a live position's risk state. */
  private async warmupFromConnectedFeed(ctx:Context):Promise<{ready:boolean;count:number;required:number}>{
   const required=localWarmupBars(ctx.run.strategy_json);
   if(ctx.evaluator.state.position)return {ready:false,count:0,required};
@@ -301,7 +376,11 @@ export class LiveService {
   const evaluator=new LiveEvaluator(ctx.run.strategy_json,Number(ctx.watch.signal_time),{
    history:[],lastEntryMatch:false,lastAddMatch:false,trades:previous.trades,lastTokenPrice:previous.lastTokenPrice,
   });
-  for(const row of rows)evaluator.onClosedCandle({time:Number(row.time),closeTime:Number(row.closeTime),open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),volume:Number(row.volume)});
+  for(const row of rows){
+   const prior=evaluator.state.history.at(-1);
+   if(prior)for(let time=prior.time+step;time<Number(row.time);time+=step)evaluator.onClosedCandle({time,closeTime:time+step,open:prior.close,high:prior.close,low:prior.close,close:prior.close,volume:0,synthetic:true,valid:true},true);
+   evaluator.onClosedCandle({time:Number(row.time),closeTime:Number(row.closeTime),open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),volume:Number(row.volume)},true);
+  }
   ctx.evaluator=evaluator;
   ctx.watch.last_candle_time=String(rows.at(-1)!.time);
   await this.pool.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',
@@ -339,9 +418,21 @@ export class LiveService {
    if(![...this.watches.values()].some(other=>other!==ctx&&other.ready&&other.watch.chain===ctx.watch.chain&&other.watch.pair_id===ctx.watch.pair_id))
     this.aggregator.markClosedThrough(ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.noOrdersBefore);
    if(ctx.run.mode==='paper')await this.pool.query("UPDATE live_orders SET status='cancelled',updated_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3 AND status='pending'",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);
+   await this.seedAggregation(ctx);
    ctx.ready=true;ctx.watch.status='monitoring';
    await this.pool.query("UPDATE live_watches SET status='monitoring',recovery_reason=NULL WHERE run_id=$1 AND chain=$2 AND ca=$3",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);
   }catch(e){await this.markRecovering(ctx,`补行情失败，稍后重试：${redact(e)}`);}
+ }
+ private async seedAggregation(ctx:Context){
+  const last=ctx.evaluator.state.history.at(-1);if(!last)return;
+  const rows=(await this.pool.query('SELECT type,close FROM meme_kline WHERE chain=$1 AND pair_id=$2 AND interval=$3 AND open_time=$4 AND valid IS DISTINCT FROM false',[ctx.watch.chain,ctx.watch.pair_id,ctx.run.interval,last.time])).rows;
+  const price=Number(rows.find(r=>r.type==='price')?.close),mcap=Number(rows.find(r=>r.type==='mcap')?.close);
+  if(!Number.isFinite(price)||price<=0 || (ctx.run.value_type==='mcap'&&(!Number.isFinite(mcap)||mcap<=0)))return; // First reliable socket pair will seed instead.
+  const step=ctx.run.interval==='30s'?30_000:60_000,first=Math.ceil(ctx.noOrdersBefore/step)*step;
+  for(const type of ['price','mcap'] as const){const value=type==='price'?price:mcap;if(!Number.isFinite(value)||value<=0)continue;
+   this.aggregator.seed({symbol:{chain:ctx.watch.chain,ca:ctx.watch.ca,pairId:ctx.watch.pair_id},interval:ctx.run.interval,type,tradeCount:0,closeTradeId:`recovery:${last.time}`,closeTradeTime:last.closeTime,
+    candle:{time:first-step,closeTime:first,open:value,high:value,low:value,close:value,volume:0,synthetic:true,valid:true}});
+  }
  }
  private async evictOrRetain(ctx:Context,reason:string){
   if(ctx.run.mode==='paper')await this.pool.query("UPDATE live_orders SET status='cancelled',updated_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3 AND side='buy' AND status='pending'",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);
@@ -410,14 +501,14 @@ export class LiveService {
    }catch(e){console.error('XXYY 订单核验:',redact(e));}
   }
  }
- private async pending(ctx:Context){return !!(await this.pool.query("SELECT 1 FROM live_orders WHERE run_id=$1 AND chain=$2 AND ca=$3 AND status IN ('pending','submitted','unknown') LIMIT 1",[ctx.run.id,ctx.watch.chain,ctx.watch.ca])).rowCount;}
- private async createDecision(ctx:Context,d:LiveDecision){
-  if(ctx.run.status!=='running'||!ctx.ready||ctx.run.execution_hold_reason)return;
+ private async pending(ctx:Context){return !!(await this.db.query("SELECT 1 FROM live_orders WHERE run_id=$1 AND chain=$2 AND ca=$3 AND status IN ('pending','submitted','unknown') LIMIT 1",[ctx.run.id,ctx.watch.chain,ctx.watch.ca])).rowCount;}
+ private async createDecision(ctx:Context,d:LiveDecision,bar:ClosedMarketBar,price:ClosedMarketBar){
+  if(ctx.run.status!=='running'||!ctx.ready||ctx.run.execution_hold_reason||!this.connected.has(pairKey(ctx.watch.chain,ctx.watch.pair_id)))return;
   const key=createHash('sha256').update(`${ctx.run.id}:${ctx.watch.chain}:${ctx.watch.ca}:${d.side}:${d.reason}:${d.time}`).digest('hex');
   const cfg=ctx.run.strategy_json,position=ctx.evaluator.state.position;
   if(d.side==='buy'){
    if(ctx.watch.status==='pending_eviction'||!this.feedHealthy || d.time<=Number(ctx.watch.signal_time))return;
-   const active=[...this.watches.values()].filter(x=>x.run.id===ctx.run.id&&x.evaluator.state.position).length;
+   const active=[...this.watches.values()].filter(x=>x.run.id===ctx.run.id&&x.evaluator.state.position).length+this.submissions.filter(x=>x.ctx.run.id===ctx.run.id&&x.decision.side==='buy'&&!x.ctx.evaluator.state.position).length;
    if(!position && active>=cfg.positionConfig.maxConcurrentPositions)return;
   }
   const available=Number(ctx.run.cash);
@@ -427,16 +518,23 @@ export class LiveService {
    sizing.type==='fixed_amount'?Math.min(sizing.value,available):available*sizing.value/100;
   if(!Number.isFinite(amount)||amount<=0)return;
   if(ctx.run.mode==='live' && (process.env.LIVE_TRADING_ENABLED!=='true'||!this.xxyy||ctx.run.chain==='robin'))return;
-  const result=await this.pool.query(`INSERT INTO live_orders(run_id,chain,ca,pair_id,intent_key,side,reason,status,decision_time,decision_value,requested_amount,raw_result,position_id)
-    VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12) ON CONFLICT(intent_key) DO NOTHING RETURNING id`,[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,key,d.side,d.reason,d.time,d.value,amount,JSON.stringify({impulse:d.impulse??null}),position?.positionId??null]);
+  const evidence={impulse:d.impulse??position?.impulse??null,executionVersion:LIVE_EXECUTION_VERSION,candle:bar.candle,priceCandle:price.candle,stop:d.stop,target:d.target,lockPrice:position?.lockPrice,lockTier:position?.lockTier,cost:position?.entryPrice,referenceValue:d.value,observedAt:Date.now(),simulatedConversion:ctx.run.value_type==='mcap',priceBasis:'paired_bar_close_ratio'};
+  const result=await this.db.query(`INSERT INTO live_orders(run_id,chain,ca,pair_id,intent_key,side,reason,status,decision_time,decision_value,requested_amount,raw_result,position_id)
+    VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12) ON CONFLICT(intent_key) DO NOTHING RETURNING id`,[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,key,d.side,d.reason,d.time,d.value,amount,JSON.stringify(evidence),position?.positionId??null]);
   if(!result.rowCount)return;
-  await this.pool.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'decision',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,`decision:${key}`,d.time,JSON.stringify({side:d.side,reason:d.reason,value:d.value})]);
-  if(ctx.run.mode==='live')await this.submitLive(ctx,result.rows[0].id,d,amount);
+  await this.db.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'decision',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,`decision:${key}`,d.time,JSON.stringify({side:d.side,reason:d.reason,value:d.value,...evidence})]);
+  if(ctx.run.mode==='live')this.submissions.push({ctx,id:result.rows[0].id,decision:d,amount});
+  else{
+   const fillPrice=simulatedBarPrice(ctx.run.value_type,d.value,bar,price);
+   if(fillPrice===undefined)throw new Error('模拟成交缺少可靠配对K线');
+   await this.paperFill(ctx,{id:result.rows[0].id,side:d.side,reason:d.reason,requested_amount:amount,raw_result:evidence,decision_time:d.time,position_id:position?.positionId},
+    {id:result.rows[0].id,chain:ctx.watch.chain,ca:ctx.watch.ca,pairId:ctx.watch.pair_id,time:d.time,price:fillPrice,mcap:ctx.run.value_type==='mcap'?d.value:undefined,volumeUsd:0});
+  }
  }
- private async paperFill(ctx:Context,trade:MarketTrade){
+ private async paperFill(ctx:Context,o:any,trade:MarketTrade){
   if(ctx.run.value_type==='mcap'&&(!trade.mcap||trade.mcap<=0))return;
-  const orders=(await this.pool.query("SELECT * FROM live_orders WHERE run_id=$1 AND chain=$2 AND ca=$3 AND status='pending' AND decision_time<$4 ORDER BY created_at LIMIT 1",[ctx.run.id,trade.chain,trade.ca,trade.time])).rows;
-  if(!orders.length)return;const o=orders[0],s=structuredClone(ctx.evaluator.state),cfg=ctx.run.strategy_json.executionConfig;
+  if(!this.executionClient)throw new Error('模拟成交必须在收盘事务内执行');
+  const s=structuredClone(ctx.evaluator.state),cfg=ctx.run.strategy_json.executionConfig;
   const feeRate=cfg.feePercent/100,slipRate=cfg.slippagePercent/100,taxRate=(o.side==='buy'?cfg.buyTaxPercent:cfg.sellTaxPercent)/100;
   let quantity:number,gross:number,fee:number,slip:number,tax:number,newCash:number,newPnl=Number(ctx.run.realized_pnl??0);
   if(o.side==='buy'){
@@ -455,22 +553,24 @@ export class LiveService {
    s.position.quantity-=quantity;s.position.costBasisUsd=(s.position.costBasisUsd??0)-basis;
    if(s.position.quantity<=1e-12){s.position=undefined;s.trades++;s.lastEntryMatch=true;}
   }
-  const c=await this.pool.connect();try{await c.query('BEGIN');
+  const c=this.executionClient;
    const claimed=await c.query("UPDATE live_orders SET status='filled',updated_at=now() WHERE id=$1 AND status='pending' RETURNING id",[o.id]);
-   if(!claimed.rowCount){await c.query('ROLLBACK');return;}
+   if(!claimed.rowCount)throw new Error('模拟订单重复成交');
    if(o.side==='buy'&&!ctx.evaluator.state.position&&s.position?.impulse)
     await c.query("UPDATE live_orders SET raw_result=jsonb_set(COALESCE(raw_result,'{}'::jsonb),'{impulse}',$2::jsonb) WHERE id=$1",[o.id,JSON.stringify(s.position.impulse)]);
    const fillValue=ctx.run.value_type==='price'?trade.price:trade.mcap!;
-   await c.query("INSERT INTO live_fills(order_id,fill_time,fill_price,fill_value,quantity,gross_amount,fee,slippage_cost,tax_cost,market_cap) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",[o.id,trade.time,trade.price,fillValue,quantity,gross,fee,slip,tax,trade.mcap??null]);
+   await c.query("INSERT INTO live_fills(order_id,fill_time,fill_price,fill_value,quantity,gross_amount,fee,slippage_cost,tax_cost,market_cap,raw_result) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",[o.id,trade.time,trade.price,fillValue,quantity,gross,fee,slip,tax,trade.mcap??null,JSON.stringify({executionVersion:LIVE_EXECUTION_VERSION,simulated:true,priceBasis:ctx.run.value_type==='mcap'?'paired_bar_close_ratio':'bar_matching_value',observedAt:Date.now()})]);
    if(o.side==='buy'&&!o.position_id&&!ctx.evaluator.state.position)await c.query('UPDATE live_orders SET position_id=$2 WHERE id=$1',[o.id,o.id]);
    await c.query('UPDATE live_runs SET cash=$2,realized_pnl=$3,updated_at=now() WHERE id=$1',[ctx.run.id,newCash,newPnl]);
    await c.query('UPDATE live_watches SET state_json=$2 WHERE run_id=$1 AND chain=$3 AND ca=$4',[ctx.run.id,JSON.stringify(s),ctx.watch.chain,ctx.watch.ca]);
    await c.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'fill',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,`fill:${o.id}`,trade.time,JSON.stringify({side:o.side,reason:o.reason,price:trade.price,value:fillValue,quantity})]);
-   await c.query('COMMIT');Object.assign(ctx.evaluator.state,s);ctx.run.cash=String(newCash);ctx.run.realized_pnl=String(newPnl);
-  }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
-  if(o.side==='sell'&&ctx.watch.status==='pending_eviction')await this.evictOrRetain(ctx,'低市值持仓已平仓');
+   Object.assign(ctx.evaluator.state,s);ctx.run.cash=String(newCash);ctx.run.realized_pnl=String(newPnl);
  }
  private async submitLive(ctx:Context,orderId:string,d:LiveDecision,amount:number){
+  const current=(await this.pool.query('SELECT status,execution_hold_reason FROM live_runs WHERE id=$1',[ctx.run.id])).rows[0];
+  if(!current||current.status!=='running'||current.execution_hold_reason){
+   await this.pool.query("UPDATE live_orders SET status='cancelled',updated_at=now() WHERE id=$1 AND status='pending'",[orderId]);return;
+  }
   const risk=ctx.run.risk_json;
   if(d.side==='buy' && (!risk||amount>risk.maxOrderNative||Number(ctx.run.realized_pnl??0)<=-risk.maxDailyLossUsd)){
    await this.pool.query("UPDATE live_orders SET status='failed',updated_at=now() WHERE id=$1",[orderId]);return;

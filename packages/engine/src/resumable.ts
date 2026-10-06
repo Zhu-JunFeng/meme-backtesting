@@ -3,6 +3,7 @@ import { evaluateCondition, stopPrice, targetPrice, type Impulse } from './index
 import { validateProfitLock } from '@meme/domain';
 import { describeInvalidation } from './invalidation.js';
 import { createEntryGate } from './entry-gate.js';
+import { matchBarExit } from './bar-exit.js';
 
 export const ENGINE_VERSION = 'portfolio-5';
 export const CHECKPOINT_VERSION = 4;
@@ -162,12 +163,11 @@ export class ResumableEngine {
     const ordered=[...ticks].sort((a,b)=>poolKey(a.symbol)<poolKey(b.symbol)?-1:1),time=ordered[0].candle.time;
     if(ordered.some(t=>t.candle.time!==time) || (this.s.lastTime!==null && time<=this.s.lastTime))throw new Error('时间批次必须完整且严格递增');
     const contexts=ordered.map(t=>{const s=this.byKey.get(poolKey(t.symbol));if(!s)throw new Error('未知交易池');this.update(s,t.candle);if(t.candle.synthetic)this.s.syntheticBars++;return {...t,s};});
-    for(const {s,candle:c,last} of contexts){if(!s.active)continue;const baseStop=stopPrice(this.config,s.active),stop=Math.max(baseStop,s.active.lockPrice ?? -Infinity),target=targetPrice(this.config,s.active,baseStop);let exit:{price:number;type:Signal['type']}|undefined;
-      if(c.open<=stop || c.low<=stop)exit={price:c.open<=stop?c.open:stop,type:(s.active.lockPrice ?? -Infinity)>baseStop?'profit_lock':'stop_loss'};
-      else if(this.group(this.config.invalidationConditionGroup,s,s.active.impulse))exit={price:c.close,type:'invalidation'};
-      else if(target>s.active.trade.entryPrice && (c.open>=target || c.high>=target))exit={price:c.open>=target?c.open:target,type:'take_profit'};
-      else if(this.config.exitConfig.maxHoldingBars && s.index-s.active.entryIndex>=this.config.exitConfig.maxHoldingBars)exit={price:c.close,type:'timeout'};
-      else if(last && this.config.exitConfig.closeAtEnd)exit={price:c.close,type:'end_of_backtest'};
+    for(const {s,candle:c,last} of contexts){if(!s.active)continue;const baseStop=stopPrice(this.config,s.active),stop=Math.max(baseStop,s.active.lockPrice ?? -Infinity),target=targetPrice(this.config,s.active,baseStop);
+      const exit=matchBarExit(c,{entry:s.active.trade.entryPrice,baseStop,lockPrice:s.active.lockPrice,target,
+        invalid:()=>this.group(this.config.invalidationConditionGroup,s,s.active!.impulse),
+        timedOut:!!this.config.exitConfig.maxHoldingBars && s.index-s.active.entryIndex>=this.config.exitConfig.maxHoldingBars,
+        end:last && this.config.exitConfig.closeAtEnd});
       if(exit)this.close(s,c,exit.price,exit.type,{priority:exit.type,stop,target,...(exit.type==='invalidation'?{invalidation:describeInvalidation(this.config.invalidationConditionGroup,s.history,s.active.impulse,condition=>this.group({mode:'all',conditions:[condition]},s,s.active!.impulse))}:{}),...(exit.type==='profit_lock'?{tier:(s.active.lockPriceTier ?? 0)+1,thresholds:this.config.exitConfig.profitLock?.tiers[s.active.lockPriceTier ?? 0],cost:s.active.lockCost,lockPrice:s.active.lockPrice}: {})});
     }
     let positions=this.s.states.filter(s=>s.active).length;

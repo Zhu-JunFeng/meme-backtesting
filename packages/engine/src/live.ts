@@ -1,8 +1,9 @@
 import type { Candle, ConditionGroup, StrategyConfig, SymbolRef } from '@meme/domain';
 import { detectImpulse, evaluateConditionGroup, stopPrice, targetPrice, type Impulse } from './index.js';
+import { matchBarExit } from './bar-exit.js';
 
 export interface MarketTrade { id:string; chain:string; ca:string; pairId:string; time:number; price:number; mcap?:number; volumeUsd:number }
-export interface ClosedMarketBar { symbol:SymbolRef; interval:'30s'|'1m'; type:'price'|'mcap'; candle:Candle; tradeCount:number }
+export interface ClosedMarketBar { symbol:SymbolRef; interval:'30s'|'1m'; type:'price'|'mcap'; candle:Candle; tradeCount:number; closeTradeId?:string; closeTradeTime?:number }
 type Bucket = {symbol:SymbolRef;interval:'30s'|'1m';type:'price'|'mcap';candle:Candle;firstAt:number;lastAt:number;firstId:string;lastId:string;tradeCount:number};
 export type TradeAcceptance={accepted:boolean;late:boolean;reason?:'invalid'|'duplicate'|'too_old'|'closed'};
 const period = (interval:'30s'|'1m') => interval==='30s'?30_000:60_000;
@@ -11,7 +12,13 @@ export class LiveCandleAggregator {
   private finalized=new Map<string,number>();
   private seen=new Map<string,number>();
   private lastTradeTime=new Map<string,number>();
+  private lastBars=new Map<string,ClosedMarketBar>();
   constructor(private readonly onClose:(bar:ClosedMarketBar)=>void){}
+  /** Recovery baseline only; never emitted or inserted as an observed candle. */
+  seed(bar:ClosedMarketBar){
+    const key=`${bar.symbol.chain}:${bar.symbol.ca}:${bar.symbol.pairId}:${bar.interval}:${bar.type}`;
+    if((this.lastBars.get(key)?.candle.time??-1)<bar.candle.time)this.lastBars.set(key,bar);
+  }
   accept(trade:MarketTrade){return this.acceptDetailed(trade).accepted;}
   acceptDetailed(trade:MarketTrade):TradeAcceptance{
     if(!trade.id || !trade.chain || !trade.ca || !trade.pairId || !Number.isSafeInteger(trade.time) || trade.time<0 || !Number.isFinite(trade.price) || trade.price<=0 || !Number.isFinite(trade.volumeUsd) || trade.volumeUsd<0)return {accepted:false,late:false,reason:'invalid'};
@@ -45,7 +52,20 @@ export class LiveCandleAggregator {
     }
     return {accepted,late,reason:accepted?undefined:'closed'};
   }
-  flush(now:number){for(const [key,bucket] of this.buckets)if(bucket.candle.closeTime<=now)this.finish(key,bucket);}
+  flush(now:number,canFill?:(bar:ClosedMarketBar,time:number)=>boolean){
+    // Fill gaps before closing a later real bucket, then the trailing idle buckets.
+    if(canFill)for(const [key,bar] of this.lastBars)this.fillUntil(key,bar,Math.min(now,this.buckets.get(key)?.candle.time??now),canFill);
+    for(const [key,bucket] of this.buckets)if(bucket.candle.closeTime<=now)this.finish(key,bucket);
+    if(canFill)for(const [key,bar] of this.lastBars)this.fillUntil(key,bar,now,canFill);
+  }
+  private fillUntil(key:string,bar:ClosedMarketBar,now:number,canFill:(bar:ClosedMarketBar,time:number)=>boolean){
+    const step=period(bar.interval);
+    for(let time=bar.candle.closeTime;time+step<=now;time+=step){
+      if(!canFill(bar,time))break;
+      const value=bar.candle.close,candle={time,closeTime:time+step,open:value,high:value,low:value,close:value,volume:0,valid:true,synthetic:true};
+      const next={...bar,candle,tradeCount:0};this.lastBars.set(key,next);this.finalized.set(key,time);this.onClose(next);
+    }
+  }
   markClosedThrough(chain:string,ca:string,pairId:string,now:number){
     for(const interval of ['30s','1m'] as const)for(const type of ['price','mcap'] as const){
       const key=`${chain}:${ca}:${pairId}:${interval}:${type}`,lastClosed=Math.floor(now/period(interval))*period(interval)-period(interval);
@@ -55,40 +75,42 @@ export class LiveCandleAggregator {
   }
   discardPair(chain:string,pairId:string){
     for(const [key,bucket] of this.buckets)if(bucket.symbol.chain===chain&&bucket.symbol.pairId===pairId)this.buckets.delete(key);
+    for(const [key,bar] of this.lastBars)if(bar.symbol.chain===chain&&bar.symbol.pairId===pairId)this.lastBars.delete(key);
   }
-  private finish(key:string,bucket:Bucket){this.buckets.delete(key);this.finalized.set(key,bucket.candle.time);this.onClose({symbol:bucket.symbol,interval:bucket.interval,type:bucket.type,candle:{...bucket.candle},tradeCount:bucket.tradeCount});}
+  private finish(key:string,bucket:Bucket){this.buckets.delete(key);this.finalized.set(key,bucket.candle.time);const bar={symbol:bucket.symbol,interval:bucket.interval,type:bucket.type,candle:{...bucket.candle},tradeCount:bucket.tradeCount,closeTradeId:bucket.lastId,closeTradeTime:bucket.lastAt};this.lastBars.set(key,bar);this.onClose(bar);}
 }
 
 export interface LivePosition {entryPrice:number;quantity:number;entries:number;entryTime:number;entryBar:number;impulse:Impulse;lockPrice?:number;lockTier?:number;tradeNo:number;costBasisUsd?:number;positionId?:string}
-export interface LiveDecision {side:'buy'|'sell';reason:'entry'|'add'|'stop_loss'|'profit_lock'|'take_profit'|'invalidation'|'timeout';time:number;value:number;impulse?:Impulse}
+export interface LiveDecision {side:'buy'|'sell';reason:'entry'|'add'|'stop_loss'|'profit_lock'|'take_profit'|'invalidation'|'timeout';time:number;value:number;impulse?:Impulse; stop?:number; target?:number}
 export interface LiveEvaluatorState {history:Candle[];position?:LivePosition;lastEntryMatch:boolean;lastAddMatch:boolean;trades:number;lastCandleTime?:number;lastTokenPrice?:number}
 function maxWindow(config:StrategyConfig){return Math.max(512,config.impulseCondition.lookbackBars+config.impulseCondition.leftBars+config.impulseCondition.rightBars+8);}
 export class LiveEvaluator {
  readonly state:LiveEvaluatorState;
  constructor(readonly config:StrategyConfig, readonly signalTime:number, state?:LiveEvaluatorState){this.state=state?structuredClone(state):{history:[],lastEntryMatch:false,lastAddMatch:false,trades:0};}
- onClosedCandle(candle:Candle):LiveDecision|undefined{
+ onClosedCandle(candle:Candle,warmup=false):LiveDecision|undefined{
   const s=this.state;if(s.lastCandleTime!==undefined && candle.time<=s.lastCandleTime)return;
   s.lastCandleTime=candle.time;s.history.push(candle);
   if(s.history.length>maxWindow(this.config)){
    s.history.shift();
    if(s.position){s.position.entryBar--;s.position.impulse.lowIndex--;s.position.impulse.highIndex--;s.position.impulse.confirmedAtIndex--;}
   }
-  const position=s.position,eligible=candle.time>this.signalTime;
+  if(warmup)return;
+  const position=s.position,eligible=this.config.entryAfterSignal===false||candle.time>this.signalTime;
   let decision:LiveDecision|undefined;
   if(position){
-    const impulse=position.impulse,invalid=evaluateConditionGroup(this.config.invalidationConditionGroup,s.history,impulse);
-    if(invalid)decision={side:'sell',reason:'invalidation',time:candle.closeTime,value:candle.close};
-    else if(this.config.exitConfig.maxHoldingBars && s.history.length-position.entryBar>=this.config.exitConfig.maxHoldingBars)decision={side:'sell',reason:'timeout',time:candle.closeTime,value:candle.close};
+    const impulse=position.impulse,active={trade:{entryPrice:position.entryPrice} as never,impulse} as never;
+    const config=this.config as Parameters<typeof stopPrice>[0],base=stopPrice(config,active),target=targetPrice(config,active,base);
+    const exit=matchBarExit(candle,{entry:position.entryPrice,baseStop:base,lockPrice:position.lockPrice,target,
+      invalid:()=>evaluateConditionGroup(this.config.invalidationConditionGroup,s.history,impulse),
+      timedOut:!!this.config.exitConfig.maxHoldingBars && s.history.length-1-position.entryBar>=this.config.exitConfig.maxHoldingBars});
+    if(exit && exit.type!=='end_of_backtest')decision={side:'sell',reason:exit.type,time:candle.closeTime,value:exit.price,stop:Math.max(base,position.lockPrice??-Infinity),target};
     else if(eligible && this.config.positionConfig.mode==='pyramiding' && position.entries<this.config.positionConfig.maxEntries){
       const matches=evaluateConditionGroup(this.config.addConditionGroup??this.config.entryConditionGroup,s.history,impulse);
       if(matches && !s.lastAddMatch)decision={side:'buy',reason:'add',time:candle.closeTime,value:candle.close,impulse};
       s.lastAddMatch=matches;
     }
-    if(this.config.exitConfig.profitLock?.enabled){
-      this.config.exitConfig.profitLock.tiers.forEach((tier,index)=>{if((position.lockTier??-1)>=index || candle.close<position.entryPrice*(1+tier.activationPercent/100))return;
-        position.lockTier=index;position.lockPrice=Math.max(position.lockPrice??-Infinity,position.entryPrice*(1+tier.floorPercent/100));});
-    }
   }else if(eligible){
+    s.lastAddMatch=false;
     const impulse=detectImpulse(s.history,this.config.impulseCondition);
     const matches=!!impulse && evaluateConditionGroup(this.config.entryConditionGroup,s.history,impulse);
     if(matches && !s.lastEntryMatch && (this.config.positionConfig.allowReentry || s.trades===0))decision={side:'buy',reason:'entry',time:candle.closeTime,value:candle.close,impulse};
@@ -96,13 +118,12 @@ export class LiveEvaluator {
   }
   return decision;
  }
- onTrade(trade:MarketTrade,valueType:'price'|'mcap'):LiveDecision|undefined{
-  const p=this.state.position,value=valueType==='price'?trade.price:trade.mcap;
-  if(!p || !value || !Number.isFinite(value) || trade.time<=p.entryTime)return;
-  const config={...this.config} as Parameters<typeof stopPrice>[0],base=stopPrice(config,{trade:{entryPrice:p.entryPrice} as never,impulse:p.impulse} as never);
-  const stop=Math.max(base,p.lockPrice??-Infinity),target=targetPrice(config,{trade:{entryPrice:p.entryPrice} as never,impulse:p.impulse} as never,base);
-  if(value<=stop)return {side:'sell',reason:(p.lockPrice??-Infinity)>base?'profit_lock':'stop_loss',time:trade.time,value};
-  if(target>p.entryPrice && value>=target)return {side:'sell',reason:'take_profit',time:trade.time,value};
+ confirmClose(candle:Candle){
+  const position=this.state.position;
+  if(position && this.config.exitConfig.profitLock?.enabled)this.config.exitConfig.profitLock.tiers.forEach((tier,index)=>{
+    if((position.lockTier??-1)>=index || candle.close<position.entryPrice*(1+tier.activationPercent/100))return;
+    position.lockTier=index;position.lockPrice=Math.max(position.lockPrice??-Infinity,position.entryPrice*(1+tier.floorPercent/100));
+  });
  }
  snapshot(){return structuredClone(this.state);}
 }

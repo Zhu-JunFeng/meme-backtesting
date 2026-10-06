@@ -26,7 +26,7 @@ function statusText(s:string){return ({paused:'已暂停',running:'运行中',st
 function statusColor(s:string){return ({paused:'default',running:'green',stopped:'default'} as Record<string,string>)[s]??'default';}
 function feedText(s:string){return ({connecting:'连接中',recovering:'补行情',connected:'行情正常',paused:'已暂停'} as Record<string,string>)[s]??'连接中';}
 function watchText(s:string){return ({monitoring:'监控中',recovering:'补行情中',pending_eviction:'等待平仓后移除',evicted:'已移除',paused:'已暂停'} as Record<string,string>)[s]??'状态未识别';}
-function eventText(s:string){return ({external_signal:'外部信号',decision:'买卖决策',fill:'成交',order_rejected:'订单被拒绝',feed_disconnect:'行情断开',feed_reconnected:'行情已重连',late_trade:'乱序成交',eviction:'退出监控'} as Record<string,string>)[s]??'运行事件';}
+function eventText(s:string){return ({external_signal:'外部信号',decision:'买卖决策',fill:'成交',execution_switched:'执行口径切换',order_rejected:'订单被拒绝',feed_disconnect:'行情断开',feed_reconnected:'行情已重连',late_trade:'乱序成交',eviction:'退出监控'} as Record<string,string>)[s]??'运行事件';}
 function eventReason(payload:any){const reason=payload?.reason;return reason?eventLabels[reason]??(typeof reason==='string'&&reason.includes('_')?'原因未识别':reason):signalSourceText(payload?.source);}
 function adminHeader(){return real?{'x-live-admin-password':password.value}:{};}
 async function loadVersions(){if(!templateId.value)return;versions.value=(await api.get(`/strategy-templates/${templateId.value}/versions`)).data;versionId.value=templates.value.find(t=>t.id===templateId.value)?.currentVersionId??versions.value[0]?.id;}
@@ -92,7 +92,7 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
 <template>
 <div class="live-workspace">
  <a-alert v-if="real" type="warning" show-icon class="live-notice" message="实盘默认禁止真实下单" description="需在服务器单独启用、配置 XXYY API Key、可信行情订阅和 HTTPS；当前仅支持 SOL/BSC。订单结果未核实时任务仍运行，但冻结新订单，绝不盲目重发。" />
- <a-alert v-else type="info" show-icon class="live-notice" message="模拟盘使用实时成交，不会连接交易钱包" description="每个任务只接收指定来源、启动后的新信号；策略在 K 线收盘后决策，模拟成交取决策后的下一笔有效交易。历史收益不代表模拟盘或未来收益。" />
+ <a-alert v-else type="info" show-icon class="live-notice" message="模拟盘按收盘 K 线撮合，不会连接交易钱包" description="仅接收指定来源、启动后的新信号。收盘后按回测规则判断：买入按收盘值，止损／止盈按触线值或跳空开盘值模拟成交；不等待下一笔交易。实盘成交价可能不同，历史收益不代表未来收益。" />
  <section v-if="real" class="live-auth" aria-label="实盘管理员验证"><div><strong>实盘管理员</strong><p>{{secureAdminContext?'口令只保留在当前页面内存中，不保存到浏览器或数据库。':'当前访问不是 HTTPS，仅提供脱敏只读视图；请先配置 HTTPS。'}}</p></div><a-input-password v-model:value="password" :disabled="!secureAdminContext" autocomplete="off" placeholder="管理员口令" aria-label="实盘管理员口令" @press-enter="checkPassword" /><a-button :type="authorized?'default':'primary'" :disabled="!secureAdminContext" @click="checkPassword">{{ authorized?'已验证 · 重新验证':'验证口令' }}</a-button><a-button danger :disabled="!authorized||busy" @click="emergency">紧急停止全部实盘任务</a-button></section>
  <div class="live-layout">
   <section class="live-create" aria-label="创建实时任务"><div class="live-section-head"><h2>新建{{real?'实盘':'模拟盘'}}任务</h2><span>创建后默认暂停</span></div>
@@ -117,6 +117,8 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
   </section>
  </div>
  <section v-if="detail" ref="detailElement" class="live-detail" aria-label="实时任务详情"><div class="live-section-head"><div><h2>{{detail.run.name}}</h2><p>{{detail.run.chain.toUpperCase()}} · {{detail.run.interval}} · {{detail.run.value_type==='mcap'?'市值':'价格'}} · {{signalSourceText(detail.run.signal_source)}} · 仅新信号</p></div><a-tag :color="statusColor(detail.run.status)">{{statusText(detail.run.status)}}</a-tag></div>
+  <p class="live-context" v-if="detail.run.execution_version==='closed-bar-v2'">执行口径：完整 K 线收盘后判断；止损／止盈检查整根高低值，模拟按回测阈值或跳空开盘值撮合，实盘以真实成交为准。正常无成交时补平价 K 线，断线补数不追单。切换时间：{{beijingTime(detail.run.execution_switched_at)}}（北京时间）。此前成交不重算。</p>
+  <p class="live-context" v-else>执行口径：旧版逐笔退出。任务切换后将在此显示生效时间，历史成交保持原样。</p>
   <a-alert v-if="detail.run.error_message" type="warning" show-icon :message="detail.run.error_message" class="live-notice" />
   <a-alert v-if="detail.run.execution_hold_reason" type="warning" show-icon :message="`订单核验中：${detail.run.execution_hold_reason}`" description="任务保持运行，但所有新订单已冻结；未知订单不会自动重发。" class="live-notice" />
   <div class="live-summary"><span>活动 CA <strong>{{detail.run.active_ca_count}} / 20</strong></span><span>行情状态 <strong>{{feedText(detail.run.feed_state)}}</strong></span><span>模拟现金／额度基准 <strong>{{formatNumber(detail.run.cash)}}</strong></span><span>已实现盈亏 <strong :class="valueTone(detail.run.realized_pnl)">{{signedValue(detail.run.realized_pnl)}}</strong></span><span>最近心跳 <strong>{{beijingTime(detail.run.heartbeat_at)}}</strong></span><span>最近信号 <strong>{{beijingTime(detail.run.last_signal_at,true)}}</strong></span><span>最近成交 <strong>{{beijingTime(detail.run.last_trade_at,true)}}</strong></span><span>重连 / 乱序 / 丢弃 <strong>{{detail.run.reconnect_count}} / {{detail.run.late_trade_count}} / {{detail.run.dropped_trade_count}}</strong></span></div>

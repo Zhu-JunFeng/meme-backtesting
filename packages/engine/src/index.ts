@@ -4,6 +4,8 @@ export * from './invalidation.js';
 export * from './live.js';
 import { describeInvalidation } from './invalidation.js';
 import { createEntryGate } from './entry-gate.js';
+import { matchBarExit } from './bar-exit.js';
+export { matchBarExit } from './bar-exit.js';
 
 const finite = (n: number) => Number.isFinite(n);
 const symbolKey = (s: SymbolRef) => `${s.chain}:${s.ca}:${s.pairId}`;
@@ -301,12 +303,10 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
       const active = activeTrades.get(symbolKey(state.symbol));
       if (!active) continue;
       const stop = stopPrice(config,active), target = targetPrice(config,active,stop);
-      let exit: {price:number;type:Signal["type"]} | undefined;
-      if (candle.open <= stop || candle.low <= stop) exit = {price:candle.open <= stop ? candle.open : stop,type:"stop_loss"};
-      else if (evaluateConditionGroup(config.invalidationConditionGroup,history,active.impulse)) exit = {price:candle.close,type:"invalidation"};
-      else if (target > active.trade.entryPrice && (candle.open >= target || candle.high >= target)) exit = {price:candle.open >= target ? candle.open : target,type:"take_profit"};
-      else if (config.exitConfig.maxHoldingBars && state.index-active.entryIndex >= config.exitConfig.maxHoldingBars) exit = {price:candle.close,type:"timeout"};
-      else if (config.exitConfig.closeAtEnd && state.index === state.candles.length-1) exit = {price:candle.close,type:"end_of_backtest"};
+      const exit = matchBarExit(candle,{entry:active.trade.entryPrice,baseStop:stop,target,
+        invalid:()=>evaluateConditionGroup(config.invalidationConditionGroup,history,active.impulse),
+        timedOut:!!config.exitConfig.maxHoldingBars && state.index-active.entryIndex>=config.exitConfig.maxHoldingBars,
+        end:config.exitConfig.closeAtEnd && state.index===state.candles.length-1});
       if (exit) close(state,candle,exit.price,exit.type,{priority:exit.type,stop,target,...(exit.type==='invalidation'?{invalidation:describeInvalidation(config.invalidationConditionGroup,history,active.impulse)}:{})});
     }
     for (const {state,candle,history,impulse} of contexts) {

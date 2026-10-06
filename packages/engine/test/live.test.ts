@@ -1,6 +1,7 @@
 import {describe,expect,it} from 'vitest';
 import {LiveCandleAggregator,LiveEvaluator,type MarketTrade} from '../src/live.js';
 import type {Candle,StrategyConfig} from '@meme/domain';
+import {matchBarExit} from '../src/bar-exit.js';
 
 const t=(id:string,time:number,price:number,mcap=price*100):MarketTrade=>({id,chain:'sol',ca:'CA',pairId:'PAIR',time,price,mcap,volumeUsd:10});
 describe('live candle aggregation',()=>{
@@ -62,9 +63,66 @@ describe('live evaluator',()=>{
   // A later bar may produce a signal, but historical bars cannot produce an authorized buy.
   expect(e.state.lastCandleTime).toBe(150_000);
  });
- it('tick exits use actual subsequent trade value and retain locked stop',()=>{
+ it('closed bars retain the locked stop, even if the close recovered above it',()=>{
   const e=new LiveEvaluator(config,0);e.state.position={entryPrice:100,quantity:1,entries:1,entryTime:30_000,entryBar:1,impulse:{low:50,high:150,lowIndex:0,highIndex:1,confirmedAtIndex:2,gainPercent:200,averageVolume:10},tradeNo:1,lockPrice:120,lockTier:0};
-  expect(e.onTrade(t('x',30_000,110), 'price')).toBeUndefined();
-  expect(e.onTrade(t('y',31_000,119), 'price')?.reason).toBe('profit_lock');
+  expect(e.onClosedCandle({...candle(2,130),open:130,low:119})).toMatchObject({reason:'profit_lock',value:120,time:90_000});
+  expect(e.onClosedCandle(candle(2,110))).toBeUndefined();
+ });
+ it('confirms locks after fills, for the next bar, and preserves them across restore/adds',()=>{
+  const cfg=structuredClone(config);cfg.exitConfig.takeProfit={type:'percent',value:500};
+  const e=new LiveEvaluator(cfg,0);e.state.position={entryPrice:100,quantity:1,entries:1,entryTime:0,entryBar:0,impulse:{low:50,high:150,lowIndex:0,highIndex:1,confirmedAtIndex:2,gainPercent:200,averageVolume:10},tradeNo:1};
+  const c={...candle(1,150),open:110,low:100};
+  expect(e.onClosedCandle(c)).toBeUndefined();expect(e.state.position.lockPrice).toBeUndefined();
+  e.confirmClose(c);expect(e.state.position.lockPrice).toBe(120);
+  e.state.position.entryPrice=90;e.confirmClose(c);expect(e.state.position.lockPrice).toBe(120);
+  const restored=new LiveEvaluator(cfg,0,e.snapshot());
+  expect(restored.onClosedCandle({...candle(2,130),open:115,low:110})).toMatchObject({reason:'profit_lock',value:115});
+ });
+ it('does not generate missed orders or modify locks during recovery warmup',()=>{
+  const e=new LiveEvaluator(config,0);e.state.position={entryPrice:100,quantity:1,entries:1,entryTime:0,entryBar:0,impulse:{low:50,high:150,lowIndex:0,highIndex:1,confirmedAtIndex:2,gainPercent:200,averageVolume:10},tradeNo:1};
+  expect(e.onClosedCandle(candle(1,160),true)).toBeUndefined();expect(e.state.position.lockPrice).toBeUndefined();
+  expect(e.onClosedCandle(candle(2,80),true)).toBeUndefined();expect(e.state.position).toBeDefined();
+ });
+ it('counts timeout from the entry bar without an off-by-one',()=>{
+  const cfg=structuredClone(config);cfg.exitConfig.maxHoldingBars=2;
+  const e=new LiveEvaluator(cfg,0);e.onClosedCandle(candle(0,100),true);
+  e.state.position={entryPrice:100,quantity:1,entries:1,entryTime:30_000,entryBar:0,impulse:{low:50,high:150,lowIndex:0,highIndex:1,confirmedAtIndex:2,gainPercent:200,averageVolume:10},tradeNo:1};
+  expect(e.onClosedCandle(candle(1,100))).toBeUndefined();
+  expect(e.onClosedCandle(candle(2,100))).toMatchObject({reason:'timeout'});
+ });
+});
+
+describe('shared completed-bar exit matching',()=>{
+ const p={entry:100,baseStop:90,target:150,invalid:()=>false,timedOut:false};
+ it.each([
+  [{open:100,high:160,low:80,close:110},'stop_loss',90],
+  [{open:85,high:160,low:80,close:110},'stop_loss',85],
+  [{open:100,high:160,low:95,close:110},'take_profit',150],
+  [{open:160,high:170,low:155,close:165},'take_profit',160],
+ ] as const)('matches intrabar touches and gaps after close: %j',(ohlc,type,price)=>{
+  expect(matchBarExit({...candle(1,ohlc.close),...ohlc},p)).toEqual({type,price});
+ });
+ it('keeps invalidation before targets, then timeout and end',()=>{
+  const c={...candle(1,110),high:160,low:95};
+  expect(matchBarExit(c,{...p,invalid:()=>true})).toEqual({type:'invalidation',price:110});
+  expect(matchBarExit(candle(1,110),{...p,timedOut:true,end:true})?.type).toBe('timeout');
+  expect(matchBarExit(candle(1,110),{...p,end:true})?.type).toBe('end_of_backtest');
+ });
+});
+
+describe('connected idle buckets',()=>{
+ it.each(['30s','1m'] as const)('fills %s only with explicit healthy connection permission',interval=>{
+  const bars:any[]=[];const a=new LiveCandleAggregator(b=>bars.push(b));a.accept(t('a',1_000,2));a.flush(60_000,()=>true);
+  a.flush(120_000,()=>true);
+  const idle=bars.filter(b=>b.interval===interval&&b.type==='price'&&b.candle.synthetic);
+  expect(idle.length).toBeGreaterThan(0);expect(idle.every(b=>b.candle.open===2&&b.candle.close===2&&b.candle.volume===0)).toBe(true);
+  const n=bars.length;a.flush(180_000,()=>false);expect(bars.length).toBe(n);
+  a.discardPair('sol','PAIR');a.flush(240_000,()=>true);expect(bars.length).toBe(n);
+ });
+ it('does not duplicate an idle bucket or overwrite a real candle',()=>{
+  const bars:any[]=[];const a=new LiveCandleAggregator(b=>bars.push(b));a.accept(t('a',1000,2));a.flush(60_000,()=>true);
+  a.accept(t('b',61_000,3));a.flush(90_000,()=>true);a.flush(90_000,()=>true);
+  const selected=bars.filter(b=>b.type==='price'&&b.interval==='30s');
+  expect(selected.map(b=>b.candle.time)).toEqual([0,30_000,60_000]);expect(selected.at(-1).candle.close).toBe(3);
  });
 });
