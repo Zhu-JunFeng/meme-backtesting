@@ -18,6 +18,20 @@ export function* backfillWindows(from:number,to:number,step:number):Generator<{f
  if(!Number.isSafeInteger(from)||!Number.isSafeInteger(to)||!Number.isSafeInteger(step)||step<=0||from%step!==0||to%step!==0||to<from)throw new Error('补行情时间范围无效');
  for(let start=from;start<to;start+=step*5000)yield {from:start,to:Math.min(to,start+step*5000)};
 }
+export function localWarmupBars(config:StrategyConfig):number{
+ const periods:number[]=[];
+ const visit=(value:unknown)=>{
+  if(!value||typeof value!=='object')return;
+  if(Array.isArray(value)){value.forEach(visit);return;}
+  const item=value as Record<string,unknown>;
+  for(const key of ['period','lookbackBars'])if(typeof item[key]==='number'&&Number.isFinite(item[key]))periods.push(item[key]);
+  if(Array.isArray(item.conditions))visit(item.conditions);
+ };
+ visit(config.entryConditionGroup);visit(config.addConditionGroup);visit(config.invalidationConditionGroup);
+ const impulse=config.impulseCondition;
+ return Math.max(impulse.lookbackBars+impulse.leftBars+impulse.rightBars+1,...periods.map(period=>period+2),1);
+}
+class HistoryChallengeError extends Error{}
 export const acceptsNewSignal=(run:{signal_source:string;started_at:Date|string},signal:ProjectSignal)=>
  (run.signal_source==='all'||run.signal_source===signal.source)&&signal.time>new Date(run.started_at).getTime();
 const redact=(error:unknown)=>String(error).replace(/Bearer\s+[^\s]+/gi,'Bearer [redacted]').slice(0,300);
@@ -62,6 +76,7 @@ export class LiveService {
  private lastMcapCheck=0;
  private signal?:WebSocket;private lock?:PoolClient;private refreshTimer?:ReturnType<typeof setInterval>;private flushTimer?:ReturnType<typeof setInterval>;
  private chain=Promise.resolve();private stopped=false;private feedHealthy=false;
+ private historyBlockedUntil=0;
  private readonly xxyy=process.env.XXYY_API_KEY?new XxyyTradeClient(process.env.XXYY_API_KEY):undefined;
  constructor(private readonly pool:Pool){}
  private enqueue(fn:()=>Promise<void>){this.chain=this.chain.then(fn).catch(e=>console.error('live service:',redact(e)));}
@@ -177,7 +192,7 @@ export class LiveService {
   const previous=this.sockets.get(key);if(previous){previous.removeAllListeners();previous.disconnect();this.connected.delete(key);}
   const socket=io(process.env.XXYY_PUSH_URL??'wss://web-push.xxyy.io/data',{transports:['websocket'],forceNew:true,reconnection:true});
   this.sockets.set(key,socket);
-  socket.on('connect',()=>{this.connected.add(key);socket.emit('SUBSCRIBE',channel,{});this.enqueue(async()=>{for(const ctx of this.watches.values())if(pairKey(ctx.watch.chain,ctx.watch.pair_id)===key){ctx.ready=false;ctx.nextRecoveryAt=0;await this.markRecovering(ctx,'连接成功，补齐断线期间行情');}await this.refresh();});});
+  socket.on('connect',()=>{this.connected.add(key);socket.emit('SUBSCRIBE',channel,{});this.enqueue(async()=>{for(const ctx of this.watches.values())if(pairKey(ctx.watch.chain,ctx.watch.pair_id)===key){ctx.ready=false;ctx.noOrdersBefore=Date.now();ctx.nextRecoveryAt=0;await this.markRecovering(ctx,'连接成功，补齐断线期间行情');}await this.refresh();});});
   socket.on('disconnect',()=>this.enqueue(()=>this.feedInterrupted(watch.chain,watch.pair_id)));
   socket.on(event,(raw,receivedChannel)=>{for(const trade of parseMarketTrades(raw,receivedChannel,channel,{chain:watch.chain,ca:watch.ca,pairId:watch.pair_id}))this.enqueue(()=>this.onTrade(trade));});
   socket.on('connect_error',error=>console.error('XXYY trade connection:',redact(error)));
@@ -243,9 +258,14 @@ export class LiveService {
   const step=ctx.run.interval==='30s'?30_000:60_000,to=Math.floor(Date.now()/step)*step;
   let from=ctx.watch.last_candle_time?Number(ctx.watch.last_candle_time)+step:to-600*step;
   if(from>=to)return;
+  if(Date.now()<this.historyBlockedUntil)throw new HistoryChallengeError('XXYY 历史接口遭 Cloudflare 挑战');
   for(const window of backfillWindows(from,to,step)){
    const end=window.to;from=window.from;
    const response=await fetch('https://www.xxyy.io/api/data/candlestick/searchBarData',{method:'POST',headers:{'X-CHAIN':ctx.watch.chain,'X-VERSION':'1','X-LANGUAGE':'zh','Content-Type':'application/json'},body:JSON.stringify({pairId:ctx.watch.pair_id,valueType:ctx.run.value_type==='mcap'?'mc':'price',interval:step/1000,priceType:'usd',from,to:end,countBack:5000}),signal:AbortSignal.timeout(15_000)});
+   if(response.status===403){
+    this.historyBlockedUntil=Date.now()+5*60_000;
+    throw new HistoryChallengeError(response.headers.get('cf-mitigated')==='challenge'?'XXYY 历史接口遭 Cloudflare 挑战':'XXYY 历史接口拒绝访问（HTTP 403）');
+   }
    if(!response.ok)throw new Error(`XXYY 历史补数 HTTP ${response.status}`);
    const data=await response.json() as any;if(data.code!==0||!Array.isArray(data.data))throw new Error('XXYY 历史补数响应无效');
    const rows=data.data.map((row:any)=>({time:Number(row.time),open:Number(row.price?.open),high:Number(row.price?.high),low:Number(row.price?.low),close:Number(row.price?.close),volume:Number(row.price?.volume)}))
@@ -262,8 +282,34 @@ export class LiveService {
    if(rows.length){ctx.watch.last_candle_time=String(rows.at(-1)!.time);await this.pool.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',[ctx.run.id,JSON.stringify(ctx.evaluator.snapshot()),rows.at(-1)!.time,ctx.watch.chain,ctx.watch.ca]);}
   }
  }
- private async markRecovering(ctx:Context,reason:string){
-  ctx.ready=false;ctx.watch.status='recovering';ctx.nextRecoveryAt=Date.now()+5_000;
+ /** Do not trust candles preceding this uninterrupted socket connection if web history is blocked. */
+ private async warmupFromConnectedFeed(ctx:Context):Promise<{ready:boolean;count:number;required:number}>{
+  const required=localWarmupBars(ctx.run.strategy_json);
+  if(ctx.evaluator.state.position)return {ready:false,count:0,required};
+  const step=ctx.run.interval==='30s'?30_000:60_000;
+  const first=Math.ceil(ctx.noOrdersBefore/step)*step;
+  const to=Math.floor(Date.now()/step)*step;
+  if(first>=to)return {ready:false,count:0,required};
+  const rows=(await this.pool.query(`SELECT open_time AS time,close_time AS "closeTime",open,high,low,close,volume
+   FROM (SELECT open_time,close_time,open,high,low,close,volume FROM meme_kline
+    WHERE chain=$1 AND ca=$2 AND pair_id=$3 AND interval=$4 AND type=$5
+      AND source='xxyy_socket' AND valid IS DISTINCT FROM false AND open_time>=$6 AND close_time<=$7
+    ORDER BY open_time DESC LIMIT $8) recent ORDER BY open_time`,
+   [ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,ctx.run.value_type,first,to,Math.min(5000,Math.max(required,512))])).rows;
+  if(rows.length<required)return {ready:false,count:rows.length,required};
+  const previous=ctx.evaluator.snapshot();
+  const evaluator=new LiveEvaluator(ctx.run.strategy_json,Number(ctx.watch.signal_time),{
+   history:[],lastEntryMatch:false,lastAddMatch:false,trades:previous.trades,lastTokenPrice:previous.lastTokenPrice,
+  });
+  for(const row of rows)evaluator.onClosedCandle({time:Number(row.time),closeTime:Number(row.closeTime),open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),volume:Number(row.volume)});
+  ctx.evaluator=evaluator;
+  ctx.watch.last_candle_time=String(rows.at(-1)!.time);
+  await this.pool.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',
+   [ctx.run.id,JSON.stringify(evaluator.snapshot()),rows.at(-1)!.time,ctx.watch.chain,ctx.watch.ca]);
+  return {ready:true,count:rows.length,required};
+ }
+ private async markRecovering(ctx:Context,reason:string,retryMs=5_000){
+  ctx.ready=false;ctx.watch.status='recovering';ctx.nextRecoveryAt=Date.now()+retryMs;
   await this.pool.query("UPDATE live_watches SET status='recovering',recovery_reason=$4 WHERE run_id=$1 AND chain=$2 AND ca=$3",[ctx.run.id,ctx.watch.chain,ctx.watch.ca,reason]);
   await this.pool.query("UPDATE live_runs SET feed_state='recovering',feed_reason=$2 WHERE id=$1 AND status='running'",[ctx.run.id,reason]);
  }
@@ -280,7 +326,14 @@ export class LiveService {
     this.subscribe(ctx.watch);
     throw new Error('主池已切换，等待新交易池订阅确认');
    }
-   await this.catchup(ctx);
+   try{await this.catchup(ctx);}catch(error){
+    if(!(error instanceof HistoryChallengeError))throw error;
+    const warmup=await this.warmupFromConnectedFeed(ctx);
+    if(!warmup.ready){
+     await this.markRecovering(ctx,`历史接口被 Cloudflare 拦截；实时行情安全预热 ${warmup.count}/${warmup.required} 根，期间暂停新买入`,60_000);
+     return;
+    }
+   }
    if(!ctx.evaluator.state.history.length)throw new Error('尚无可用历史行情，等待重试');
    ctx.noOrdersBefore=Date.now();
    if(![...this.watches.values()].some(other=>other!==ctx&&other.ready&&other.watch.chain===ctx.watch.chain&&other.watch.pair_id===ctx.watch.pair_id))
