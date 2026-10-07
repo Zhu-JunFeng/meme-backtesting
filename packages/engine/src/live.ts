@@ -2,9 +2,10 @@ import type { Candle, ConditionGroup, StrategyConfig, SymbolRef } from '@meme/do
 import { detectImpulse, evaluateConditionGroup, stopPrice, targetPrice, type Impulse } from './index.js';
 import { matchBarExit } from './bar-exit.js';
 
-export interface MarketTrade { id:string; chain:string; ca:string; pairId:string; time:number; price:number; mcap?:number; volumeUsd:number }
-export interface ClosedMarketBar { symbol:SymbolRef; interval:'30s'|'1m'; type:'price'|'mcap'; candle:Candle; tradeCount:number; closeTradeId?:string; closeTradeTime?:number }
-type Bucket = {symbol:SymbolRef;interval:'30s'|'1m';type:'price'|'mcap';candle:Candle;firstAt:number;lastAt:number;firstId:string;lastId:string;tradeCount:number};
+export type MarketCapBasis={source:'ws'|'price_supply';value:string;supply?:{original:string;unit:'raw'|'tokens';decimals:number|null;tokens:string;fetchedAt:number}};
+export interface MarketTrade { id:string; chain:string; ca:string; pairId:string; time:number; price:number; mcap?:number; volumeUsd:number; marketCapBasis?:MarketCapBasis }
+export interface ClosedMarketBar { symbol:SymbolRef; interval:'30s'|'1m'; type:'price'|'mcap'; candle:Candle; tradeCount:number; closeTradeId?:string; closeTradeTime?:number;marketCapBasis?:MarketCapBasis;derivedSupply?:MarketCapBasis['supply'];hasDerivedMarketCap?:boolean }
+type Bucket = {symbol:SymbolRef;interval:'30s'|'1m';type:'price'|'mcap';candle:Candle;firstAt:number;lastAt:number;firstId:string;lastId:string;tradeCount:number;marketCapBasis?:MarketCapBasis;derivedSupply?:MarketCapBasis['supply'];hasDerivedMarketCap?:boolean};
 export type TradeAcceptance={accepted:boolean;late:boolean;reason?:'invalid'|'duplicate'|'too_old'|'closed'};
 const period = (interval:'30s'|'1m') => interval==='30s'?30_000:60_000;
 export class LiveCandleAggregator {
@@ -46,9 +47,11 @@ export class LiveCandleAggregator {
         accepted=true;
         current.candle.high=Math.max(current.candle.high,value);current.candle.low=Math.min(current.candle.low,value);
         if(trade.time<current.firstAt || (trade.time===current.firstAt&&trade.id<current.firstId)){current.firstAt=trade.time;current.firstId=trade.id;current.candle.open=value;}
-        if(trade.time>current.lastAt || (trade.time===current.lastAt&&trade.id>current.lastId)){current.lastAt=trade.time;current.lastId=trade.id;current.candle.close=value;}
+        if(trade.time>current.lastAt || (trade.time===current.lastAt&&trade.id>current.lastId)){current.lastAt=trade.time;current.lastId=trade.id;current.candle.close=value;current.marketCapBasis=trade.marketCapBasis;}
+        current.hasDerivedMarketCap ||= trade.marketCapBasis?.source==='price_supply';
+        if(trade.marketCapBasis?.source==='price_supply')current.derivedSupply=trade.marketCapBasis.supply;
         current.candle.volume+=trade.volumeUsd;current.tradeCount++;
-      }else if(!current || current.candle.time<start){accepted=true;this.buckets.set(key,{symbol,interval,type,candle:{time:start,closeTime:start+period(interval),open:value,high:value,low:value,close:value,volume:trade.volumeUsd,valid:true},firstAt:trade.time,lastAt:trade.time,firstId:trade.id,lastId:trade.id,tradeCount:1});}
+      }else if(!current || current.candle.time<start){accepted=true;this.buckets.set(key,{symbol,interval,type,candle:{time:start,closeTime:start+period(interval),open:value,high:value,low:value,close:value,volume:trade.volumeUsd,valid:true},firstAt:trade.time,lastAt:trade.time,firstId:trade.id,lastId:trade.id,tradeCount:1,marketCapBasis:trade.marketCapBasis,derivedSupply:trade.marketCapBasis?.source==='price_supply'?trade.marketCapBasis.supply:undefined,hasDerivedMarketCap:trade.marketCapBasis?.source==='price_supply'});}
     }
     return {accepted,late,reason:accepted?undefined:'closed'};
   }
@@ -77,7 +80,7 @@ export class LiveCandleAggregator {
     for(const [key,bucket] of this.buckets)if(bucket.symbol.chain===chain&&bucket.symbol.pairId===pairId)this.buckets.delete(key);
     for(const [key,bar] of this.lastBars)if(bar.symbol.chain===chain&&bar.symbol.pairId===pairId)this.lastBars.delete(key);
   }
-  private finish(key:string,bucket:Bucket){this.buckets.delete(key);this.finalized.set(key,bucket.candle.time);const bar={symbol:bucket.symbol,interval:bucket.interval,type:bucket.type,candle:{...bucket.candle},tradeCount:bucket.tradeCount,closeTradeId:bucket.lastId,closeTradeTime:bucket.lastAt};this.lastBars.set(key,bar);this.onClose(bar);}
+  private finish(key:string,bucket:Bucket){this.buckets.delete(key);this.finalized.set(key,bucket.candle.time);const bar={symbol:bucket.symbol,interval:bucket.interval,type:bucket.type,candle:{...bucket.candle},tradeCount:bucket.tradeCount,closeTradeId:bucket.lastId,closeTradeTime:bucket.lastAt,marketCapBasis:bucket.marketCapBasis,derivedSupply:bucket.derivedSupply,hasDerivedMarketCap:bucket.hasDerivedMarketCap};this.lastBars.set(key,bar);this.onClose(bar);}
 }
 
 export interface LivePosition {entryPrice:number;quantity:number;entries:number;entryTime:number;entryBar:number;impulse:Impulse;lockPrice?:number;lockTier?:number;tradeNo:number;costBasisUsd?:number;positionId?:string}

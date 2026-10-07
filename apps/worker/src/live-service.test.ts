@@ -49,12 +49,49 @@ describe('recovery windows',()=>{
   expect(await (service as any).warmupFromConnectedFeed(ctx)).toMatchObject({ready:true,count:5,required:5});
   expect(ctx.evaluator.state.history).toHaveLength(5);
   expect(ctx.evaluator.state.position).toBeUndefined();
-  expect(query.mock.calls[0][0]).toContain("source='xxyy_socket'");
+  expect(query.mock.calls[0][0]).toContain("source='meme_market_v2'");
   ctx.evaluator.state.position={entryPrice:1} as never;
   expect(await (service as any).warmupFromConnectedFeed(ctx)).toMatchObject({ready:false});
  });
 });
 describe('monitor admission',()=>{
+ function waitingService(){
+  const service:any=new LiveService({query:vi.fn(async()=>({rows:[]}))} as never);
+  service.watches.set('r:robin:a',{run:{id:'r',status:'running',value_type:'mcap'},watch:{chain:'robin',ca:'a',pair_id:'p'},ready:true});
+  service.marketSessions.set('robin:a','s');service.marketEpochs.set('robin:a',0);
+  let info:any,release!:()=>void;const promise=new Promise<any>(resolve=>{release=()=>{info={supply:{tokens:'1000000000'}};resolve(info);};});
+  service.projects={peek:()=>info,status:()=>undefined,get:vi.fn(()=>promise)};
+  service.onTrade=vi.fn(async()=>{});
+  const raw={chain:'robin',ca:'a',pair_id:'p',event_id:'1',trade_time:60000,price_usd:'0.001',volume_usd:'10',market_cap_usd:null};
+  return {service,raw,release};
+ }
+ it('buffers the entire project stream while supply is pending, including WS-valued trades',async()=>{
+  const {service,raw,release}=waitingService();service.receiveTrade(raw,'s');service.receiveTrade({...raw,event_id:'2',trade_time:65000,market_cap_usd:'2000000'},'s');
+  await service.chain;expect(service.onTrade).not.toHaveBeenCalled();expect(service.projectTrades.get('robin:a')).toHaveLength(2);expect(service.projects.get).toHaveBeenCalledTimes(1);
+  release();await vi.waitFor(()=>expect(service.onTrade).toHaveBeenCalledTimes(2));
+  expect(service.onTrade.mock.calls.map((x:any)=>x[0].mcap)).toEqual([1000000,2000000]);
+ });
+ it('rejects old buffered trades after disconnect even when lookup later succeeds',async()=>{
+  const {service,raw,release}=waitingService();service.receiveTrade(raw,'s');service.interruptMarket([{chain:'robin',ca:'a'}],'disconnect');release();
+  await vi.waitFor(()=>expect(service.projectLoading.size).toBe(0));await service.chain;expect(service.onTrade).not.toHaveBeenCalled();
+ });
+ it('bounds the per-project buffer and invalidates an overflowing bucket',async()=>{
+  const {service,raw}=waitingService();service.market.resetProjects=vi.fn();
+  for(let i=0;i<257;i++)service.receiveTrade({...raw,event_id:String(i)},'s');
+  expect(service.quality.overflow).toBe(1);expect(service.projectTrades.has('robin:a')).toBe(false);expect(service.market.resetProjects).toHaveBeenCalledOnce();await service.chain;
+ });
+ it('ignores unrelated pools without aggregation or metadata lookup',async()=>{
+  const {service,raw}=waitingService();service.receiveTrade({...raw,pair_id:'other'},'s');await service.chain;expect(service.projects.get).not.toHaveBeenCalled();expect(service.onTrade).not.toHaveBeenCalled();
+ });
+ it('fences ready contexts and removes queued bars immediately on interruption',async()=>{
+  const query=vi.fn(async()=>({rows:[]}));const service:any=new LiveService({query} as never);
+  const ctx={run:{id:'r'},watch:{chain:'robin',ca:'a',pair_id:'p'},ready:true};
+  service.watches.set('r:robin:a',ctx);service.marketSessions.set('robin:a','session');service.connected.add('robin:p');service.confirmedFeeds.add('robin:p');
+  service.closedBars.push({symbol:{chain:'robin',ca:'a',pairId:'p'}});
+  service.interruptMarket([{chain:'robin',ca:'a'}],'gap');
+  expect(ctx.ready).toBe(false);expect(service.connected.size).toBe(0);expect(service.marketSessions.size).toBe(0);expect(service.closedBars).toEqual([]);
+  await service.chain;
+ });
  it('allows exactly twenty active CAs per run and keeps existing watches',()=>{
   expect(canMonitor(LIVE_CA_LIMIT-1,false)).toBe(true);
   expect(canMonitor(LIVE_CA_LIMIT,false)).toBe(false);

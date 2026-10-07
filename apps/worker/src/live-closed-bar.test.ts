@@ -36,7 +36,7 @@ const url=process.env.TEST_DATABASE_URL;
   pool=new Pool({connectionString:url,options:`-c search_path=${schema},public`});
   await pool.query('CREATE TABLE backtest_strategy_versions(id uuid PRIMARY KEY DEFAULT gen_random_uuid())');
   version=(await pool.query('INSERT INTO backtest_strategy_versions DEFAULT VALUES RETURNING id')).rows[0].id;
-  for(const name of ['010_live_trading','011_live_signal_sources','012_live_watch_dex','013_live_recovery_capacity','014_live_portfolio','015_live_closed_bar'])
+  for(const name of ['010_live_trading','011_live_signal_sources','012_live_watch_dex','013_live_recovery_capacity','014_live_portfolio','015_live_closed_bar','016_live_market_protocol'])
    await pool.query(readFileSync(new URL(`../../api/migrations/${name}.sql`,import.meta.url),'utf8').replaceAll('public.',`${schema}.`));
  },20_000);
  afterEach(()=>vi.unstubAllEnvs());
@@ -89,10 +89,12 @@ const url=process.env.TEST_DATABASE_URL;
  });
  it('keeps market-cap decision values distinct from token prices in fills',async()=>{
   const {run,service,add}=await fixture('paper','mcap');await add('a');
-  const mc={...bar('a','mcap'),candle:{...bar().candle,open:10000,high:10100,low:8500,close:9500}};
+  const supply={original:'100',unit:'tokens' as const,decimals:null,tokens:'100',fetchedAt:1000};
+  const mc={...bar('a','mcap'),candle:{...bar().candle,open:10000,high:10100,low:8500,close:9500},marketCapBasis:{source:'price_supply' as const,value:'9500',supply},derivedSupply:supply,hasDerivedMarketCap:true};
   await service.executeBars([mc,bar()]);
   const f=(await pool.query('SELECT f.* FROM live_fills f JOIN live_orders o ON o.id=f.order_id WHERE o.run_id=$1',[run.id])).rows[0];
   expect(Number(f.fill_price)).toBe(90);expect(Number(f.fill_value)).toBe(9000);expect(Number(f.quantity)).toBe(1);expect(Number(run.realized_pnl)).toBeCloseTo(-12.7);
+  const evidence=(await pool.query('SELECT raw_result FROM live_orders WHERE run_id=$1',[run.id])).rows[0].raw_result;expect(evidence.marketCapBasis).toEqual(mc.marketCapBasis);expect(evidence.derivedSupply).toEqual(supply);
  });
  it('switches existing runs once, cancels old paper intents and preserves positions',async()=>{
   const {run,service,add}=await fixture();const ctx=await add('a'),before=ctx.evaluator.snapshot();
@@ -101,6 +103,13 @@ const url=process.env.TEST_DATABASE_URL;
   const saved=(await pool.query('SELECT * FROM live_runs WHERE id=$1',[run.id])).rows[0];expect(saved.execution_version).toBe(LIVE_EXECUTION_VERSION);expect(saved.execution_switched_at).toBeTruthy();
   expect((await pool.query('SELECT status FROM live_orders WHERE run_id=$1',[run.id])).rows[0].status).toBe('cancelled');expect(ctx.evaluator.snapshot()).toEqual(before);
   expect((await pool.query("SELECT COUNT(*) n FROM live_events WHERE run_id=$1 AND kind='execution_switched'",[run.id])).rows[0].n).toBe('1');
+ });
+ it('switches the market source atomically and keeps prior positions and cash intact',async()=>{
+  const {run,service,add}=await fixture();const ctx=await add('a'),before=ctx.evaluator.snapshot();
+  await pool.query("INSERT INTO live_orders(run_id,chain,ca,pair_id,intent_key,side,reason,status,decision_time,decision_value,requested_amount) VALUES($1,'sol','a','a',$2,'buy','entry','pending',0,100,10)",[run.id,randomUUID()]);
+  await service.switchMarket();await service.switchMarket();
+  const saved=(await pool.query('SELECT * FROM live_runs WHERE id=$1',[run.id])).rows[0];expect(saved.market_source).toBe('meme_market_v2');expect(saved.market_switched_at).toBeTruthy();expect(Number(saved.cash)).toBe(Number(run.cash));expect(ctx.evaluator.snapshot()).toEqual(before);
+  expect((await pool.query('SELECT status FROM live_orders WHERE run_id=$1',[run.id])).rows[0].status).toBe('cancelled');expect((await pool.query("SELECT COUNT(*) n FROM live_events WHERE run_id=$1 AND kind='market_switched'",[run.id])).rows[0].n).toBe('1');
  });
  it('holds an uncertain real intent on restart instead of resending it',async()=>{
   const {run,service,add}=await fixture('live');await add('a');
@@ -122,5 +131,10 @@ const url=process.env.TEST_DATABASE_URL;
   await service.executeBars([bar()]);expect(swap).toHaveBeenCalledOnce();await service.executeBars([bar()]);expect(swap).toHaveBeenCalledOnce();
   expect((await pool.query('SELECT COUNT(*) n FROM live_fills f JOIN live_orders o ON o.id=f.order_id WHERE o.run_id=$1',[run.id])).rows[0].n).toBe('0');
   expect((await pool.query('SELECT status FROM live_orders WHERE run_id=$1',[run.id])).rows[0].status).toBe('submitted');
+ });
+ it('does not submit a real order if the market interrupts during wallet preflight',async()=>{
+  vi.stubEnv('LIVE_TRADING_ENABLED','true');const {run,service,add}=await fixture('live');const ctx=await add('a'),swap=vi.fn();
+  service.xxyy={walletInfo:async()=>{ctx.ready=false;return {address:run.wallet_address,tokenBalance:{uiAmount:1}};},swap};
+  await service.executeBars([bar()]);expect(swap).not.toHaveBeenCalled();expect((await pool.query('SELECT status FROM live_orders WHERE run_id=$1',[run.id])).rows[0].status).toBe('cancelled');
  });
 });

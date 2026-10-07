@@ -1,10 +1,13 @@
 import {createHash} from 'node:crypto';
-import {io,type Socket} from 'socket.io-client';
+import {MemeMarketFeed,parseMemeTrade,projectKey,type Project} from './meme-market.js';
+import {ProjectCache,resolveMarketCap} from './project-cache.js';
+import {Redis} from 'ioredis';
+import {redisConnection} from '@meme/runtime';
 import WebSocket from 'ws';
 import type {Pool,PoolClient} from 'pg';
 import {LiveCandleAggregator,LiveEvaluator,detectImpulse,validCandle,type ClosedMarketBar,type LiveDecision,type MarketTrade} from '@meme/engine';
 import type {Candle,StrategyConfig} from '@meme/domain';
-import {parseMarketTrades,parseProjectSignal,resolveLivePool,type ProjectSignal} from './live-input.js';
+import {parseProjectSignal,type ProjectSignal} from './live-input.js';
 
 type Run={id:string;mode:'paper'|'live';chain:string;signal_source:string;interval:'30s'|'1m';value_type:'price'|'mcap';status:string;execution_hold_reason:string|null;strategy_json:StrategyConfig;cash:string;realized_pnl:string;wallet_address:string|null;risk_json:any;started_at:Date;execution_version:string;execution_switched_at:Date|null};
 type Watch={run_id:string;chain:string;ca:string;pair_id:string;dex_id:string|null;signal_time:string;state_json:any;last_candle_time:string|null;status:string;current_mcap:string|null;last_trade_at:string|null};
@@ -80,7 +83,76 @@ export class LiveService {
  private get db(){return this.executionClient??this.pool;}
  private submissions:Array<{ctx:Context;id:string;decision:LiveDecision;amount:number}>=[];
  private readonly watches=new Map<string,Context>();
- private readonly sockets=new Map<string,Socket>();
+ private readonly marketSessions=new Map<string,string>();
+ private readonly marketEpochs=new Map<string,number>();
+ private readonly marketInputAfter=new Map<string,number>();
+ private pendingMarket=0;
+ private readonly quality={invalid:0,gaps:0,overflow:0,derivedMcap:0,wsMcap:0};
+ private readonly projectRedis=new Redis({...redisConnection(),lazyConnect:true,connectTimeout:800,commandTimeout:800,maxRetriesPerRequest:1,enableOfflineQueue:false,retryStrategy:()=>null});
+ private readonly projects=new ProjectCache(this.projectRedis);
+ private readonly projectLoading=new Set<string>();
+ private readonly supplyBlocked=new Set<string>();
+ private readonly projectTrades=new Map<string,Array<{raw:any;session:string;epoch:number|undefined}>>();
+ private readonly latestCaps=new Map<string,{value:number;time:number;pairId:string}>();
+ private readonly signalRetries=new Map<string,ReturnType<typeof setTimeout>>();
+ private readonly market=new MemeMarketFeed({
+  ready:(projects,session)=>{for(const p of projects){this.marketSessions.set(projectKey(p),session);this.marketEpochs.set(projectKey(p),Date.now());}this.enqueue(async()=>{for(const ctx of this.matchProjects(projects)){this.connected.add(pairKey(ctx.watch.chain,ctx.watch.pair_id));ctx.noOrdersBefore=Date.now();ctx.nextRecoveryAt=0;await this.markRecovering(ctx,'协议 2 订阅已确认，正在预热／补数');}});},
+  interrupted:(projects,reason)=>this.interruptMarket(projects,reason),
+  trade:(raw,session)=>this.receiveTrade(raw,session)
+ });
+ private prepareProject(p:Project){
+  const key=projectKey(p);if(this.stopped||this.projectLoading.has(key)||this.projects.peek(p))return;
+  const state=this.projects.status(p);if(state&&(state.attempts>=3||state.nextRetryAt>Date.now()))return;
+  this.projectLoading.add(key);
+  void this.projects.get(p).then(()=>{
+   if(this.stopped)return;
+   const waiting=this.projectTrades.get(key)??[];this.projectTrades.delete(key);this.supplyBlocked.delete(key);
+   waiting.sort((a,b)=>a.raw.trade_time-b.raw.trade_time||String(a.raw.event_id).localeCompare(String(b.raw.event_id)));
+   for(const item of waiting)this.receiveTrade(item.raw,item.session,item.epoch);
+  }).catch(e=>{if(!this.stopped){if(this.projects.status(p)?.attempts===3)this.projectTrades.delete(key);this.enqueue(async()=>{for(const ctx of this.matchProjects([p]))await this.markRecovering(ctx,`供应量资料不可用：${redact(e)}`);});}}).finally(()=>this.projectLoading.delete(key));
+ }
+ private blockSupply(p:Project,reason:string){
+  const key=projectKey(p);if(this.supplyBlocked.has(key))return;this.supplyBlocked.add(key);
+  // The already-open bucket may contain trades discarded before metadata arrived.
+  // Resume aggregation only at the next complete minute, for both 30s and 1m.
+  this.marketInputAfter.set(key,Math.ceil(Date.now()/60_000)*60_000);
+  for(const ctx of this.matchProjects([p])){ctx.ready=false;ctx.noOrdersBefore=Date.now();this.confirmedFeeds.delete(pairKey(ctx.watch.chain,ctx.watch.pair_id));this.aggregator.discardPair(ctx.watch.chain,ctx.watch.pair_id);}
+  this.closedBars=this.closedBars.filter(b=>projectKey(b.symbol)!==key);
+  this.enqueue(async()=>{for(const ctx of this.matchProjects([p]))await this.markRecovering(ctx,reason);});
+ }
+ private receiveTrade(raw:any,session:string,originalEpoch?:number){
+   if(this.stopped)return;
+   if(this.marketSessions.get(projectKey(raw))!==session)return;
+   const epoch=this.marketEpochs.get(projectKey(raw));if(originalEpoch!==undefined&&originalEpoch!==epoch)return;
+   const contexts=this.matchProjects([raw]).filter(c=>!raw.pair_id||c.watch.pair_id===raw.pair_id);if(!contexts.length)return;
+   const trade=parseMemeTrade(raw);if(!trade){this.quality.invalid++;this.market.resetProjects([raw],'成交字段缺失／非法，受影响时间桶不可用于策略');return;}
+   const info=this.projects.peek(raw),basis=resolveMarketCap(raw,info);
+   if(!basis&&info&&contexts.some(c=>c.run.value_type==='mcap')){this.quality.invalid++;this.market.resetProjects([raw],'缓存供应量无法为本笔成交计算有限正数市值，丢弃受影响桶并重新预热');return;}
+   if((!basis||this.supplyBlocked.has(projectKey(raw)))&&contexts.some(c=>c.run.value_type==='mcap')){
+    const key=projectKey(raw),waiting=this.projectTrades.get(key)??[];
+    this.blockSupply(raw,'正在获取供应量，暂缓市值策略判断');
+    if(!this.projectLoading.has(key)&&this.projects.status(raw)?.attempts===3&&this.projects.status(raw)?.status==='failed')return;
+    const total=[...this.projectTrades.values()].reduce((sum,x)=>sum+x.length,0);
+    if(waiting.length>=256||total+this.pendingMarket>=2000){this.quality.overflow++;this.projectTrades.delete(key);this.market.resetProjects([raw],'供应量等待队列溢出，受影响时间桶丢弃并重新预热');return;}
+    waiting.push({raw,session,epoch});this.projectTrades.set(key,waiting);this.prepareProject(raw);return;
+   }
+   if(basis){trade.mcap=Number(basis.value);trade.marketCapBasis=basis;this.quality[basis.source==='ws'?'wsMcap':'derivedMcap']++;}
+   if(this.pendingMarket>=2000){this.quality.overflow++;this.market.resetProjects([raw],'本地成交处理队列溢出，暂停判断并补数');return;}
+   this.pendingMarket++;
+   this.enqueue(async()=>{try{
+    if(this.marketSessions.get(projectKey(raw))!==session||this.marketEpochs.get(projectKey(raw))!==epoch)return;
+    await this.onTrade(trade);
+   }finally{this.pendingMarket--;}});
+ }
+ private matchProjects(projects:Project[]){const keys=new Set(projects.map(projectKey));return [...this.watches.values()].filter(c=>keys.has(projectKey(c.watch)));}
+ private interruptMarket(projects:Project[],reason:string){
+  this.quality.gaps++;
+  // Fence queued decisions immediately, before any asynchronous database work.
+  for(const p of projects){this.marketEpochs.set(projectKey(p),Date.now());this.marketSessions.delete(projectKey(p));this.projectTrades.delete(projectKey(p));this.supplyBlocked.delete(projectKey(p));}
+  for(const ctx of this.matchProjects(projects)){ctx.ready=false;ctx.noOrdersBefore=Date.now();this.connected.delete(pairKey(ctx.watch.chain,ctx.watch.pair_id));this.confirmedFeeds.delete(pairKey(ctx.watch.chain,ctx.watch.pair_id));this.aggregator.discardPair(ctx.watch.chain,ctx.watch.pair_id);}
+  this.closedBars=this.closedBars.filter(b=>!projects.some(p=>p.chain===b.symbol.chain&&p.ca===b.symbol.ca));
+  this.enqueue(async()=>{for(const ctx of this.matchProjects(projects)){await this.markRecovering(ctx,reason);this.bump(ctx.run.id,'reconnect');if(ctx.run.mode==='paper')await this.pool.query("UPDATE live_orders SET status='cancelled',updated_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3 AND status='pending'",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);}});
+ }
  private readonly connected=new Set<string>();
  private readonly confirmedFeeds=new Set<string>();
  private readonly telemetry=new Map<string,{late:number;dropped:number;closed:number;tooOld:number;reconnect:number;lastTradeAt:number}>();
@@ -98,12 +170,14 @@ export class LiveService {
   const locked=(await client.query('SELECT pg_try_advisory_lock(63920924) AS acquired')).rows[0]?.acquired;
   if(!locked){client.release();console.log('live service standby: another owner holds advisory lock');return;}
   this.lock=client;
+  this.projectRedis.on('error',()=>{});
+  await this.projectRedis.connect().catch(()=>{});
   await this.refresh();this.connectSignals();
   this.refreshTimer=setInterval(()=>this.enqueue(()=>this.refresh()),5_000);
   this.flushTimer=setInterval(()=>{const receivedAt=Date.now();this.enqueue(()=>this.flushBars(receivedAt));},1_000);
   console.log('live service started; real orders',process.env.LIVE_TRADING_ENABLED==='true'?'armed by server configuration':'disabled');
  }
- async close(){this.stopped=true;if(this.refreshTimer)clearInterval(this.refreshTimer);if(this.flushTimer)clearInterval(this.flushTimer);this.signal?.close();for(const socket of this.sockets.values()){socket.removeAllListeners();socket.disconnect();}await this.chain;await this.flushTelemetry();if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(63920924)');this.lock.release();}}
+ async close(){this.stopped=true;if(this.refreshTimer)clearInterval(this.refreshTimer);if(this.flushTimer)clearInterval(this.flushTimer);for(const timer of this.signalRetries.values())clearTimeout(timer);this.signalRetries.clear();this.signal?.close();this.market.stop();this.projectRedis.disconnect();await this.chain;await this.flushTelemetry();if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(63920924)');this.lock.release();}}
  private async switchExecution(){
   const c=await this.pool.connect();try{await c.query('BEGIN');
    const switched=await c.query("UPDATE live_runs SET execution_version=$1,execution_switched_at=now() WHERE status='running' AND execution_version<>$1 RETURNING id,mode",[LIVE_EXECUTION_VERSION]);
@@ -118,9 +192,19 @@ export class LiveService {
    await c.query('COMMIT');
   }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
  }
+ private async switchMarket(){
+  const c=await this.pool.connect();try{await c.query('BEGIN');
+   const switched=await c.query("UPDATE live_runs SET market_source='meme_market_v2',market_switched_at=now() WHERE status='running' AND market_source IS DISTINCT FROM 'meme_market_v2' RETURNING id,mode");
+   for(const r of switched.rows){
+    if(r.mode==='paper')await c.query("UPDATE live_orders SET status='cancelled',raw_result=COALESCE(raw_result,'{}'::jsonb)||$2::jsonb,updated_at=now() WHERE run_id=$1 AND status='pending'",[r.id,JSON.stringify({cancelReason:'切换 Meme Market 协议2，旧模拟待成交订单不追溯成交'})]);
+    await c.query("INSERT INTO live_events(run_id,kind,event_key,event_time,payload) VALUES($1,'market_switched',$2,$3,$4) ON CONFLICT(event_key) DO NOTHING",[r.id,`${r.id}:meme-market-v2`,Date.now(),JSON.stringify({source:'meme_market_v2',delivery:'best_effort'})]);
+   }
+   await c.query('COMMIT');
+  }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
+ }
  private async refresh(){
   if(this.stopped)return;
-  await this.switchExecution();
+  await this.switchExecution();await this.switchMarket();
   const rows=(await this.pool.query("SELECT * FROM live_runs WHERE status='running'")).rows as Run[];
   const active=new Set(rows.map(r=>r.id));
   const watchRows=(await this.pool.query("SELECT w.* FROM live_watches w JOIN live_runs r ON r.id=w.run_id WHERE r.status='running' AND w.status IN ('monitoring','recovering','pending_eviction')")).rows as Watch[];
@@ -129,13 +213,13 @@ export class LiveService {
    const run=runMap.get(w.run_id);if(!run)continue;
    const ctx:Context={run,watch:w,evaluator:new LiveEvaluator(run.strategy_json,Number(w.signal_time),w.state_json?.history?w.state_json:undefined),ready:false,nextRecoveryAt:0,noOrdersBefore:Math.max(Date.now(),new Date(run.execution_switched_at??0).getTime())};
    this.watches.set(key,ctx);
+   if(this.marketSessions.has(projectKey(w)))this.connected.add(pairKey(w.chain,w.pair_id));
    await this.markRecovering(ctx,'服务启动，等待行情订阅并补数');
   }
   for(const [key,ctx] of this.watches)if(!active.has(ctx.run.id)||!watchRows.some(w=>watchKey(w.run_id,w.chain,w.ca)===key))this.watches.delete(key);
-  const required=new Map([...this.watches.values()].map(ctx=>[pairKey(ctx.watch.chain,ctx.watch.pair_id),ctx.watch]));
-  for(const [key,watch] of required)if(!this.sockets.has(key))this.subscribe(watch);
-  for(const [key,socket] of this.sockets)if(!required.has(key)){socket.removeAllListeners();socket.disconnect();this.sockets.delete(key);this.connected.delete(key);const [chain,pairId]=key.split(':');this.aggregator.discardPair(chain,pairId);}
-  for(const ctx of this.watches.values())if(!ctx.ready&&(!ctx.watch.dex_id||this.connected.has(pairKey(ctx.watch.chain,ctx.watch.pair_id)))&&Date.now()>=ctx.nextRecoveryAt)await this.recover(ctx);
+  this.market.setProjects([...this.watches.values()].map(c=>({chain:c.watch.chain,ca:c.watch.ca})));
+  for(const ctx of this.watches.values())this.prepareProject(ctx.watch);
+  for(const ctx of this.watches.values())if(!ctx.ready&&this.marketSessions.has(projectKey(ctx.watch))&&Date.now()>=ctx.nextRecoveryAt)await this.recover(ctx);
   if(Date.now()-this.lastMcapCheck>=60_000){this.lastMcapCheck=Date.now();await this.recheckMarketCaps();}
   await this.reconcileOrders();
   await this.flushTelemetry();
@@ -146,6 +230,7 @@ export class LiveService {
    feed_reason=CASE WHEN EXISTS(SELECT 1 FROM live_watches w WHERE w.run_id=r.id AND w.status='recovering') THEN feed_reason ELSE NULL END
    WHERE r.status='running'`);
   if(rows.length)await this.pool.query("UPDATE live_runs SET heartbeat_at=now() WHERE status='running'");
+  for(const r of rows){const contexts=[...this.watches.values()].filter(c=>c.run.id===r.id),subscribed=contexts.filter(c=>this.marketSessions.has(projectKey(c.watch))).length;await this.pool.query('UPDATE live_runs SET market_status=$2 WHERE id=$1',[r.id,JSON.stringify({expectedProtocol:2,protocol:subscribed?2:null,delivery:'best_effort',lastMessageAt:this.market.lastMessageAt,subscribed,ready:contexts.filter(c=>c.ready).length,cache:this.projects.storageStatus,supplyReady:contexts.filter(c=>this.projects.peek(c.watch)).length,quality:this.quality,qualityScope:'当前 Worker 会话全部任务'})]);}
  }
  private connectSignals(){
   if(this.stopped)return;
@@ -155,13 +240,6 @@ export class LiveService {
   ws.on('message',raw=>{const signal=parseProjectSignal(raw.toString());if(signal)this.enqueue(()=>this.onSignal(signal));});
   ws.on('close',()=>{this.feedHealthy=false;if(!this.stopped)setTimeout(()=>this.connectSignals(),3_000);});
   ws.on('error',error=>console.error('MemeInfo signal connection:',redact(error)));
- }
- private async lookup(signal:ProjectSignal){
-  const response=await fetch('https://app.memeinfo.net/api/projects/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({caList:[signal.ca],symbolList:['']}),signal:AbortSignal.timeout(10_000)});
-  if(!response.ok)throw new Error(`MemeInfo lookup HTTP ${response.status}`);
-  const data=await response.json() as any;
-  const item=(data?.data?.caListTokenList??[]).find((p:any)=>String(p.chain??'').toLowerCase()===signal.chain && (signal.chain==='sol'?p.token_address===signal.ca:String(p.token_address??'').toLowerCase()===signal.ca));
-  return resolveLivePool(item);
  }
  private async onSignal(signal:ProjectSignal){
   if(!this.feedHealthy||signal.time>Date.now()+5_000)return;
@@ -174,10 +252,19 @@ export class LiveService {
   if(!capacities.some(r=>canMonitor(Number(r.active),!!r.existing))){
    await this.pool.query("INSERT INTO live_events(chain,ca,kind,event_time,payload) VALUES($1,$2,'signal_skipped',$3,$4)",[signal.chain,signal.ca,signal.time,JSON.stringify({reason:'all_matching_runs_full',limit:LIVE_CA_LIMIT})]);return;
   }
-  const pool=await this.lookup(signal);
+  if(!this.projects.peek(signal)){
+   void this.projects.get(signal).then(()=>{if(!this.stopped)this.enqueue(()=>this.onSignal(signal));}).catch(e=>{
+    console.error('新信号项目资料:',redact(e));const state=this.projects.status(signal);
+    if(this.stopped||!state||state.attempts>=3||this.signalRetries.has(signal.key)||this.signalRetries.size>=1000)return;
+    const timer=setTimeout(()=>{this.signalRetries.delete(signal.key);if(!this.stopped)this.enqueue(()=>this.onSignal(signal));},Math.max(1000,state.nextRetryAt-Date.now()));this.signalRetries.set(signal.key,timer);
+   });return;
+  }
+  const pool=this.projects.peek(signal)!;
   if(!pool){await this.pool.query("INSERT INTO live_events(chain,ca,kind,event_time,payload) VALUES($1,$2,'lookup_unmatched',$3,$4)",[signal.chain,signal.ca,signal.time,JSON.stringify({source:signal.source})]);return;}
-  if(!eligibleMarketCap(pool.marketCap)){
-   await this.pool.query("INSERT INTO live_events(chain,ca,pair_id,kind,event_time,payload) VALUES($1,$2,$3,'signal_skipped',$4,$5)",[signal.chain,signal.ca,pool.pairId,signal.time,JSON.stringify({reason:'market_cap_below_threshold_or_missing',marketCap:pool.marketCap??null})]);return;
+  const latest=this.latestCaps.get(projectKey(signal));
+  const marketCap=latest?.pairId===pool.pairId&&Date.now()-latest.time<=60_000?latest.value:Date.now()-pool.fetchedAt<=60_000?pool.marketCap:undefined;
+  if(!eligibleMarketCap(marketCap)){
+   await this.pool.query("INSERT INTO live_events(chain,ca,pair_id,kind,event_time,payload) VALUES($1,$2,$3,'signal_skipped',$4,$5)",[signal.chain,signal.ca,pool.pairId,signal.time,JSON.stringify({reason:'market_cap_below_threshold_or_missing',marketCap:marketCap??null})]);return;
   }
   const {pairId,dexId}=pool;
   const c=await this.pool.connect();
@@ -202,7 +289,7 @@ export class LiveService {
     if(prior?.signal_key===signal.key)continue;
     await c.query(`INSERT INTO live_watches(run_id,chain,ca,pair_id,dex_id,signal_source,signal_key,signal_time,status,state_json,last_candle_time,current_mcap,mcap_checked_at,recovery_reason)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,'recovering','{}',NULL,$9,now(),'新信号入组，预热指标')
-      ON CONFLICT(run_id,chain,ca) DO UPDATE SET pair_id=EXCLUDED.pair_id,dex_id=EXCLUDED.dex_id,signal_source=EXCLUDED.signal_source,signal_key=EXCLUDED.signal_key,signal_time=EXCLUDED.signal_time,status='recovering',state_json='{}',last_candle_time=NULL,current_mcap=EXCLUDED.current_mcap,mcap_checked_at=now(),recovery_reason=EXCLUDED.recovery_reason`,[r.id,signal.chain,signal.ca,pairId,dexId,signal.source,signal.key,signal.time,pool.marketCap]);
+      ON CONFLICT(run_id,chain,ca) DO UPDATE SET pair_id=EXCLUDED.pair_id,dex_id=EXCLUDED.dex_id,signal_source=EXCLUDED.signal_source,signal_key=EXCLUDED.signal_key,signal_time=EXCLUDED.signal_time,status='recovering',state_json='{}',last_candle_time=NULL,current_mcap=EXCLUDED.current_mcap,mcap_checked_at=now(),recovery_reason=EXCLUDED.recovery_reason`,[r.id,signal.chain,signal.ca,pairId,dexId,signal.source,signal.key,signal.time,marketCap]);
     await c.query("UPDATE live_runs SET last_signal_at=GREATEST(COALESCE(last_signal_at,0),$2),feed_state='connecting' WHERE id=$1",[r.id,signal.time]);
     await c.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'external_signal',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[r.id,signal.chain,signal.ca,pairId,`${r.id}:${signal.key}`,signal.time,JSON.stringify(signal.identity)]);
    }
@@ -210,31 +297,13 @@ export class LiveService {
   }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
   await this.refresh();
  }
- private subscribe(watch:Watch){
-  if(!watch.dex_id)return;
-  const template=process.env.XXYY_TRADE_CHANNEL_TEMPLATE||'D_TOKEN_DETAIL_{dexId}_{pairId}';
-  if(!template.includes('{pairId}')||!template.includes('{dexId}'))throw new Error('XXYY_TRADE_CHANNEL_TEMPLATE 必须包含 {pairId} 和 {dexId}');
-  const channel=template.replaceAll('{pairId}',watch.pair_id).replaceAll('{dexId}',watch.dex_id).replaceAll('{chain}',watch.chain),event=process.env.XXYY_TRADE_EVENT||'NEW_TRADE';
-  const key=pairKey(watch.chain,watch.pair_id);
-  const previous=this.sockets.get(key);if(previous){previous.removeAllListeners();previous.disconnect();this.connected.delete(key);}this.confirmedFeeds.delete(key);
-  const socket=io(process.env.XXYY_PUSH_URL??'wss://web-push.xxyy.io/data',{transports:['websocket'],forceNew:true,reconnection:true});
-  this.sockets.set(key,socket);
-  socket.on('connect',()=>{this.connected.add(key);socket.emit('SUBSCRIBE',channel,{});this.enqueue(async()=>{for(const ctx of this.watches.values())if(pairKey(ctx.watch.chain,ctx.watch.pair_id)===key){ctx.ready=false;ctx.noOrdersBefore=Date.now();ctx.nextRecoveryAt=0;await this.markRecovering(ctx,'连接成功，补齐断线期间行情');}await this.refresh();});});
-  socket.on('disconnect',()=>{this.connected.delete(key);this.confirmedFeeds.delete(key);this.enqueue(()=>this.feedInterrupted(watch.chain,watch.pair_id));});
-  socket.on(event,(raw,receivedChannel)=>{for(const trade of parseMarketTrades(raw,receivedChannel,channel,{chain:watch.chain,ca:watch.ca,pairId:watch.pair_id}))this.enqueue(()=>this.onTrade(trade));});
-  socket.on('connect_error',error=>console.error('XXYY trade connection:',redact(error)));
- }
- private async feedInterrupted(chain:string,pairId:string){
-  if(this.stopped)return;
-  this.connected.delete(pairKey(chain,pairId));
-  this.confirmedFeeds.delete(pairKey(chain,pairId));
-  this.aggregator.discardPair(chain,pairId);
-  const contexts=[...this.watches.values()].filter(c=>c.watch.chain===chain&&c.watch.pair_id===pairId);
-  for(const ctx of contexts){ctx.ready=false;ctx.noOrdersBefore=Date.now();await this.markRecovering(ctx,'实时成交连接断开，自动重连中');if(ctx.run.mode==='paper')await this.pool.query("UPDATE live_orders SET status='cancelled',updated_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3 AND status='pending'",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);this.bump(ctx.run.id,'reconnect');}
- }
  private async onTrade(trade:MarketTrade){
   if(this.stopped || !Number.isSafeInteger(trade.time) || trade.time<0 || trade.time>Date.now()+5_000)return;
-  const contexts=[...this.watches.values()].filter(c=>c.watch.chain===trade.chain&&c.watch.pair_id===trade.pairId&&c.run.status==='running');
+  // The connection starts mid-bucket: never persist that incomplete bar as a full input.
+  const epoch=this.marketEpochs.get(projectKey(trade));
+  if(epoch!==undefined&&trade.time<Math.ceil(epoch/60_000)*60_000)return;
+  if(trade.time<(this.marketInputAfter.get(projectKey(trade))??0))return;
+  const contexts=[...this.watches.values()].filter(c=>c.watch.chain===trade.chain&&c.watch.ca===trade.ca&&c.watch.pair_id===trade.pairId&&c.run.status==='running');
   if(!contexts.length)return;
   await this.flushBars(Math.min(Date.now(),trade.time));
   const result=this.aggregator.acceptDetailed(trade);
@@ -242,6 +311,7 @@ export class LiveService {
   if(!result.accepted){if(result.reason==='closed'||result.reason==='too_old')for(const ctx of contexts)this.bump(ctx.run.id,result.reason==='closed'?'closed':'tooOld');return;}
   if(this.connected.has(pairKey(trade.chain,trade.pairId)))this.confirmedFeeds.add(pairKey(trade.chain,trade.pairId));
   if(result.late)return; // May update an open candle, but never simulate a fill or a tick exit.
+  if(trade.mcap!==undefined)this.latestCaps.set(projectKey(trade),{value:trade.mcap,time:trade.time,pairId:trade.pairId});
   for(const ctx of contexts){
    if(trade.time<=Number(ctx.watch.last_trade_at??0))continue;
    ctx.watch.last_trade_at=String(trade.time);if(trade.mcap!==undefined)ctx.watch.current_mcap=String(trade.mcap);
@@ -257,12 +327,12 @@ export class LiveService {
  private async saveBar(bar:ClosedMarketBar){
   const c=bar.candle;
   await this.pool.query(`INSERT INTO meme_kline(chain,ca,pair_id,interval,open_time,close_time,open,high,low,close,volume,trade_count,type,source,raw_data,valid)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'xxyy_socket',$14,true)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'meme_market_v2',$14,true)
     ON CONFLICT(chain,pair_id,interval,open_time,type) DO NOTHING RETURNING open_time`,
-    [bar.symbol.chain,bar.symbol.ca,bar.symbol.pairId,bar.interval,c.time,c.closeTime,c.open,c.high,c.low,c.close,c.volume,bar.tradeCount,bar.type,JSON.stringify({feed:'xxyy_socket',closed:true,synthetic:!!c.synthetic,closeTradeId:bar.closeTradeId,closeTradeTime:bar.closeTradeTime})]);
+    [bar.symbol.chain,bar.symbol.ca,bar.symbol.pairId,bar.interval,c.time,c.closeTime,c.open,c.high,c.low,c.close,c.volume,bar.tradeCount,bar.type,JSON.stringify({feed:'meme_market_v2',protocol:2,delivery:'best_effort',session:this.marketSessions.get(projectKey(bar.symbol)),closed:true,synthetic:!!c.synthetic,syntheticReason:c.synthetic?'assumed_no_trade':undefined,closeTradeId:bar.closeTradeId,closeTradeTime:bar.closeTradeTime,marketCapBasis:bar.marketCapBasis,derivedSupply:bar.derivedSupply,hasDerivedMarketCap:bar.hasDerivedMarketCap})]);
  }
  private async flushBars(now:number){
-  this.aggregator.flush(now,(bar,time)=>this.connected.has(pairKey(bar.symbol.chain,bar.symbol.pairId))&&this.confirmedFeeds.has(pairKey(bar.symbol.chain,bar.symbol.pairId))&&[...this.watches.values()].some(ctx=>ctx.ready&&ctx.watch.chain===bar.symbol.chain&&ctx.watch.pair_id===bar.symbol.pairId&&time>=ctx.noOrdersBefore));
+  this.aggregator.flush(now,(bar,time)=>this.connected.has(pairKey(bar.symbol.chain,bar.symbol.pairId))&&this.confirmedFeeds.has(pairKey(bar.symbol.chain,bar.symbol.pairId))&&[...this.watches.values()].some(ctx=>ctx.watch.chain===bar.symbol.chain&&ctx.watch.pair_id===bar.symbol.pairId&&time>=ctx.noOrdersBefore));
   while(this.closedBars.length){
    const end=Math.min(...this.closedBars.map(b=>b.candle.closeTime));
    if(end>now)break;
@@ -302,6 +372,7 @@ export class LiveService {
    }
    // Same timestamp: exits release cash/capacity before deterministic entries.
    for(const side of ['sell','buy'] as const)for(const {ctx,bar,price,decision} of decisions){
+    if(!ctx.ready||!this.connected.has(pairKey(ctx.watch.chain,ctx.watch.pair_id)))throw new Error('行情在决策事务期间中断，回滚本轮');
     if(!decision||decision.side!==side||await this.pending(ctx))continue;
     await this.createDecision(ctx,decision,bar,price);
    }
@@ -368,7 +439,7 @@ export class LiveService {
   const rows=(await this.pool.query(`SELECT open_time AS time,close_time AS "closeTime",open,high,low,close,volume
    FROM (SELECT open_time,close_time,open,high,low,close,volume FROM meme_kline
     WHERE chain=$1 AND ca=$2 AND pair_id=$3 AND interval=$4 AND type=$5
-      AND source='xxyy_socket' AND valid IS DISTINCT FROM false AND open_time>=$6 AND close_time<=$7
+      AND source='meme_market_v2' AND valid IS DISTINCT FROM false AND open_time>=$6 AND close_time<=$7
     ORDER BY open_time DESC LIMIT $8) recent ORDER BY open_time`,
    [ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,ctx.run.value_type,first,to,Math.min(5000,Math.max(required,512))])).rows;
   if(rows.length<required)return {ready:false,count:rows.length,required};
@@ -378,7 +449,7 @@ export class LiveService {
   });
   for(const row of rows){
    const prior=evaluator.state.history.at(-1);
-   if(prior)for(let time=prior.time+step;time<Number(row.time);time+=step)evaluator.onClosedCandle({time,closeTime:time+step,open:prior.close,high:prior.close,low:prior.close,close:prior.close,volume:0,synthetic:true,valid:true},true);
+   if(prior&&Number(row.time)!==prior.time+step)return {ready:false,count:0,required};
    evaluator.onClosedCandle({time:Number(row.time),closeTime:Number(row.closeTime),open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),volume:Number(row.volume)},true);
   }
   ctx.evaluator=evaluator;
@@ -395,24 +466,31 @@ export class LiveService {
  private async recover(ctx:Context){
   ctx.nextRecoveryAt=Date.now()+10_000;
   try{
-   const pool=await this.lookup({chain:ctx.watch.chain as ProjectSignal['chain'],ca:ctx.watch.ca} as ProjectSignal);
+   const pool=this.projects.peek(ctx.watch);
+   if(!pool){this.prepareProject(ctx.watch);await this.markRecovering(ctx,`等待项目供应量资料：${this.projects.status(ctx.watch)?.error??'正在查询'}`);return;}
    if(!pool)throw new Error('主池查询缺少可订阅交易池');
    if(pool.pairId!==ctx.watch.pair_id||pool.dexId!==ctx.watch.dex_id){
+    if(ctx.evaluator.state.position&&pool.pairId!==ctx.watch.pair_id)throw new Error('已有持仓主池发生变化，暂停策略等待核验；不迁移旧持仓行情');
     this.aggregator.discardPair(ctx.watch.chain,ctx.watch.pair_id);
     const state=ctx.evaluator.snapshot();if(!state.position){state.history=[];state.lastCandleTime=undefined;ctx.watch.last_candle_time=null;}
     ctx.watch.pair_id=pool.pairId;ctx.watch.dex_id=pool.dexId;ctx.evaluator=new LiveEvaluator(ctx.run.strategy_json,Number(ctx.watch.signal_time),state);
     await this.pool.query('UPDATE live_watches SET pair_id=$4,dex_id=$5,last_candle_time=$6,state_json=$7 WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,pool.pairId,pool.dexId,ctx.watch.last_candle_time,JSON.stringify(state)]);
-    this.subscribe(ctx.watch);
+    ctx.noOrdersBefore=Date.now();this.connected.add(pairKey(ctx.watch.chain,ctx.watch.pair_id));
     throw new Error('主池已切换，等待新交易池订阅确认');
    }
-   try{await this.catchup(ctx);}catch(error){
-    if(!(error instanceof HistoryChallengeError))throw error;
+   const epoch=this.marketEpochs.get(projectKey(ctx.watch));
+   try{await this.catchup(ctx);
+    const step=ctx.run.interval==='30s'?30_000:60_000;
+    if(ctx.evaluator.state.history.length<localWarmupBars(ctx.run.strategy_json)||(ctx.evaluator.state.lastCandleTime??0)<Math.floor(Date.now()/step)*step-step)throw new Error('历史预热不足或未覆盖最近收盘桶');
+   }catch(error){
     const warmup=await this.warmupFromConnectedFeed(ctx);
     if(!warmup.ready){
-     await this.markRecovering(ctx,`历史接口被 Cloudflare 拦截；实时行情安全预热 ${warmup.count}/${warmup.required} 根，期间暂停新买入`,60_000);
+     await this.markRecovering(ctx,`历史补数不可用；实时行情预热 ${warmup.count}/${warmup.required} 根，期间暂停策略交易${ctx.evaluator.state.position?'；已有持仓止损无法保证及时执行':''}`,60_000);
      return;
     }
    }
+   if(epoch!==this.marketEpochs.get(projectKey(ctx.watch))||!this.marketSessions.has(projectKey(ctx.watch))||this.supplyBlocked.has(projectKey(ctx.watch)))return;
+   this.connected.add(pairKey(ctx.watch.chain,ctx.watch.pair_id));
    if(!ctx.evaluator.state.history.length)throw new Error('尚无可用历史行情，等待重试');
    ctx.noOrdersBefore=Date.now();
    if(![...this.watches.values()].some(other=>other!==ctx&&other.ready&&other.watch.chain===ctx.watch.chain&&other.watch.pair_id===ctx.watch.pair_id))
@@ -453,15 +531,13 @@ export class LiveService {
   }
   for(const contexts of groups.values()){
    const first=contexts[0]!;
-   try{
-    const project=await this.lookup({chain:first.watch.chain as ProjectSignal['chain'],ca:first.watch.ca} as ProjectSignal);
-    if(project?.marketCap===undefined)continue; // Missing/failed data is not a low-cap verdict.
+   const latest=this.latestCaps.get(projectKey(first.watch));
+   if(!latest||Date.now()-latest.time>60_000)continue;
     for(const ctx of contexts){
-     await this.pool.query('UPDATE live_watches SET current_mcap=$4,mcap_checked_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,project.marketCap]);
-     if(project.marketCap<MIN_MARKET_CAP)await this.evictOrRetain(ctx,'MemeInfo 复查市值低于 50,000 USD');
+     if(ctx.watch.pair_id!==latest.pairId)continue;
+     await this.pool.query('UPDATE live_watches SET current_mcap=$4,mcap_checked_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,latest.value]);
+     if(latest.value<MIN_MARKET_CAP)await this.evictOrRetain(ctx,'最新成交市值低于 50,000 USD');
     }
-   }catch(e){console.error('MemeInfo 市值复查:',redact(e));}
-   await wait(250);
   }
  }
  private bump(runId:string,field:'late'|'closed'|'tooOld'|'reconnect'|'lastTradeAt',time=0){
@@ -518,7 +594,7 @@ export class LiveService {
    sizing.type==='fixed_amount'?Math.min(sizing.value,available):available*sizing.value/100;
   if(!Number.isFinite(amount)||amount<=0)return;
   if(ctx.run.mode==='live' && (process.env.LIVE_TRADING_ENABLED!=='true'||!this.xxyy||ctx.run.chain==='robin'))return;
-  const evidence={impulse:d.impulse??position?.impulse??null,executionVersion:LIVE_EXECUTION_VERSION,candle:bar.candle,priceCandle:price.candle,stop:d.stop,target:d.target,lockPrice:position?.lockPrice,lockTier:position?.lockTier,cost:position?.entryPrice,referenceValue:d.value,observedAt:Date.now(),simulatedConversion:ctx.run.value_type==='mcap',priceBasis:'paired_bar_close_ratio'};
+  const evidence={impulse:d.impulse??position?.impulse??null,executionVersion:LIVE_EXECUTION_VERSION,candle:bar.candle,priceCandle:price.candle,marketCapBasis:bar.marketCapBasis,derivedSupply:bar.derivedSupply,hasDerivedMarketCap:bar.hasDerivedMarketCap,stop:d.stop,target:d.target,lockPrice:position?.lockPrice,lockTier:position?.lockTier,cost:position?.entryPrice,referenceValue:d.value,observedAt:Date.now(),simulatedConversion:ctx.run.value_type==='mcap',priceBasis:'paired_bar_close_ratio'};
   const result=await this.db.query(`INSERT INTO live_orders(run_id,chain,ca,pair_id,intent_key,side,reason,status,decision_time,decision_value,requested_amount,raw_result,position_id)
     VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8,$9,$10,$11,$12) ON CONFLICT(intent_key) DO NOTHING RETURNING id`,[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,key,d.side,d.reason,d.time,d.value,amount,JSON.stringify(evidence),position?.positionId??null]);
   if(!result.rowCount)return;
@@ -568,7 +644,7 @@ export class LiveService {
  }
  private async submitLive(ctx:Context,orderId:string,d:LiveDecision,amount:number){
   const current=(await this.pool.query('SELECT status,execution_hold_reason FROM live_runs WHERE id=$1',[ctx.run.id])).rows[0];
-  if(!current||current.status!=='running'||current.execution_hold_reason){
+  if(!current||current.status!=='running'||current.execution_hold_reason||this.stopped||!ctx.ready||!this.connected.has(pairKey(ctx.watch.chain,ctx.watch.pair_id))){
    await this.pool.query("UPDATE live_orders SET status='cancelled',updated_at=now() WHERE id=$1 AND status='pending'",[orderId]);return;
   }
   const risk=ctx.run.risk_json;
@@ -592,6 +668,7 @@ export class LiveService {
    return;
   }
   let txId:string|undefined;
+  if(this.stopped||!ctx.ready||!this.connected.has(pairKey(ctx.watch.chain,ctx.watch.pair_id))){await this.pool.query("UPDATE live_orders SET status='cancelled',raw_result=COALESCE(raw_result,'{}'::jsonb)||$2::jsonb,updated_at=now() WHERE id=$1 AND status='pending'",[orderId,JSON.stringify({cancelReason:'提交前行情中断；本订单未发送'})]);return;}
   try{
    txId=await this.xxyy!.swap({chain:ctx.run.chain as 'sol'|'bsc',walletAddress:ctx.run.wallet_address!,tokenAddress:ctx.watch.ca,isBuy:d.side==='buy',amount,tip:risk.tip,slippage:risk.slippagePercent});
    await this.pool.query("UPDATE live_orders SET status='submitted',tx_id=$2,updated_at=now() WHERE id=$1",[orderId,txId]);

@@ -44,13 +44,13 @@ export function parseMarketTrades(input:unknown,channel:unknown,expectedChannel:
  return (Array.isArray(decoded)?decoded:[decoded]).map(row=>parseMarketTrade(row,expected)).filter((row):row is MarketTrade=>!!row);
 }
 /** A display dex_name (e.g. Flap.sh/Pons) is not the Socket.IO dexId. */
-export function resolveLivePool(item:unknown):{pairId:string;dexId:string;marketCap?:number}|undefined{
+export function resolveLivePool(item:unknown,allowMissingDex=false):{pairId:string;dexId:string;marketCap?:number}|undefined{
  const project=object(item),meta=object(project?.project_meta);
  const pairId=str(project?.main_pair_id);
- if(!pairId||!meta)return;
+ if(!pairId||(!meta&&!allowMissingDex))return;
  const same=(value:unknown)=>typeof value==='string'&&value.toLowerCase()===pairId.toLowerCase();
- const dexId=same(meta.outer_pair_address)?str(meta.outer_dex):same(meta.pair_address)?str(meta.inner_pair_dex):undefined;
- if(!dexId||!/^[a-z0-9_-]+$/.test(dexId))return;
+ const dexId=same(meta?.outer_pair_address)?str(meta?.outer_dex):same(meta?.pair_address)?str(meta?.inner_pair_dex):undefined;
+ if((!dexId||!/^[a-z0-9_-]+$/.test(dexId))&&!allowMissingDex)return;
  const marketCap=numeric(project?.current_market_cap,project?.currentMarketCap);
- return {pairId,dexId,marketCap:marketCap!==undefined&&marketCap>=0?marketCap:undefined};
+ return {pairId,dexId:dexId??'',marketCap:marketCap!==undefined&&marketCap>=0?marketCap:undefined};
 }

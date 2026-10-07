@@ -39,7 +39,7 @@ export class LiveController {
  @Get('live-runs') async list(@Query('mode') mode?:string){
   if(mode && !['paper','live'].includes(mode))throw new BadRequestException('模式无效');
   const rows=(await this.pool.query(`SELECT r.id,r.name,r.mode,r.chain,r.interval,r.value_type,r.signal_source,r.strategy_version_id,r.initial_capital,r.wallet_address,r.risk_json,r.status,r.cash,r.realized_pnl,r.started_at,r.heartbeat_at,r.error_message,r.feed_state,r.feed_reason,r.execution_hold_reason,r.reconnect_count,r.late_trade_count,r.dropped_trade_count,r.last_signal_at,r.last_trade_at,r.created_at,r.updated_at,
-   r.execution_version,r.execution_switched_at,
+   r.execution_version,r.execution_switched_at,r.market_source,r.market_switched_at,r.market_status,
    (SELECT COUNT(*)::int FROM live_watches w WHERE w.run_id=r.id AND w.status IN ('monitoring','recovering','pending_eviction')) AS active_ca_count
    FROM live_runs r WHERE ($1::text IS NULL OR r.mode=$1) ORDER BY r.created_at DESC LIMIT 300`,[mode??null])).rows;
   return rows.map(publicRow);
