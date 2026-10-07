@@ -21,7 +21,7 @@ export function importComplete(text){if(!text.trim())return false;try{if(JSON.pa
 export async function* candleLines(path){const stream=createReadStream(path).pipe(createGunzip());for await(const line of createInterface({input:stream,crlfDelay:Infinity}))if(line)yield JSON.parse(line);}
 export function decodeRow(chain,r){const [ca,pairId,time,closeTime,open,high,low,close,volume,valid]=r;return {symbol:{chain,ca,pairId},candle:{time,closeTime,open,high,low,close,volume,valid}};}
 
-export async function snapshot({connectionString,output,importReport,client,allKlines=false}){
+export async function snapshot({connectionString,output,importReport,client,allKlines=false,researchMcapOnly=false}){
  assert(connectionString||client);output=resolve(output);
  const audit=importReport?requireFinishedImport(await readFile(importReport,'utf8')):{source:'direct_read_only_database_snapshot'};
  await mkdir(output,{recursive:true});
@@ -34,10 +34,11 @@ export async function snapshot({connectionString,output,importReport,client,allK
   manifest.snapshot=(await db.query('SELECT txid_current_snapshot()::text AS snapshot')).rows[0].snapshot;
   const metadata={};
   for(const table of ['token_info','token_signal_events'])metadata[table]=(await db.query(`SELECT * FROM public.${table} ${allKlines?'':'WHERE chain=ANY($1)'} ORDER BY chain,ca,id`,allKlines?[]:[chains])).rows;
+  if(researchMcapOnly)metadata.live_signals=(await db.query('SELECT DISTINCT chain,ca,signal_time,signal_source FROM live_watches WHERE signal_time IS NOT NULL ORDER BY chain,ca,signal_time')).rows;
   metadata.versions=(await db.query('SELECT t.name,t.status,v.* FROM backtest_strategy_versions v JOIN backtest_strategy_templates t ON t.id=v.template_id ORDER BY v.created_at,v.id')).rows;
   metadata.previousRuns=allKlines?[]:(await db.query("SELECT r.id,r.name,r.config_json,p.report_json FROM backtest_runs r JOIN backtest_reports p ON p.run_id=r.id WHERE r.status='completed' ORDER BY r.id")).rows;
   await saveJson(resolve(output,'metadata.json'),metadata);manifest.metadataHash=await fileHash(resolve(output,'metadata.json'));
-  const dimensions=allKlines?(await db.query('SELECT DISTINCT chain,interval,type FROM public.meme_kline ORDER BY chain,interval,type')).rows:chains.flatMap(chain=>['30s','1m'].flatMap(interval=>['mcap','price'].map(type=>({chain,interval,type}))));
+  const dimensions=researchMcapOnly?(await db.query("SELECT DISTINCT chain,interval,type FROM public.meme_kline WHERE type='mcap' AND interval IN ('30s','1m') ORDER BY chain,interval,type")).rows:allKlines?(await db.query('SELECT DISTINCT chain,interval,type FROM public.meme_kline ORDER BY chain,interval,type')).rows:chains.flatMap(chain=>['30s','1m'].flatMap(interval=>['mcap','price'].map(type=>({chain,interval,type}))));
   for(const {chain,interval,type} of dimensions){
    const name=`${chain}-${interval}-${type}.jsonl.gz`,path=resolve(output,name),gzip=createGzip(),sink=createWriteStream(path+'.tmp',{flags:'wx'});
    const completion=finished(sink);gzip.on('error',e=>sink.destroy(e));gzip.pipe(sink);

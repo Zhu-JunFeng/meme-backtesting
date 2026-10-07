@@ -98,3 +98,17 @@ test('all-K-line export discovers database dimensions, includes time bounds and 
   assert(!calls.some(s=>s.includes('FROM backtest_runs')));assert(calls.includes('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY'));
  }finally{await rm(dir,{recursive:true,force:true});}
 });
+test('market-cap research snapshot includes live signals and limits discovered dimensions',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'meme-mcap-snapshot-')),calls=[];let fetched=false;
+ const client={connect:async()=>{},end:async()=>{},query:async(sql)=>{calls.push(sql);let rows=[];
+  if(sql.includes('txid_current_snapshot'))rows=[{snapshot:'frozen'}];
+  else if(sql.includes('SELECT DISTINCT chain,interval,type'))rows=[{chain:'sol',interval:'1m',type:'mcap'}];
+  else if(sql.includes('FROM live_watches'))rows=[{chain:'sol',ca:'CaseSensitive',signal_time:'1000',signal_source:'top_cluster_first_buy'}];
+  else if(sql.startsWith('DECLARE'))fetched=false;
+  else if(sql.startsWith('FETCH')&&!fetched){fetched=true;rows=[{ca:'CaseSensitive',pair_id:'p',open_time:60000,close_time:120000,open:1,high:1,low:1,close:1,volume:1,valid:true}];}
+  return {rows,rowCount:rows.length};}};
+ try{const m=await snapshot({output:dir,client,allKlines:true,researchMcapOnly:true});assert.equal(m.files.length,1);
+  const metadata=JSON.parse(await readFile(join(dir,'metadata.json'),'utf8'));assert.equal(metadata.live_signals[0].ca,'CaseSensitive');
+  assert(calls.some(s=>s.includes("WHERE type='mcap' AND interval IN ('30s','1m')")));assert(!calls.some(s=>/INSERT|UPDATE|DELETE/.test(s)));
+ }finally{await rm(dir,{recursive:true,force:true});}
+});
