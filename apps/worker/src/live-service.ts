@@ -1,6 +1,7 @@
 import {createHash} from 'node:crypto';
 import {MemeMarketFeed,parseMemeTrade,projectKey,type Project} from './meme-market.js';
 import {ProjectCache,resolveMarketCap} from './project-cache.js';
+import {HistoryClient,type HistoryResult} from './history-client.js';
 import {Redis} from 'ioredis';
 import {redisConnection} from '@meme/runtime';
 import WebSocket from 'ws';
@@ -41,7 +42,6 @@ export function localWarmupBars(config:StrategyConfig):number{
  const impulse=config.impulseCondition;
  return Math.max(impulse.lookbackBars+impulse.leftBars+impulse.rightBars+1,...periods.map(period=>period+2),1);
 }
-class HistoryChallengeError extends Error{}
 export const acceptsNewSignal=(run:{signal_source:string;started_at:Date|string},signal:ProjectSignal)=>
  (run.signal_source==='all'||run.signal_source===signal.source)&&signal.time>new Date(run.started_at).getTime();
 const redact=(error:unknown)=>String(error).replace(/Bearer\s+[^\s]+/gi,'Bearer [redacted]').slice(0,300);
@@ -98,6 +98,7 @@ export class LiveService {
  private readonly market=new MemeMarketFeed({
   ready:(projects,session)=>{for(const p of projects){this.marketSessions.set(projectKey(p),session);this.marketEpochs.set(projectKey(p),Date.now());}this.enqueue(async()=>{for(const ctx of this.matchProjects(projects)){this.connected.add(pairKey(ctx.watch.chain,ctx.watch.pair_id));ctx.noOrdersBefore=Date.now();ctx.nextRecoveryAt=0;await this.markRecovering(ctx,'协议 2 订阅已确认，正在预热／补数');}});},
   interrupted:(projects,reason)=>this.interruptMarket(projects,reason),
+  removed:projects=>{for(const p of projects){this.marketSessions.delete(projectKey(p));this.marketEpochs.delete(projectKey(p));this.marketInputAfter.delete(projectKey(p));this.projectTrades.delete(projectKey(p));}},
   trade:(raw,session)=>this.receiveTrade(raw,session)
  });
  private prepareProject(p:Project){
@@ -146,6 +147,7 @@ export class LiveService {
  }
  private matchProjects(projects:Project[]){const keys=new Set(projects.map(projectKey));return [...this.watches.values()].filter(c=>keys.has(projectKey(c.watch)));}
  private interruptMarket(projects:Project[],reason:string){
+  if(!projects.length)return;
   this.quality.gaps++;
   // Fence queued decisions immediately, before any asynchronous database work.
   for(const p of projects){this.marketEpochs.set(projectKey(p),Date.now());this.marketSessions.delete(projectKey(p));this.projectTrades.delete(projectKey(p));this.supplyBlocked.delete(projectKey(p));}
@@ -160,7 +162,8 @@ export class LiveService {
  private lastMcapCheck=0;
  private signal?:WebSocket;private lock?:PoolClient;private refreshTimer?:ReturnType<typeof setInterval>;private flushTimer?:ReturnType<typeof setInterval>;
  private chain=Promise.resolve();private stopped=false;private feedHealthy=false;
- private historyBlockedUntil=0;
+ private readonly history=new HistoryClient();
+ private readonly recovering=new Map<Context,symbol>();
  private readonly xxyy=process.env.XXYY_API_KEY?new XxyyTradeClient(process.env.XXYY_API_KEY):undefined;
  constructor(private readonly pool:Pool){}
  private enqueue(fn:()=>Promise<void>){this.chain=this.chain.then(fn).catch(e=>console.error('live service:',redact(e)));}
@@ -177,7 +180,7 @@ export class LiveService {
   this.flushTimer=setInterval(()=>{const receivedAt=Date.now();this.enqueue(()=>this.flushBars(receivedAt));},1_000);
   console.log('live service started; real orders',process.env.LIVE_TRADING_ENABLED==='true'?'armed by server configuration':'disabled');
  }
- async close(){this.stopped=true;if(this.refreshTimer)clearInterval(this.refreshTimer);if(this.flushTimer)clearInterval(this.flushTimer);for(const timer of this.signalRetries.values())clearTimeout(timer);this.signalRetries.clear();this.signal?.close();this.market.stop();this.projectRedis.disconnect();await this.chain;await this.flushTelemetry();if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(63920924)');this.lock.release();}}
+ async close(){this.stopped=true;this.history.close();if(this.refreshTimer)clearInterval(this.refreshTimer);if(this.flushTimer)clearInterval(this.flushTimer);for(const timer of this.signalRetries.values())clearTimeout(timer);this.signalRetries.clear();this.signal?.close();this.market.stop();this.projectRedis.disconnect();await this.chain;await this.flushTelemetry();if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(63920924)');this.lock.release();}}
  private async switchExecution(){
   const c=await this.pool.connect();try{await c.query('BEGIN');
    const switched=await c.query("UPDATE live_runs SET execution_version=$1,execution_switched_at=now() WHERE status='running' AND execution_version<>$1 RETURNING id,mode",[LIVE_EXECUTION_VERSION]);
@@ -219,7 +222,7 @@ export class LiveService {
   for(const [key,ctx] of this.watches)if(!active.has(ctx.run.id)||!watchRows.some(w=>watchKey(w.run_id,w.chain,w.ca)===key))this.watches.delete(key);
   this.market.setProjects([...this.watches.values()].map(c=>({chain:c.watch.chain,ca:c.watch.ca})));
   for(const ctx of this.watches.values())this.prepareProject(ctx.watch);
-  for(const ctx of this.watches.values())if(!ctx.ready&&this.marketSessions.has(projectKey(ctx.watch))&&Date.now()>=ctx.nextRecoveryAt)await this.recover(ctx);
+  for(const ctx of this.watches.values())if(!ctx.ready&&!this.recovering.has(ctx)&&this.marketSessions.has(projectKey(ctx.watch))&&Date.now()>=ctx.nextRecoveryAt)await this.recover(ctx);
   if(Date.now()-this.lastMcapCheck>=60_000){this.lastMcapCheck=Date.now();await this.recheckMarketCaps();}
   await this.reconcileOrders();
   await this.flushTelemetry();
@@ -395,41 +398,79 @@ export class LiveService {
   await this.db.query(`INSERT INTO live_equity_curve(run_id,time,equity,cash,unrealized) VALUES($1,$2,$3,$4,$5)
    ON CONFLICT(run_id,time) DO UPDATE SET equity=EXCLUDED.equity,cash=EXCLUDED.cash,unrealized=EXCLUDED.unrealized`,[run.id,time,cash+held,cash,held-basis]);
  }
- private async catchup(ctx:Context){
-  const step=ctx.run.interval==='30s'?30_000:60_000,to=Math.floor(Date.now()/step)*step;
-  let from=ctx.watch.last_candle_time?Number(ctx.watch.last_candle_time)+step:to-600*step;
-  if(from>=to)return;
-  if(Date.now()<this.historyBlockedUntil)throw new HistoryChallengeError('XXYY 历史接口遭 Cloudflare 挑战');
-  for(const window of backfillWindows(from,to,step)){
-   const end=window.to;from=window.from;
-   const response=await fetch('https://www.xxyy.io/api/data/candlestick/searchBarData',{method:'POST',headers:{'X-CHAIN':ctx.watch.chain,'X-VERSION':'1','X-LANGUAGE':'zh','Content-Type':'application/json'},body:JSON.stringify({pairId:ctx.watch.pair_id,valueType:ctx.run.value_type==='mcap'?'mc':'price',interval:step/1000,priceType:'usd',from,to:end,countBack:5000}),signal:AbortSignal.timeout(15_000)});
-   if(response.status===403){
-    this.historyBlockedUntil=Date.now()+5*60_000;
-    throw new HistoryChallengeError(response.headers.get('cf-mitigated')==='challenge'?'XXYY 历史接口遭 Cloudflare 挑战':'XXYY 历史接口拒绝访问（HTTP 403）');
-   }
-   if(!response.ok)throw new Error(`XXYY 历史补数 HTTP ${response.status}`);
-   const data=await response.json() as any;if(data.code!==0||!Array.isArray(data.data))throw new Error('XXYY 历史补数响应无效');
-   const rows=data.data.map((row:any)=>({time:Number(row.time),open:Number(row.price?.open),high:Number(row.price?.high),low:Number(row.price?.low),close:Number(row.price?.close),volume:Number(row.price?.volume)}))
-    .filter((row:Candle)=>Number.isSafeInteger(row.time)&&row.time>=from&&row.time+step<=end&&row.time%step===0&&row.low>0&&row.high>=Math.max(row.open,row.close)&&row.low<=Math.min(row.open,row.close)&&row.volume>=0)
-    .sort((a:Candle,b:Candle)=>a.time-b.time);
-   for(let index=0;index<rows.length;index+=500){
-    const batch=rows.slice(index,index+500);
-    await this.pool.query(`INSERT INTO meme_kline(chain,ca,pair_id,interval,open_time,close_time,open,high,low,close,volume,trade_count,type,source,raw_data,valid)
-     SELECT $1,$2,$3,$4,x.time,x.time+$5,x.open,x.high,x.low,x.close,x.volume,0,$6,'xxyy',null,true
-     FROM jsonb_to_recordset($7::jsonb) AS x(time bigint,open numeric,high numeric,low numeric,close numeric,volume numeric)
-     ON CONFLICT(chain,pair_id,interval,open_time,type) DO NOTHING`,[ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,step,ctx.run.value_type,JSON.stringify(batch)]);
-    for(const row of batch){
-     const prior=ctx.evaluator.state.history.at(-1);
-     if(prior)for(let time=prior.time+step;time<row.time;time+=step)ctx.evaluator.onClosedCandle({time,closeTime:time+step,open:prior.close,high:prior.close,low:prior.close,close:prior.close,volume:0,synthetic:true,valid:true},true);
-     ctx.evaluator.onClosedCandle({...row,closeTime:row.time+step,valid:true},true); // Warmup only: never issue missed orders or activate historical locks.
-    }
-   }
-   if(rows.length){ctx.watch.last_candle_time=String(rows.at(-1)!.time);await this.pool.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',[ctx.run.id,JSON.stringify(ctx.evaluator.snapshot()),rows.at(-1)!.time,ctx.watch.chain,ctx.watch.ca]);}
-  }
+ /** Await only queued state application, never put an HTTP await on the event chain. */
+ private queuedRecovery<T>(valid:()=>boolean,fn:()=>Promise<T>):Promise<T|undefined>{
+  return new Promise((resolve,reject)=>this.enqueue(async()=>{try{resolve(valid()?await fn():undefined);}catch(e){reject(e);}}));
  }
- /** A connected socket is the only source we can trust when the web history endpoint is challenged.
-  * Never replay old bars as orders, and never reset a live position's risk state. */
- private async warmupFromConnectedFeed(ctx:Context):Promise<{ready:boolean;count:number;required:number}>{
+ private launchRecovery(ctx:Context){
+  const token=Symbol(),pair=ctx.watch.pair_id,epoch=this.marketEpochs.get(projectKey(ctx.watch)),session=this.marketSessions.get(projectKey(ctx.watch)),boundary=ctx.noOrdersBefore;
+  this.recovering.set(ctx,token);
+  const valid=()=>!this.stopped&&this.recovering.get(ctx)===token&&this.watches.get(watchKey(ctx.run.id,ctx.watch.chain,ctx.watch.ca))===ctx&&ctx.run.status==='running'&&ctx.watch.pair_id===pair&&ctx.noOrdersBefore===boundary&&this.marketEpochs.get(projectKey(ctx.watch))===epoch&&this.marketSessions.get(projectKey(ctx.watch))===session&&!this.supplyBlocked.has(projectKey(ctx.watch));
+  const step=ctx.run.interval==='30s'?30_000:60_000,to=Math.floor(Date.now()/step)*step;
+  const from=ctx.watch.last_candle_time?Number(ctx.watch.last_candle_time)+step:to-600*step;
+  void (async()=>{
+   let issue='历史接口未返回当前范围的已收盘 K 线',count=0;
+   try{
+    for(const window of backfillWindows(from,to,step)){
+     if(!valid())return;
+     const types=ctx.run.value_type==='mcap'?['price','mcap'] as const:['price'] as const;
+     const results=await Promise.all(types.map(type=>this.history.get({chain:ctx.watch.chain,pair,interval:ctx.run.interval,type,from:window.from,to:window.to})));
+     if(!valid())return;
+     const target=results[types.findIndex(type=>type===ctx.run.value_type)]!;count+=target.rows.length;
+     await this.queuedRecovery(valid,()=>this.applyHistory(ctx,types.map((type,i)=>({type,result:results[i]})),valid));
+    }
+    const required=localWarmupBars(ctx.run.strategy_json);
+    issue=count===0?'历史接口返回空数据':ctx.evaluator.state.history.length<required?`历史指标预热不足 ${ctx.evaluator.state.history.length}/${required} 根`:'历史尾部未覆盖最近收盘桶';
+   }catch(error){issue=redact(error);}
+   await this.queuedRecovery(valid,()=>this.finishRecovery(ctx,issue,valid));
+  })().catch(error=>console.error('history recovery:',redact(error))).finally(()=>{if(this.recovering.get(ctx)===token)this.recovering.delete(ctx);});
+ }
+ private async applyHistory(ctx:Context,series:Array<{type:'price'|'mcap';result:HistoryResult}>,valid:()=>boolean){
+  const c=await this.pool.connect(),step=ctx.run.interval==='30s'?30_000:60_000;
+  try{
+   await c.query('BEGIN');
+   const run=(await c.query('SELECT status FROM live_runs WHERE id=$1 FOR UPDATE',[ctx.run.id])).rows[0];
+   if(!valid()||run?.status!=='running'){await c.query('ROLLBACK');return;}
+   for(const {type,result} of series)for(let i=0;i<result.rows.length;i+=500){
+    if(!valid()){await c.query('ROLLBACK');return;}
+    await c.query(`INSERT INTO meme_kline(chain,ca,pair_id,interval,open_time,close_time,open,high,low,close,volume,trade_count,type,source,raw_data,valid)
+     SELECT $1,$2,$3,$4,x.time,x.time+$5,x.open,x.high,x.low,x.close,x.volume,0,$6,'memeinfo_xxyy',$8::jsonb,true
+     FROM jsonb_to_recordset($7::jsonb) AS x(time bigint,open numeric,high numeric,low numeric,close numeric,volume numeric)
+     ON CONFLICT(chain,pair_id,interval,open_time,type) DO NOTHING`,[ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,step,type,JSON.stringify(result.rows.slice(i,i+500)),JSON.stringify({upstream:'xxyy',endpoint:result.endpoint,traceId:result.traceId})]);
+   }
+   const target=series.find(s=>s.type===ctx.run.value_type)!.result.rows;
+   const evaluator=new LiveEvaluator(ctx.run.strategy_json,Number(ctx.watch.signal_time),ctx.evaluator.snapshot());
+   // Read back authoritative stored values on conflict, rather than evaluating a different HTTP snapshot.
+   const stored=target.length?(await c.query(`SELECT open_time AS time,open,high,low,close,volume FROM meme_kline WHERE chain=$1 AND ca=$2 AND pair_id=$3 AND interval=$4 AND type=$5 AND valid IS DISTINCT FROM false AND open_time=ANY($6::bigint[]) ORDER BY open_time`,[ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,ctx.run.value_type,target.map(r=>r.time)])).rows:[];
+   for(const row of stored){
+    const time=Number(row.time),prior=evaluator.state.history.at(-1);
+    if(prior)for(let t=prior.time+step;t<time;t+=step)evaluator.onClosedCandle({time:t,closeTime:t+step,open:prior.close,high:prior.close,low:prior.close,close:prior.close,volume:0,synthetic:true,valid:true},true);
+    evaluator.onClosedCandle({time,closeTime:time+step,open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),volume:Number(row.volume),valid:true},true);
+   }
+   if(!valid()){await c.query('ROLLBACK');return;}
+   const last=evaluator.state.lastCandleTime;
+   if(last!==undefined)await c.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',[ctx.run.id,JSON.stringify(evaluator.snapshot()),last,ctx.watch.chain,ctx.watch.ca]);
+   if(!valid()){await c.query('ROLLBACK');return;}
+   await c.query('COMMIT');
+   if(valid()){ctx.evaluator=evaluator;if(last!==undefined)ctx.watch.last_candle_time=String(last);}
+  }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
+ }
+ /** Extend a historical snapshot only with an unbroken, already-closed live tail from this epoch. */
+ private async appendConnectedHistory(ctx:Context,valid:()=>boolean){
+  const step=ctx.run.interval==='30s'?30_000:60_000,last=ctx.evaluator.state.lastCandleTime;
+  if(last===undefined||last+step<Math.ceil(ctx.noOrdersBefore/step)*step)return;
+  const rows=(await this.pool.query(`SELECT open_time AS time,close_time AS "closeTime",open,high,low,close,volume FROM meme_kline
+   WHERE chain=$1 AND ca=$2 AND pair_id=$3 AND interval=$4 AND type=$5 AND source='meme_market_v2' AND valid IS DISTINCT FROM false AND open_time>$6 AND close_time<=$7 ORDER BY open_time LIMIT 5000`,[ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,ctx.run.value_type,last,Math.floor(Date.now()/step)*step])).rows;
+  if(!valid()||!rows.length)return;
+  const evaluator=new LiveEvaluator(ctx.run.strategy_json,Number(ctx.watch.signal_time),ctx.evaluator.snapshot());
+  let expected=last+step;
+  for(const row of rows){if(Number(row.time)!==expected)break;evaluator.onClosedCandle({time:Number(row.time),closeTime:Number(row.closeTime),open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),volume:Number(row.volume)},true);expected+=step;}
+  if(expected===last+step||!valid())return;
+  await this.pool.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',[ctx.run.id,JSON.stringify(evaluator.snapshot()),expected-step,ctx.watch.chain,ctx.watch.ca]);
+  if(valid()){ctx.evaluator=evaluator;ctx.watch.last_candle_time=String(expected-step);}
+ }
+ /** No historical orders or risk-state resets when the history provider is unavailable. */
+ private async warmupFromConnectedFeed(ctx:Context,valid=()=>true):Promise<{ready:boolean;count:number;required:number}>{
   const required=localWarmupBars(ctx.run.strategy_json);
   if(ctx.evaluator.state.position)return {ready:false,count:0,required};
   const step=ctx.run.interval==='30s'?30_000:60_000;
@@ -442,7 +483,7 @@ export class LiveService {
       AND source='meme_market_v2' AND valid IS DISTINCT FROM false AND open_time>=$6 AND close_time<=$7
     ORDER BY open_time DESC LIMIT $8) recent ORDER BY open_time`,
    [ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,ctx.run.value_type,first,to,Math.min(5000,Math.max(required,512))])).rows;
-  if(rows.length<required)return {ready:false,count:rows.length,required};
+  if(!valid()||rows.length<required||Number(rows.at(-1)?.time)<to-step)return {ready:false,count:rows.length,required};
   const previous=ctx.evaluator.snapshot();
   const evaluator=new LiveEvaluator(ctx.run.strategy_json,Number(ctx.watch.signal_time),{
    history:[],lastEntryMatch:false,lastAddMatch:false,trades:previous.trades,lastTokenPrice:previous.lastTokenPrice,
@@ -452,10 +493,12 @@ export class LiveService {
    if(prior&&Number(row.time)!==prior.time+step)return {ready:false,count:0,required};
    evaluator.onClosedCandle({time:Number(row.time),closeTime:Number(row.closeTime),open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),volume:Number(row.volume)},true);
   }
-  ctx.evaluator=evaluator;
-  ctx.watch.last_candle_time=String(rows.at(-1)!.time);
+  if(!valid())return {ready:false,count:rows.length,required};
   await this.pool.query('UPDATE live_watches SET state_json=$2,last_candle_time=$3 WHERE run_id=$1 AND chain=$4 AND ca=$5',
    [ctx.run.id,JSON.stringify(evaluator.snapshot()),rows.at(-1)!.time,ctx.watch.chain,ctx.watch.ca]);
+  if(!valid())return {ready:false,count:rows.length,required};
+  ctx.evaluator=evaluator;
+  ctx.watch.last_candle_time=String(rows.at(-1)!.time);
   return {ready:true,count:rows.length,required};
  }
  private async markRecovering(ctx:Context,reason:string,retryMs=5_000){
@@ -469,7 +512,7 @@ export class LiveService {
    const pool=this.projects.peek(ctx.watch);
    if(!pool){this.prepareProject(ctx.watch);await this.markRecovering(ctx,`等待项目供应量资料：${this.projects.status(ctx.watch)?.error??'正在查询'}`);return;}
    if(!pool)throw new Error('主池查询缺少可订阅交易池');
-   if(pool.pairId!==ctx.watch.pair_id||pool.dexId!==ctx.watch.dex_id){
+   if(pool.pairId!==ctx.watch.pair_id){
     if(ctx.evaluator.state.position&&pool.pairId!==ctx.watch.pair_id)throw new Error('已有持仓主池发生变化，暂停策略等待核验；不迁移旧持仓行情');
     this.aggregator.discardPair(ctx.watch.chain,ctx.watch.pair_id);
     const state=ctx.evaluator.snapshot();if(!state.position){state.history=[];state.lastCandleTime=undefined;ctx.watch.last_candle_time=null;}
@@ -478,35 +521,48 @@ export class LiveService {
     ctx.noOrdersBefore=Date.now();this.connected.add(pairKey(ctx.watch.chain,ctx.watch.pair_id));
     throw new Error('主池已切换，等待新交易池订阅确认');
    }
-   const epoch=this.marketEpochs.get(projectKey(ctx.watch));
-   try{await this.catchup(ctx);
-    const step=ctx.run.interval==='30s'?30_000:60_000;
-    if(ctx.evaluator.state.history.length<localWarmupBars(ctx.run.strategy_json)||(ctx.evaluator.state.lastCandleTime??0)<Math.floor(Date.now()/step)*step-step)throw new Error('历史预热不足或未覆盖最近收盘桶');
-   }catch(error){
-    const warmup=await this.warmupFromConnectedFeed(ctx);
+   if(pool.dexId!==ctx.watch.dex_id){ctx.watch.dex_id=pool.dexId;await this.pool.query('UPDATE live_watches SET dex_id=$4 WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,pool.dexId]);}
+   this.launchRecovery(ctx);
+  }catch(e){await this.markRecovering(ctx,`补行情失败，稍后重试：${redact(e)}`,60_000);}
+ }
+ private async finishRecovery(ctx:Context,issue:string,valid:()=>boolean){
+  try{
+   await this.appendConnectedHistory(ctx,valid);
+   if(!valid())return;
+   const step=ctx.run.interval==='30s'?30_000:60_000;
+   if(ctx.evaluator.state.history.length<localWarmupBars(ctx.run.strategy_json)||(ctx.evaluator.state.lastCandleTime??0)<Math.floor(Date.now()/step)*step-step){
+    const warmup=await this.warmupFromConnectedFeed(ctx,valid);
+    if(!valid())return;
     if(!warmup.ready){
-     await this.markRecovering(ctx,`历史补数不可用；实时行情预热 ${warmup.count}/${warmup.required} 根，期间暂停策略交易${ctx.evaluator.state.position?'；已有持仓止损无法保证及时执行':''}`,60_000);
+     await this.markRecovering(ctx,`${issue}；实时行情预热 ${warmup.count}/${warmup.required} 根，期间暂停策略交易${ctx.evaluator.state.position?'；已有持仓止损无法保证及时执行':''}`,60_000);
      return;
     }
    }
-   if(epoch!==this.marketEpochs.get(projectKey(ctx.watch))||!this.marketSessions.has(projectKey(ctx.watch))||this.supplyBlocked.has(projectKey(ctx.watch)))return;
+   if(!valid())return;
+   const current=(await this.pool.query('SELECT status FROM live_runs WHERE id=$1',[ctx.run.id])).rows[0];
+   if(!valid()||current?.status!=='running')return;
    this.connected.add(pairKey(ctx.watch.chain,ctx.watch.pair_id));
    if(!ctx.evaluator.state.history.length)throw new Error('尚无可用历史行情，等待重试');
-   ctx.noOrdersBefore=Date.now();
-   if(![...this.watches.values()].some(other=>other!==ctx&&other.ready&&other.watch.chain===ctx.watch.chain&&other.watch.pair_id===ctx.watch.pair_id))
-    this.aggregator.markClosedThrough(ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.noOrdersBefore);
+   const boundary=Date.now();
    if(ctx.run.mode==='paper')await this.pool.query("UPDATE live_orders SET status='cancelled',updated_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3 AND status='pending'",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);
-   await this.seedAggregation(ctx);
-   ctx.ready=true;ctx.watch.status='monitoring';
+   if(!valid())return;
+   await this.seedAggregation(ctx,boundary,valid);
+   if(!valid())return;
    await this.pool.query("UPDATE live_watches SET status='monitoring',recovery_reason=NULL WHERE run_id=$1 AND chain=$2 AND ca=$3",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);
-  }catch(e){await this.markRecovering(ctx,`补行情失败，稍后重试：${redact(e)}`);}
+   if(!valid())return;
+   if(![...this.watches.values()].some(other=>other!==ctx&&other.ready&&other.watch.chain===ctx.watch.chain&&other.watch.pair_id===ctx.watch.pair_id))
+    this.aggregator.markClosedThrough(ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,boundary);
+   ctx.noOrdersBefore=boundary;ctx.ready=true;ctx.watch.status='monitoring';
+  }catch(e){if(valid())await this.markRecovering(ctx,`补行情失败，稍后重试：${redact(e)}`,60_000);}
  }
- private async seedAggregation(ctx:Context){
+ private async seedAggregation(ctx:Context,boundary=ctx.noOrdersBefore,valid=()=>true){
+  if([...this.watches.values()].some(other=>other!==ctx&&other.ready&&other.watch.chain===ctx.watch.chain&&other.watch.pair_id===ctx.watch.pair_id&&other.run.interval===ctx.run.interval))return;
   const last=ctx.evaluator.state.history.at(-1);if(!last)return;
   const rows=(await this.pool.query('SELECT type,close FROM meme_kline WHERE chain=$1 AND pair_id=$2 AND interval=$3 AND open_time=$4 AND valid IS DISTINCT FROM false',[ctx.watch.chain,ctx.watch.pair_id,ctx.run.interval,last.time])).rows;
+  if(!valid())return;
   const price=Number(rows.find(r=>r.type==='price')?.close),mcap=Number(rows.find(r=>r.type==='mcap')?.close);
   if(!Number.isFinite(price)||price<=0 || (ctx.run.value_type==='mcap'&&(!Number.isFinite(mcap)||mcap<=0)))return; // First reliable socket pair will seed instead.
-  const step=ctx.run.interval==='30s'?30_000:60_000,first=Math.ceil(ctx.noOrdersBefore/step)*step;
+  const step=ctx.run.interval==='30s'?30_000:60_000,first=Math.ceil(boundary/step)*step;
   for(const type of ['price','mcap'] as const){const value=type==='price'?price:mcap;if(!Number.isFinite(value)||value<=0)continue;
    this.aggregator.seed({symbol:{chain:ctx.watch.chain,ca:ctx.watch.ca,pairId:ctx.watch.pair_id},interval:ctx.run.interval,type,tradeCount:0,closeTradeId:`recovery:${last.time}`,closeTradeTime:last.closeTime,
     candle:{time:first-step,closeTime:first,open:value,high:value,low:value,close:value,volume:0,synthetic:true,valid:true}});

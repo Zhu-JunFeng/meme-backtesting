@@ -38,6 +38,7 @@ const url=process.env.TEST_DATABASE_URL;
   version=(await pool.query('INSERT INTO backtest_strategy_versions DEFAULT VALUES RETURNING id')).rows[0].id;
   for(const name of ['010_live_trading','011_live_signal_sources','012_live_watch_dex','013_live_recovery_capacity','014_live_portfolio','015_live_closed_bar','016_live_market_protocol'])
    await pool.query(readFileSync(new URL(`../../api/migrations/${name}.sql`,import.meta.url),'utf8').replaceAll('public.',`${schema}.`));
+  await pool.query(`CREATE TABLE meme_kline(chain text,ca text,pair_id text,interval text,open_time bigint,close_time bigint,open numeric,high numeric,low numeric,close numeric,volume numeric,trade_count bigint,type text,source text,raw_data jsonb,valid boolean,UNIQUE(chain,pair_id,interval,open_time,type))`);
  },20_000);
  afterEach(()=>vi.unstubAllEnvs());
  afterAll(async()=>{await pool?.end();if(admin){await admin.query(`DROP SCHEMA ${schema} CASCADE`);await admin.end();}});
@@ -55,6 +56,27 @@ const url=process.env.TEST_DATABASE_URL;
   };
   return {run,service,add};
  }
+ it('imports history with exact decimals, retains authoritative conflicts, and never emits historical orders',async()=>{
+  const {run,service,add}=await fixture('paper','mcap');const ctx=await add('history');ctx.evaluator.state.position!.lockPrice=10500;ctx.evaluator.state.position!.lockTier=1;
+  const before=structuredClone(ctx.evaluator.state.position),time=210000;
+  const result={endpoint:'https://history',traceId:'trace',rows:[{time,open:'12000.0000000000000001',high:'13000',low:'11000',close:'12500',volume:'1.1234567890123456789'}]};
+  await service.applyHistory(ctx,[{type:'mcap',result},{type:'price',result:{...result,rows:result.rows.map(r=>({...r,open:'120',high:'130',low:'110',close:'125'}))}}],()=>true);
+  expect(ctx.evaluator.state.position).toEqual(before);expect(ctx.evaluator.state.lastCandleTime).toBe(time);
+  const stored=(await pool.query("SELECT * FROM meme_kline WHERE ca='history' AND type='mcap'")).rows[0];expect(stored.open).toBe('12000.0000000000000001');expect(stored.volume).toBe('1.1234567890123456789');expect(stored.source).toBe('memeinfo_xxyy');expect(stored.raw_data.traceId).toBe('trace');
+  await service.applyHistory(ctx,[{type:'mcap',result:{...result,rows:result.rows.map(r=>({...r,close:'12000'}))}}],()=>true);
+  expect(ctx.evaluator.state.history.at(-1)!.close).toBe(12500);expect((await pool.query('SELECT count(*) n FROM live_orders WHERE run_id=$1',[run.id])).rows[0].n).toBe('0');
+ });
+ it('rolls back history and checkpoint when the recovery epoch is lost during storage',async()=>{
+  const {run,service,add}=await fixture();const ctx=await add('stale-history'),before=ctx.evaluator.snapshot();let valid=true;
+  const connect=pool.connect.bind(pool);service.pool={query:pool.query.bind(pool),connect:async()=>{const client=await connect();return new Proxy(client,{get(target,key){if(key==='query')return async(sql:string,args:any[])=>{const result=await target.query(sql,args);if(sql.startsWith('INSERT INTO meme_kline'))valid=false;return result;};const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;}});}};
+  await service.applyHistory(ctx,[{type:'price',result:{endpoint:'history',rows:[{time:210000,open:'1',high:'1',low:'1',close:'1',volume:'1'}]}}],()=>valid);
+  expect(ctx.evaluator.snapshot()).toEqual(before);expect((await pool.query("SELECT count(*) n FROM meme_kline WHERE ca='stale-history'")).rows[0].n).toBe('0');expect((await pool.query('SELECT state_json FROM live_watches WHERE run_id=$1',[run.id])).rows[0].state_json).not.toEqual(ctx.evaluator.snapshot());
+ });
+ it('does not restore a paused task even if its HTTP request succeeded',async()=>{
+  const {run,service,add}=await fixture();const ctx=await add('paused-history');await pool.query("UPDATE live_runs SET status='paused' WHERE id=$1",[run.id]);
+  await service.applyHistory(ctx,[{type:'price',result:{endpoint:'history',rows:[{time:210000,open:'1',high:'1',low:'1',close:'1',volume:'1'}]}}],()=>true);
+  expect((await pool.query("SELECT count(*) n FROM meme_kline WHERE ca='paused-history'")).rows[0].n).toBe('0');
+ });
  it('fills on closed-bar thresholds and atomically saves state/cash/equity; duplicate and restart are inert',async()=>{
   const {run,service,add}=await fixture();const ctx=await add('a');
   await service.executeBars([bar()]);

@@ -40,7 +40,7 @@ describe('recovery windows',()=>{
    entryConditionGroup:{mode:'all',conditions:[]},
    invalidationConditionGroup:{mode:'any',conditions:[]},
   } as unknown as StrategyConfig;
-  const base=Math.floor(Date.now()/30_000)*30_000-8*30_000;
+  const base=Math.floor(Date.now()/30_000)*30_000-5*30_000;
   const rows=Array.from({length:5},(_,index)=>({time:base+index*30_000,closeTime:base+(index+1)*30_000,open:1,high:1,low:1,close:1,volume:1}));
   const query=vi.fn(async(sql:string)=>({rows:sql.startsWith('SELECT')?rows:[]}));
   const service=new LiveService({query} as never);
@@ -55,6 +55,19 @@ describe('recovery windows',()=>{
  });
 });
 describe('monitor admission',()=>{
+ it('keeps slow HTTP work outside the event queue and fences its result after a disconnect',async()=>{
+  const service:any=new LiveService({query:vi.fn(async()=>({rows:[]}))} as never);
+  const ctx={run:{id:'r',status:'running',interval:'1m',value_type:'price'},watch:{chain:'sol',ca:'a',pair_id:'p',last_candle_time:null},noOrdersBefore:0};
+  service.watches.set('r:sol:a',ctx);service.marketSessions.set('sol:a','s');service.marketEpochs.set('sol:a',1);
+  let resolve!:(value:any)=>void;service.history={get:vi.fn(()=>new Promise(r=>resolve=r))};service.applyHistory=vi.fn();service.finishRecovery=vi.fn();
+  service.launchRecovery(ctx);const tick=vi.fn(async()=>{});service.enqueue(tick);await service.chain;expect(tick).toHaveBeenCalledOnce();expect(service.applyHistory).not.toHaveBeenCalled();
+  service.marketEpochs.set('sol:a',2);resolve({rows:[]});await vi.waitFor(()=>expect(service.recovering.size).toBe(0));expect(service.applyHistory).not.toHaveBeenCalled();expect(service.finishRecovery).not.toHaveBeenCalled();
+ });
+ it('does not reseed the shared aggregator when a second task recovers the same pool',async()=>{
+  const query=vi.fn();const service:any=new LiveService({query} as never);service.aggregator.seed=vi.fn();
+  const ctx={run:{interval:'1m'},watch:{chain:'sol',pair_id:'p'}};service.watches.set('other',{...ctx,ready:true});
+  await service.seedAggregation(ctx);expect(query).not.toHaveBeenCalled();expect(service.aggregator.seed).not.toHaveBeenCalled();
+ });
  function waitingService(){
   const service:any=new LiveService({query:vi.fn(async()=>({rows:[]}))} as never);
   service.watches.set('r:robin:a',{run:{id:'r',status:'running',value_type:'mcap'},watch:{chain:'robin',ca:'a',pair_id:'p'},ready:true});
