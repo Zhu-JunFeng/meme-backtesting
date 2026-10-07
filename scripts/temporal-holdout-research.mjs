@@ -20,7 +20,7 @@ export function baseStrategy(){return {schemaVersion:1,entryAfterSignal:true,min
  exitConfig:{stopLoss:{type:'percent',value:10},takeProfit:{type:'risk_reward',ratio:2},maxHoldingBars:120,closeAtEnd:true,profitLock:{enabled:false,tiers:[]}},
  positionConfig:{mode:'single_entry',maxEntries:1,maxConcurrentPositions:3,allowReentry:false,sizing:{type:'fixed_percent',value:2}},executionConfig:{...COSTS}};}
 export function splitCohort(signals,ratio=.7){
- assert(ratio>0&&ratio<1);const ordered=earliestSignals(signals);assert(ordered.length>=2,'Insufficient CA signals');
+ assert(typeof ratio==='number'&&Number.isFinite(ratio)&&ratio>0&&ratio<1,'Split ratio must be between 0 and 1');const ordered=earliestSignals(signals);assert(ordered.length>=2,'Insufficient CA signals');
  const index=Math.min(ordered.length-1,Math.max(1,Math.floor(ordered.length*ratio))),cutoff=ordered[index].signalTime;
  const development=ordered.filter(s=>s.signalTime<cutoff),validation=ordered.filter(s=>s.signalTime>=cutoff);
  assert(development.length&&validation.length,'Equal signal timestamps cannot be split');
@@ -42,7 +42,7 @@ export function shardCandidates(candidates,shard){
  assert(Number.isInteger(shard.index)&&Number.isInteger(shard.total)&&shard.total>=1&&shard.total<=8&&shard.index>=0&&shard.index<shard.total,'Invalid shard');
  return candidates.filter((_,i)=>i%shard.total===shard.index);
 }
-export async function study({snapshot,output,chain,count=96,shard}){
+export async function study({snapshot,output,chain,count=96,shard,splitRatio=.7}){
  snapshot=resolve(snapshot);output=resolve(output);await mkdir(output,{recursive:true});
  const manifest=JSON.parse(await readFile(resolve(snapshot,'manifest.json'),'utf8')),metadata=JSON.parse(await readFile(resolve(snapshot,'metadata.json'),'utf8'));
  const {checksum,...unsigned}=manifest;assert.equal(hash(unsigned),checksum);assert.equal(manifest.engineVersion,ENGINE_VERSION);assert.equal(await fileHash(resolve(snapshot,'metadata.json')),manifest.metadataHash);
@@ -51,10 +51,10 @@ export async function study({snapshot,output,chain,count=96,shard}){
   const r=await loadInputs(snapshot,manifest,chain,interval);r.inputs=selectInputs(r.inputs,allSignals,asOf);loaded[interval]=r;
   for(const p of r.inputs)available.add(key(p.symbol));
  }
- const signals=allSignals.filter(s=>available.has(key(s))),partition=splitCohort(signals),candidates=candidateGrid(count);
- const protocol={version:1,engineVersion:ENGINE_VERSION,snapshotHash:checksum,chain,asOf,partition,candidates,costs:COSTS,
+ const signals=allSignals.filter(s=>available.has(key(s))),partition=splitCohort(signals,splitRatio),candidates=candidateGrid(count);
+ const protocol={version:1,engineVersion:ENGINE_VERSION,snapshotHash:checksum,chain,asOf,partition,candidates,costs:COSTS,...(splitRatio!==.7?{splitRatio}:{}),
   scope:'Historical chronological CA-disjoint holdout; old history has been studied before, so NOT genuinely unseen prospective validation.',
-  rule:'70% earliest discovered CAs develop, later 30% validate; tied times stay together. Development candles must close by cutoff; pre-signal history warms indicators, all entries strictly after earliest signal. All pools of a CA stay together. One winner frozen by development return (>=10 trades, <=20% drawdown) BEFORE validation. No validation-driven reselection. Last available candle closes positions. Existing engine gap fill unchanged.',
+  rule:`${Number((splitRatio*100).toFixed(4))}% earliest discovered CAs develop, later ${Number(((1-splitRatio)*100).toFixed(4))}% validate; tied times stay together. Development candles must close by cutoff; pre-signal history warms indicators, all entries strictly after earliest signal. All pools of a CA stay together. One winner frozen by development return (>=10 trades, <=20% drawdown) BEFORE validation. No validation-driven reselection. Last available candle closes positions. Existing engine gap fill unchanged.`,
   coverage:Object.fromEntries(Object.entries(loaded).map(([interval,r])=>[interval,{rows:r.rows,invalid:r.invalid,pools:r.inputs.length,cas:new Set(r.inputs.map(p=>key(p.symbol))).size}])),
   signalsWithoutCandles:allSignals.filter(s=>!available.has(key(s)))};
  const pp=resolve(output,'protocol.json');try{const old=JSON.parse(await readFile(pp,'utf8'));assert.equal(hash(old),hash(protocol),'Protocol changed');}catch(e){if(e.code!=='ENOENT')throw e;assert(!shard,'Freeze protocol with coordinator before starting shards');await writeFile(pp,JSON.stringify(protocol,null,2),{flag:'wx'});}
@@ -83,10 +83,17 @@ export async function study({snapshot,output,chain,count=96,shard}){
  const best=Object.entries(validation.audit.byCa).sort((a,b)=>b[1]-a[1])[0];
  const withoutBestSignals=partition.validation.filter(s=>`${s.chain}:${s.ca}`!==best?.[0]);
  const withoutBest=best&&withoutBestSignals.length?run(winner,withoutBestSignals,asOf,true):null;
- const report={chain,protocolHash:hash(protocol),snapshotHash:checksum,scope:protocol.scope,cutoff:partition.cutoff,asOf,config:winner.config,id:winner.id,interval:winner.interval,strategyDescription:generateStrategyDescription(winner.config),
+ const report={chain,protocolHash:hash(protocol),snapshotHash:checksum,scope:protocol.scope,splitRatio,cutoff:partition.cutoff,asOf,config:winner.config,id:winner.id,interval:winner.interval,strategyDescription:generateStrategyDescription(winner.config),
   development,validation,stress,withoutBest,bestValidationCa:best,
   passed:accepted(development,validation),stressPassed:stress.accountReturn>0,withoutBestPassed:!!withoutBest&&withoutBest.accountReturn>0,
   warning:'Finite historical search, not profit guarantee. Validation never used to replace frozen winner. Gap-filled candles and terminal closes must be reviewed before paper deployment.',completedAt:new Date().toISOString()};
  await saveJson(resolve(output,'report.json'),report);console.log(JSON.stringify({stage:'complete',chain,id:winner.id,passed:report.passed,development:development.accountReturn,validation:validation.accountReturn,stress:stress.accountReturn}));return report;
 }
-if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.url){const [snapshot,output,chain,count='96',shardArg]=process.argv.slice(2);assert(chain);const shard=shardArg?{index:Number(shardArg.split('/')[0]),total:Number(shardArg.split('/')[1])}:undefined;await study({snapshot,output,chain,count:Number(count),shard});}
+export function parseStudyArgs(args){
+ const options=args.filter(a=>a.startsWith('--'));assert(options.length<=1&&options.every(a=>a.startsWith('--split=')),'Usage: SNAPSHOT OUTPUT CHAIN [COUNT] [SHARD/TOTAL] [--split=0.5]');
+ const splitRatio=options.length?Number(options[0].slice('--split='.length)):.7;assert(Number.isFinite(splitRatio)&&splitRatio>0&&splitRatio<1,'Invalid split ratio');
+ const [snapshot,output,chain,count='96',shardArg,...extra]=args.filter(a=>!a.startsWith('--'));assert(snapshot&&output&&chain&&!extra.length,'Missing or extra arguments');
+ const shard=shardArg?{index:Number(shardArg.split('/')[0]),total:Number(shardArg.split('/')[1])}:undefined;
+ return {snapshot,output,chain,count:Number(count),shard,splitRatio};
+}
+if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.url)await study(parseStudyArgs(process.argv.slice(2)));
