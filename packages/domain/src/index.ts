@@ -155,3 +155,4 @@ export interface ConditionDefinition {
 
 export interface StrategyTemplateSummary { id: string; name: string; description: string; status: "draft" | "active" | "archived"; currentVersionId: string | null; currentVersion?: number; createdAt: string; updatedAt: string }
 export interface StrategyVersion { id: string; templateId: string; version: number; schemaVersion: number; strategyJson: StrategyConfig; checksum: string; createdAt: string; versionDescription?: import('./strategy-description.js').VersionDescription | null }
+export * from './live-sources.js';

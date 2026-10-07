@@ -273,14 +273,14 @@ export class LiveService {
   const c=await this.pool.connect();
   try{await c.query('BEGIN');
    // Serialize admissions per run; concurrent signals cannot each claim the last slot.
-   await c.query('SELECT id FROM live_runs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE',[relevant.map(r=>r.id)]);
+   const admitted=(await c.query("SELECT id,signal_source,started_at,status FROM live_runs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",[relevant.map(r=>r.id)])).rows.filter(r=>r.status==='running'&&acceptsNewSignal(r,signal));
    await c.query(`INSERT INTO token_signal_events(chain,ca,signal_source,detail_id,signal_time,source_signal,provenance)
     VALUES($1,$2,$3,$4,$5,$6,'[]') ON CONFLICT(chain,ca,signal_source,detail_id) DO NOTHING`,[signal.chain,signal.ca,signal.source,signal.key,signal.time,JSON.stringify(signal.identity)]);
    await c.query(`INSERT INTO token_info(chain,ca,pair,signal_source,source_signal,signal_time) VALUES($1,$2,$3,$4,$5,$6)
     ON CONFLICT(chain,ca,pair) DO UPDATE SET signal_source=CASE WHEN token_info.signal_time IS NULL OR EXCLUDED.signal_time<token_info.signal_time THEN EXCLUDED.signal_source ELSE token_info.signal_source END,
     source_signal=CASE WHEN token_info.signal_time IS NULL OR EXCLUDED.signal_time<token_info.signal_time THEN EXCLUDED.source_signal ELSE token_info.source_signal END,
     signal_time=LEAST(COALESCE(token_info.signal_time,EXCLUDED.signal_time),EXCLUDED.signal_time)`,[signal.chain,signal.ca,pairId,signal.source,JSON.stringify(signal.identity),signal.time]);
-   for(const r of relevant){
+   for(const r of admitted){
     const active=Number((await c.query("SELECT COUNT(*) AS count FROM live_watches WHERE run_id=$1 AND status IN ('monitoring','recovering','pending_eviction')",[r.id])).rows[0].count);
     const prior=(await c.query('SELECT status,signal_key FROM live_watches WHERE run_id=$1 AND chain=$2 AND ca=$3',[r.id,signal.chain,signal.ca])).rows[0];
     if(prior?.status!=='evicted_low_mcap'&&prior){

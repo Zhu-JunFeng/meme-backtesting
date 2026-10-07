@@ -13,6 +13,10 @@ describe('source-isolated paper runs',()=>{
   expect(acceptsNewSignal({signal_source:'top_cluster_first_buy',started_at:new Date(2000)},signal)).toBe(false);
   expect(acceptsNewSignal({signal_source:'top_cluster_first_buy',started_at:new Date(3000)},signal)).toBe(false);
  });
+ it('admits either selected source via compatible all storage',()=>{
+  for(const source of ['top_cluster_first_buy','fomo_new_project_expanded'] as const)
+   expect(acceptsNewSignal({signal_source:'all',started_at:new Date(1000)},{...signal,source})).toBe(true);
+ });
 });
 describe('recovery windows',()=>{
  it('keeps every fetch at or below five thousand candles with no overlap',()=>{
@@ -55,6 +59,16 @@ describe('recovery windows',()=>{
  });
 });
 describe('monitor admission',()=>{
+ it('rechecks source selection under the admission lock after an in-flight edit',async()=>{
+  const run={id:'r',signal_source:'all',started_at:new Date(1000)};
+  const tx=vi.fn(async(sql:string)=>({rows:sql.includes('FOR UPDATE')?[{...run,status:'running',signal_source:'fomo_new_project_expanded'}]:[]}));
+  const pool={query:vi.fn(async(sql:string)=>({rows:sql.includes('COUNT(w.*)')?[{id:'r',active:0,existing:false}]:[run]})),connect:async()=>({query:tx,release:vi.fn()})};
+  const service:any=new LiveService(pool as never);service.feedHealthy=true;service.refresh=vi.fn();
+  service.projects={peek:()=>({pairId:'p',dexId:null,marketCap:100000,fetchedAt:Date.now()})};
+  await service.onSignal({chain:'bsc',ca:'a',source:'top_cluster_first_buy',time:2000,key:'s',identity:{}});
+  expect(tx.mock.calls.some(([sql])=>sql.includes('FOR UPDATE'))).toBe(true);
+  expect(tx.mock.calls.some(([sql])=>sql.includes('INSERT INTO live_watches'))).toBe(false);
+ });
  it('keeps slow HTTP work outside the event queue and fences its result after a disconnect',async()=>{
   const service:any=new LiveService({query:vi.fn(async()=>({rows:[]}))} as never);
   const ctx={run:{id:'r',status:'running',interval:'1m',value_type:'price'},watch:{chain:'sol',ca:'a',pair_id:'p',last_candle_time:null},noOrdersBefore:0};

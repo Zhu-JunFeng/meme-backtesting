@@ -1,18 +1,26 @@
-import {BadRequestException,ConflictException,Controller,Get,Headers,Param,Post,Body,Query,Req} from '@nestjs/common';
+import {BadRequestException,ConflictException,Controller,Get,Headers,Param,Post,Patch,Body,Query,Req} from '@nestjs/common';
 import {scryptSync,timingSafeEqual} from 'node:crypto';
 import {Pool} from 'pg';
 import type {StrategyConfig} from '@meme/domain';
+import {liveSignalSources,legacyLiveSource} from '@meme/domain';
 import {buildLivePortfolio} from './live-portfolio.js';
 import {liveFib,decisionBucket} from './live-locator.js';
 
 type Mode='paper'|'live';
 type Risk={maxOrderNative:number;maxTotalNative:number;maxDailyLossUsd:number;maxPositions:number;tip:number;slippagePercent:number};
 export type LiveSignalSource='all'|'top_cluster_first_buy'|'fomo_new_project_expanded';
-type RequestBody={name:string;mode:Mode;chain:'sol'|'bsc'|'robin';interval:'30s'|'1m';valueType:'price'|'mcap';strategyVersionId:string;initialCapital:number;signalSource?:LiveSignalSource;clientKey?:string;walletAddress?:string;risk?:Risk};
-export const validLiveSignalSource=(value:unknown):value is LiveSignalSource=>['all','top_cluster_first_buy','fomo_new_project_expanded'].includes(String(value));
+type RequestBody={name:string;mode:Mode;chain:'sol'|'bsc'|'robin';interval:'30s'|'1m';valueType:'price'|'mcap';strategyVersionId:string;initialCapital:number;signalSource?:LiveSignalSource;signalSources?:string[];clientKey?:string;walletAddress?:string;risk?:Risk};
+export const validLiveSignalSource=(value:unknown):value is LiveSignalSource=>typeof value==='string'&&['all','top_cluster_first_buy','fomo_new_project_expanded'].includes(value);
 const positive=(value:unknown)=>typeof value==='number'&&Number.isFinite(value)&&value>0;
 const mask=(wallet:string|null)=>wallet?`${wallet.slice(0,5)}…${wallet.slice(-4)}`:null;
-const publicRow=(r:any)=>({...r,wallet_address:mask(r.wallet_address),risk_json:r.mode==='live'?undefined:r.risk_json});
+const publicRow=(r:any)=>({...r,signalSources:liveSignalSources(r.signal_source),wallet_address:mask(r.wallet_address),risk_json:r.mode==='live'?undefined:r.risk_json});
+export function resolveSignalSource(body:{signalSource?:string;signalSources?:unknown}):LiveSignalSource {
+ try {
+  const source=body.signalSources===undefined?(body.signalSource??'all'):legacyLiveSource(body.signalSources);
+  if(!validLiveSignalSource(source)||(body.signalSources!==undefined&&body.signalSource!==undefined&&body.signalSource!==source))throw new Error('信号来源无效或新旧参数冲突');
+  return source;
+ }catch(e){throw new BadRequestException((e as Error).message);}
+}
 
 /** The browser keeps the password in memory only. In production it is accepted only behind HTTPS. */
 export function requireLiveAdmin(password:string|undefined,request:any){
@@ -46,7 +54,7 @@ export class LiveController {
  }
  @Post('live-runs') async create(@Body() body:RequestBody,@Headers('x-live-admin-password') password:string,@Req() request:any){
   if(!body || !body.name?.trim() || !['paper','live'].includes(body.mode) || !['sol','bsc','robin'].includes(body.chain) || !['30s','1m'].includes(body.interval)||!['price','mcap'].includes(body.valueType)||!positive(body.initialCapital))throw new BadRequestException('实时任务配置无效');
-  if(!validLiveSignalSource(body.signalSource??'all'))throw new BadRequestException('信号来源无效');
+  const signalSource=resolveSignalSource(body);
   if(body.clientKey!==undefined && (body.mode!=='paper'||typeof body.clientKey!=='string'||!(/^[a-z0-9][a-z0-9:_-]{7,127}$/).test(body.clientKey)))throw new BadRequestException('模拟盘幂等键无效');
   if(body.mode==='live'){
    requireLiveAdmin(password,request);validateRisk(body.risk);
@@ -65,11 +73,11 @@ export class LiveController {
   if(body.mode==='live' && strategy.positionConfig.maxConcurrentPositions>body.risk!.maxPositions)throw new BadRequestException('实盘硬性最大持仓数不能小于策略最大持仓数');
   let result;
   try{result=await this.pool.query(`INSERT INTO live_runs(name,mode,chain,interval,value_type,signal_source,client_key,strategy_version_id,strategy_json,initial_capital,wallet_address,risk_json,cash)
-    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$10) ON CONFLICT (client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING *`,[body.name.trim(),body.mode,body.chain,body.interval,body.valueType,body.signalSource??'all',body.clientKey??null,body.strategyVersionId,JSON.stringify(strategy),body.initialCapital,body.mode==='live'?body.walletAddress!.trim():null,body.mode==='live'?JSON.stringify(body.risk):null]);}
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$10) ON CONFLICT (client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING *`,[body.name.trim(),body.mode,body.chain,body.interval,body.valueType,signalSource,body.clientKey??null,body.strategyVersionId,JSON.stringify(strategy),body.initialCapital,body.mode==='live'?body.walletAddress!.trim():null,body.mode==='live'?JSON.stringify(body.risk):null]);}
   catch(error:any){if(error?.code==='23505')throw new ConflictException('该链钱包已绑定其他实盘任务，必须使用独立钱包');throw error;}
   if(!result.rowCount){
    const existing=(await this.pool.query('SELECT * FROM live_runs WHERE client_key=$1',[body.clientKey])).rows[0];
-   if(!existing||existing.mode!==body.mode||existing.chain!==body.chain||existing.interval!==body.interval||existing.value_type!==body.valueType||existing.signal_source!==(body.signalSource??'all')||existing.strategy_version_id!==body.strategyVersionId||Number(existing.initial_capital)!==body.initialCapital)throw new ConflictException('幂等键已用于不同配置');
+   if(!existing||existing.mode!==body.mode||existing.chain!==body.chain||existing.interval!==body.interval||existing.value_type!==body.valueType||existing.signal_source!==signalSource||existing.strategy_version_id!==body.strategyVersionId||Number(existing.initial_capital)!==body.initialCapital)throw new ConflictException('幂等键已用于不同配置');
    return publicRow(existing);
   }
   return publicRow(result.rows[0]);
@@ -83,7 +91,7 @@ export class LiveController {
   const result=await this.pool.query('SELECT * FROM live_runs WHERE id=$1',[id]);
   if(!result.rowCount)throw new BadRequestException('实时任务不存在');
   const [watches,orders,events]=await Promise.all([
-   this.pool.query('SELECT chain,ca,pair_id,signal_source,signal_time,status,last_candle_time,last_trade_at,current_mcap,recovery_reason,state_json FROM live_watches WHERE run_id=$1 ORDER BY created_at DESC LIMIT 500',[id]),
+   this.pool.query("SELECT chain,ca,pair_id,signal_source,signal_time,created_at,status,last_candle_time,last_trade_at,current_mcap,recovery_reason,state_json FROM live_watches WHERE run_id=$1 ORDER BY (status IN ('monitoring','recovering','pending_eviction')) DESC, created_at DESC,ca LIMIT 500",[id]),
    this.pool.query('SELECT o.*,f.fill_time,f.fill_price,f.quantity,f.gross_amount,f.fee,f.slippage_cost,f.tax_cost FROM live_orders o LEFT JOIN live_fills f ON f.order_id=o.id WHERE o.run_id=$1 ORDER BY o.created_at DESC LIMIT 500',[id]),
    this.pool.query('SELECT kind,chain,ca,pair_id,event_time,payload FROM live_events WHERE run_id=$1 ORDER BY event_time DESC LIMIT 200',[id])]);
   const run=result.rows[0],activeCaCount=watches.rows.filter(w=>['monitoring','recovering','pending_eviction'].includes(w.status)).length;
@@ -194,6 +202,16 @@ export class LiveController {
  }
  @Get('live-runs/:id/equity') async equity(@Param('id') id:string){
   return (await this.pool.query('SELECT time,equity,cash,unrealized FROM live_equity_curve WHERE run_id=$1 ORDER BY time DESC LIMIT 1000',[id])).rows.reverse();
+ }
+ @Patch('live-runs/:id/signal-sources') async sources(@Param('id') id:string,@Body() body:{signalSources?:unknown},@Headers('x-live-admin-password') password:string,@Req() request:any){
+  if(body?.signalSources===undefined)throw new BadRequestException('请选择信号来源');
+  const source=resolveSignalSource(body);
+  const existing=(await this.pool.query('SELECT mode FROM live_runs WHERE id=$1',[id])).rows[0];
+  if(!existing)throw new BadRequestException('实时任务不存在');
+  if(existing.mode==='live')requireLiveAdmin(password,request);
+  const result=await this.pool.query("UPDATE live_runs SET signal_source=$2,updated_at=now() WHERE id=$1 AND status IN ('paused','running') RETURNING *",[id,source]);
+  if(!result.rowCount)throw new ConflictException('已停止任务不能修改信号来源');
+  return publicRow(result.rows[0]);
  }
  @Post('live-runs/:id/start') async start(@Param('id') id:string,@Headers('x-live-admin-password') password:string,@Req() request:any){
   const existing=(await this.pool.query('SELECT mode,chain,wallet_address FROM live_runs WHERE id=$1',[id])).rows[0];
