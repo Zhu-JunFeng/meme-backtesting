@@ -1,6 +1,7 @@
 import {createHash} from 'node:crypto';
 import type {MarketTrade} from '@meme/engine';
-export interface ProjectSignal {key:string;chain:'sol'|'bsc'|'robin';ca:string;source:'top_cluster_first_buy'|'fomo_new_project_expanded';time:number;identity:Record<string,unknown>}
+import {LIVE_SIGNAL_SOURCES,type LiveSignalSourceCode} from '@meme/domain';
+export interface ProjectSignal {key:string;chain:'sol'|'bsc'|'robin';ca:string;source:LiveSignalSourceCode;time:number;identity:Record<string,unknown>}
 const object=(v:unknown):Record<string,unknown>|undefined=>v&&typeof v==='object'&&!Array.isArray(v)?v as Record<string,unknown>:undefined;
 const str=(...values:unknown[])=>values.find(v=>typeof v==='string'&&v.trim()) as string|undefined;
 const numeric=(...values:unknown[])=>{for(const v of values){const n=typeof v==='number'?v:typeof v==='string'&&v.trim()?Number(v):NaN;if(Number.isFinite(n))return n;}return undefined;};
@@ -13,11 +14,15 @@ export function parseProjectSignal(input:unknown):ProjectSignal|undefined{
  const source=str(data.signal_code,data.signalCode,data.signal_source,data.signalSource,root.signal_code,root.signalCode,root.signal_source,root.signalSource,data.type);
  const ca=str(data.ca,data.token_address,data.tokenAddress,data.contract_address,data.contractAddress);
  const time=milliseconds(data.trigger_time_ms??data.triggerTimeMs??data.signal_time??data.signalTime??data.trigger_time??data.triggerTime??data.timestamp);
- if(!['sol','bsc','robin'].includes(chain??'')||!['top_cluster_first_buy','fomo_new_project_expanded'].includes(source??'')||!ca||!time)return;
+ if(!['sol','bsc','robin'].includes(chain??'')||!LIVE_SIGNAL_SOURCES.includes(source as LiveSignalSourceCode)||!ca||!time)return;
+ // Multiplier notifications repeat the original trigger; never treat them as new admissions.
+ if(source==='fomo_trending_new_project'&&data.reached_multiple!=null)return;
  if(chain!=='sol'&&!/^0x[0-9a-fA-F]{40}$/.test(ca))return;
  const normalized=chain==='sol'?ca:ca.toLowerCase(),detail=str(data.detail_id,data.detailId,data.event_id,data.eventId,data.id,root.id);
  const key=detail??createHash('sha256').update(`${chain}:${normalized}:${source}:${time}`).digest('hex');
- return {key,chain:chain as ProjectSignal['chain'],ca:normalized,source:source as ProjectSignal['source'],time,identity:{id:detail??null,source,chain,ca:normalized,signalName:str(data.signal_name,data.signalName)??null}};
+ const trending=object(data.trending),reason=object(data.reason);
+ const evidence=source==='fomo_trending_new_project'?{trending:trending?{rank:trending.rank,finished_at_ms:trending.finished_at_ms,received_at_ms:trending.received_at_ms,fetched_at_ms:trending.fetched_at_ms}:null,description:str(reason?.description)??null}:{};
+ return {key,chain:chain as ProjectSignal['chain'],ca:normalized,source:source as ProjectSignal['source'],time,identity:{id:detail??null,source,chain,ca:normalized,signalName:str(data.signal_name,data.signalName)??null,...evidence}};
 }
 export function parseMarketTrade(input:unknown,expected:{chain:string;ca:string;pairId:string}):MarketTrade|undefined{
  const root=decode(input);if(!root)return;

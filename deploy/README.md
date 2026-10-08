@@ -28,7 +28,11 @@ apps/web/public/charting_library/
 管理员口令哈希可在受控终端生成，原文不得写入仓库或部署日志；只保存哈希到 Secret。服务器密钥配置与公网 HTTPS 均未随本次代码提交自动开通。
 # 按信号来源隔离的模拟盘实验
 
-`live_runs.signal_source` 将模拟盘任务限制为一个 MemeInfo 来源。旧任务保持 `all` 兼容行为；新建页面要求明确选择来源。ROBIN `1m-E0345` 和 BSC `30s-E0119` 的两个来源分别创建暂停任务，不混合样本，不代表实盘稳定盈利。上线并核对策略版本后，显式运行：
+`live_runs.signal_sources` 保存任务明确选择的来源集合，`signal_source` 仅为兼容摘要。迁移 017 将旧 `all` 固定为原两类（扩大信号、Top Cluster 首买），不会因新增来源自动扩大旧任务。支持 `fomo_trending_new_project`（FOMO 新上榜项目）；模拟盘支持 SOL/BSC/ROBIN，实盘仍仅 SOL/BSC 且保持管理员与全局开关保护。多选任意子集，历史 CA 的入组来源和持仓不会因配置更新被改写。
+
+Trending 沿用现有外部信号 WS，使用 `trigger_time_ms` 入场门禁，不使用榜单完成时间替代；保留排名、榜单时间及原因摘要。倍数通知不作为新入组信号。仅接收任务启动后的新触发，不回放旧信号；沿用市值准入、容量及行情预热门槛。
+
+ROBIN `1m-E0345` 和 BSC `30s-E0119` 的旧实验脚本仍按来源分别创建暂停任务，不混合样本，不代表实盘稳定盈利。上线并核对策略版本后，显式运行：
 
 ```sh
 node scripts/seed-profitable-paper-runs.mjs --api=https://YOUR_HOST/api

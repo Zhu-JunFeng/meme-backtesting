@@ -1,5 +1,5 @@
 import {liveSignalSources} from '@meme/domain';
-export const signalSourceOptions=[{label:'FOMO 新项目（扩大信号）',value:'fomo_new_project_expanded'},{label:'Top Cluster 首次买入',value:'top_cluster_first_buy'}];
+export const signalSourceOptions=[{label:'FOMO 新项目（扩大信号）',value:'fomo_new_project_expanded'},{label:'Top Cluster 首次买入',value:'top_cluster_first_buy'},{label:'FOMO 新上榜项目（fomo_trending_new_project）',value:'fomo_trending_new_project'}];
 export const sourceText=(value:string)=>signalSourceOptions.find(x=>x.value===value)?.label??(value==='all'?'全部来源':'未知来源');
 export const runSourceText=(run:any)=>(run.signalSources??liveSignalSources(run.signal_source)).map(sourceText).join('、');
 export const activeWatch=(w:any)=>['monitoring','recovering','pending_eviction'].includes(w.status);

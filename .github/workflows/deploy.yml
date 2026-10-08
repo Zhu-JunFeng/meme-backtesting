@@ -39,6 +39,7 @@ jobs:
       - run: pnpm --filter @meme/domain build
       - run: pnpm --filter @meme/engine build
       - run: pnpm test:research
+      - run: node --test scripts/tri-chain-holdout-leader.test.mjs
       - run: python3 scripts/test_signal_entry_manifest.py
       - run: python3 scripts/test_token_signal_manifest.py
       - run: python3 .agents/skills/meme-kline-import/scripts/test_import_meme_klines.py

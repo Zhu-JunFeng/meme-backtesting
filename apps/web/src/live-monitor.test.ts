@@ -21,5 +21,6 @@ describe('live monitoring presentation',()=>{
   expect(runSourceText({signal_source:'all'})).toBe('FOMO 新项目（扩大信号）、Top Cluster 首次买入');
   expect(runSourceText({signalSources:['top_cluster_first_buy']})).toBe('Top Cluster 首次买入');
   expect(sourceText('unknown')).toBe('未知来源');
+  expect(runSourceText({signal_source:'all',signalSources:['top_cluster_first_buy','fomo_trending_new_project']})).toBe('Top Cluster 首次买入、FOMO 新上榜项目（fomo_trending_new_project）');
  });
 });

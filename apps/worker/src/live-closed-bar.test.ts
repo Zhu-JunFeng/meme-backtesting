@@ -36,7 +36,7 @@ const url=process.env.TEST_DATABASE_URL;
   pool=new Pool({connectionString:url,options:`-c search_path=${schema},public`});
   await pool.query('CREATE TABLE backtest_strategy_versions(id uuid PRIMARY KEY DEFAULT gen_random_uuid())');
   version=(await pool.query('INSERT INTO backtest_strategy_versions DEFAULT VALUES RETURNING id')).rows[0].id;
-  for(const name of ['010_live_trading','011_live_signal_sources','012_live_watch_dex','013_live_recovery_capacity','014_live_portfolio','015_live_closed_bar','016_live_market_protocol'])
+  for(const name of ['010_live_trading','011_live_signal_sources','012_live_watch_dex','013_live_recovery_capacity','014_live_portfolio','015_live_closed_bar','016_live_market_protocol','017_live_signal_selections'])
    await pool.query(readFileSync(new URL(`../../api/migrations/${name}.sql`,import.meta.url),'utf8').replaceAll('public.',`${schema}.`));
   await pool.query(`CREATE TABLE meme_kline(chain text,ca text,pair_id text,interval text,open_time bigint,close_time bigint,open numeric,high numeric,low numeric,close numeric,volume numeric,trade_count bigint,type text,source text,raw_data jsonb,valid boolean,UNIQUE(chain,pair_id,interval,open_time,type))`);
  },20_000);
@@ -56,6 +56,18 @@ const url=process.env.TEST_DATABASE_URL;
   };
   return {run,service,add};
  }
+ it('migrates legacy all to two explicit sources, keeps new subsets, and is repeatable',async()=>{
+  const {run}=await fixture('paper','price',123);
+  const sql=readFileSync(new URL('../../api/migrations/017_live_signal_selections.sql',import.meta.url),'utf8').replaceAll('public.',`${schema}.`);
+  await pool.query(sql);
+  let stored=(await pool.query('SELECT * FROM live_runs WHERE id=$1',[run.id])).rows[0];
+  expect(stored.signal_sources).toEqual(['fomo_new_project_expanded','top_cluster_first_buy']);expect(stored.cash).toBe('123');expect(stored.strategy_json).toEqual(strategy);
+  await pool.query('UPDATE live_runs SET signal_sources=$2 WHERE id=$1',[run.id,['top_cluster_first_buy','fomo_trending_new_project']]);
+  await pool.query(sql);
+  stored=(await pool.query('SELECT * FROM live_runs WHERE id=$1',[run.id])).rows[0];expect(stored.signal_sources).toEqual(['top_cluster_first_buy','fomo_trending_new_project']);
+  await expect(pool.query('UPDATE live_runs SET signal_sources=$2 WHERE id=$1',[run.id,[]])).rejects.toThrow();
+  await expect(pool.query('UPDATE live_runs SET signal_sources=$2 WHERE id=$1',[run.id,['unknown']])).rejects.toThrow();
+ });
  it('imports history with exact decimals, retains authoritative conflicts, and never emits historical orders',async()=>{
   const {run,service,add}=await fixture('paper','mcap');const ctx=await add('history');ctx.evaluator.state.position!.lockPrice=10500;ctx.evaluator.state.position!.lockTier=1;
   const before=structuredClone(ctx.evaluator.state.position),time=210000;

@@ -17,6 +17,13 @@ describe('source-isolated paper runs',()=>{
   for(const source of ['top_cluster_first_buy','fomo_new_project_expanded'] as const)
    expect(acceptsNewSignal({signal_source:'all',started_at:new Date(1000)},{...signal,source})).toBe(true);
  });
+ it('requires an explicit trending opt-in and honors exact subsets',()=>{
+  const trending={...signal,source:'fomo_trending_new_project' as const};
+  expect(acceptsNewSignal({signal_source:'all',started_at:new Date(1000)},trending)).toBe(false);
+  const run={signal_source:'all',signal_sources:['top_cluster_first_buy','fomo_trending_new_project'],started_at:new Date(1000)};
+  expect(acceptsNewSignal(run,trending)).toBe(true);
+  expect(acceptsNewSignal(run,{...signal,source:'fomo_new_project_expanded'})).toBe(false);
+ });
 });
 describe('recovery windows',()=>{
  it('keeps every fetch at or below five thousand candles with no overlap',()=>{

@@ -1,6 +1,15 @@
 import {describe,it,expect} from 'vitest';
 import {parseMarketTrade,parseMarketTrades,parseProjectSignal,resolveLivePool} from './live-input.js';
 describe('external realtime data validation',()=>{
+ it('maps trending triggers on three supported chains, retaining evidence and skipping multiples',()=>{
+  const input={type:'signal_triggered',signal_code:'fomo_trending_new_project',trigger_time_ms:1791369003000,detail_id:'80',reached_multiple:null,trending:{rank:8,finished_at_ms:1791369000000,received_at_ms:1791369001000,fetched_at_ms:1791369002000},reason:{description:'首次上榜第8'}};
+  for(const chain of ['bsc','robin','sol']){
+   const message={...input,chain,ca:chain==='sol'?'UpBBfyC75u3kxDGWmmmW2yauk9YY3CqZhdt1KUDkids':'0x'+'A'.repeat(40)};
+   expect(parseProjectSignal(message)).toMatchObject({key:'80',chain,source:'fomo_trending_new_project',time:input.trigger_time_ms,identity:{trending:input.trending,description:'首次上榜第8'}});
+   expect(parseProjectSignal({...message,reached_multiple:150})).toBeUndefined();
+  }
+  expect(parseProjectSignal({...input,chain:'eth',ca:'0x'+'a'.repeat(40)})).toBeUndefined();
+ });
  it('accepts only allowed chain and source with millisecond times',()=>{
   const data={data:{chain:'BSC',token_address:'0x'+'A'.repeat(40),signal_source:'fomo_new_project_expanded',signal_time:1_780_000_000_123,id:'abc'}};
   expect(parseProjectSignal(data)).toMatchObject({chain:'bsc',ca:'0x'+'a'.repeat(40),time:1_780_000_000_123});

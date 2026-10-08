@@ -8,6 +8,7 @@ import WebSocket from 'ws';
 import type {Pool,PoolClient} from 'pg';
 import {LiveCandleAggregator,LiveEvaluator,detectImpulse,validCandle,type ClosedMarketBar,type LiveDecision,type MarketTrade} from '@meme/engine';
 import type {Candle,StrategyConfig} from '@meme/domain';
+import {selectedLiveSources} from '@meme/domain';
 import {parseProjectSignal,type ProjectSignal} from './live-input.js';
 
 type Run={id:string;mode:'paper'|'live';chain:string;signal_source:string;interval:'30s'|'1m';value_type:'price'|'mcap';status:string;execution_hold_reason:string|null;strategy_json:StrategyConfig;cash:string;realized_pnl:string;wallet_address:string|null;risk_json:any;started_at:Date;execution_version:string;execution_switched_at:Date|null};
@@ -42,8 +43,8 @@ export function localWarmupBars(config:StrategyConfig):number{
  const impulse=config.impulseCondition;
  return Math.max(impulse.lookbackBars+impulse.leftBars+impulse.rightBars+1,...periods.map(period=>period+2),1);
 }
-export const acceptsNewSignal=(run:{signal_source:string;started_at:Date|string},signal:ProjectSignal)=>
- (run.signal_source==='all'||run.signal_source===signal.source)&&signal.time>new Date(run.started_at).getTime();
+export const acceptsNewSignal=(run:{signal_source:string;signal_sources?:string[]|null;started_at:Date|string},signal:ProjectSignal)=>
+ selectedLiveSources(run).includes(signal.source)&&signal.time>new Date(run.started_at).getTime();
 const redact=(error:unknown)=>String(error).replace(/Bearer\s+[^\s]+/gi,'Bearer [redacted]').slice(0,300);
 const wait=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
 
@@ -246,7 +247,7 @@ export class LiveService {
  }
  private async onSignal(signal:ProjectSignal){
   if(!this.feedHealthy||signal.time>Date.now()+5_000)return;
-  const runs=(await this.pool.query("SELECT id,signal_source,started_at FROM live_runs WHERE status='running' AND chain=$1 AND started_at IS NOT NULL AND signal_source IN ('all',$2)",[signal.chain,signal.source])).rows;
+  const runs=(await this.pool.query("SELECT id,signal_source,signal_sources,started_at FROM live_runs WHERE status='running' AND chain=$1 AND started_at IS NOT NULL AND $2=ANY(COALESCE(signal_sources,CASE WHEN signal_source='all' THEN ARRAY['fomo_new_project_expanded','top_cluster_first_buy'] ELSE ARRAY[signal_source] END))",[signal.chain,signal.source])).rows;
   const relevant=runs.filter(r=>acceptsNewSignal(r,signal));
   if(!relevant.length)return;
   const capacities=(await this.pool.query(`SELECT r.id,COUNT(w.*) FILTER(WHERE w.status IN ('monitoring','recovering','pending_eviction'))::int AS active,
@@ -273,7 +274,7 @@ export class LiveService {
   const c=await this.pool.connect();
   try{await c.query('BEGIN');
    // Serialize admissions per run; concurrent signals cannot each claim the last slot.
-   const admitted=(await c.query("SELECT id,signal_source,started_at,status FROM live_runs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",[relevant.map(r=>r.id)])).rows.filter(r=>r.status==='running'&&acceptsNewSignal(r,signal));
+   const admitted=(await c.query("SELECT id,signal_source,signal_sources,started_at,status FROM live_runs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",[relevant.map(r=>r.id)])).rows.filter(r=>r.status==='running'&&acceptsNewSignal(r,signal));
    await c.query(`INSERT INTO token_signal_events(chain,ca,signal_source,detail_id,signal_time,source_signal,provenance)
     VALUES($1,$2,$3,$4,$5,$6,'[]') ON CONFLICT(chain,ca,signal_source,detail_id) DO NOTHING`,[signal.chain,signal.ca,signal.source,signal.key,signal.time,JSON.stringify(signal.identity)]);
    await c.query(`INSERT INTO token_info(chain,ca,pair,signal_source,source_signal,signal_time) VALUES($1,$2,$3,$4,$5,$6)

@@ -1,8 +1,8 @@
-/** Explicit UI/API selections; legacy storage uses `all` for the two supported sources. */
-export const LIVE_SIGNAL_SOURCES = ['fomo_new_project_expanded', 'top_cluster_first_buy'] as const;
+/** Legacy `all` permanently means the original two sources, never future opt-ins. */
+export const LIVE_SIGNAL_SOURCES = ['fomo_new_project_expanded', 'top_cluster_first_buy', 'fomo_trending_new_project'] as const;
 export type LiveSignalSourceCode = typeof LIVE_SIGNAL_SOURCES[number];
 export function liveSignalSources(legacy: string): LiveSignalSourceCode[] {
-  if (legacy === 'all') return [...LIVE_SIGNAL_SOURCES];
+  if (legacy === 'all') return ['fomo_new_project_expanded', 'top_cluster_first_buy'];
   return LIVE_SIGNAL_SOURCES.filter(source => source === legacy);
 }
 export function normalizeLiveSources(values: unknown): LiveSignalSourceCode[] {
@@ -12,5 +12,9 @@ export function normalizeLiveSources(values: unknown): LiveSignalSourceCode[] {
 }
 export function legacyLiveSource(values: unknown): string {
   const sources = normalizeLiveSources(values);
-  return sources.length === LIVE_SIGNAL_SOURCES.length ? 'all' : sources[0];
+  return sources.length > 1 ? 'all' : sources[0];
+}
+/** Nullable array allows old API instances to finish requests during rolling deployment. */
+export function selectedLiveSources(run:{signal_source:string;signal_sources?:string[]|null}):LiveSignalSourceCode[]{
+ return run.signal_sources==null?liveSignalSources(run.signal_source):normalizeLiveSources(run.signal_sources);
 }

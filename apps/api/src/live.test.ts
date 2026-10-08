@@ -1,6 +1,6 @@
 import {afterEach,describe,expect,it,vi} from 'vitest';
 import {randomBytes,scryptSync} from 'node:crypto';
-import {LiveController,requireLiveAdmin,validateRisk,validLiveSignalSource,resolveSignalSource} from './live.js';
+import {LiveController,requireLiveAdmin,validateRisk,validLiveSignalSource,resolveSignalSource,resolveSignalSources} from './live.js';
 import {liveSignalSources} from '@meme/domain';
 
 const previousHash=process.env.LIVE_ADMIN_PASSWORD_HASH;
@@ -24,7 +24,7 @@ describe('live order safety boundaries',()=>{
   const controller=new LiveController();
   const query=vi.spyOn((controller as any).pool,'query').mockResolvedValueOnce({rows:[{mode:'paper'}]}).mockResolvedValueOnce({rowCount:1,rows:[{id:'r',mode:'paper',signal_source:'all',wallet_address:null}]});
   expect(await controller.sources('r',{signalSources:['top_cluster_first_buy','fomo_new_project_expanded']},'',{})).toMatchObject({id:'r',signalSources:['fomo_new_project_expanded','top_cluster_first_buy']});
-  expect(query.mock.calls[1]).toEqual([expect.stringContaining("status IN ('paused','running')"),['r','all']]);
+  expect(query.mock.calls[1]).toEqual([expect.stringContaining("status IN ('paused','running')"),['r','all',['fomo_new_project_expanded','top_cluster_first_buy']]]);
   expect(query.mock.calls.every(call=>!String(call[0]).includes('live_watches'))).toBe(true);
   await controller.onModuleDestroy();
  });
@@ -44,6 +44,18 @@ describe('live order safety boundaries',()=>{
   expect(validLiveSignalSource('all')).toBe(true);
   expect(validLiveSignalSource('fomo_new_project')).toBe(false);
   expect(validLiveSignalSource(['all'])).toBe(false);
+  expect(validLiveSignalSource('fomo_trending_new_project')).toBe(true);
+ });
+ it('persists arbitrary subsets without expanding old all tasks',()=>{
+  expect(resolveSignalSources({signalSource:'all'})).toEqual(['fomo_new_project_expanded','top_cluster_first_buy']);
+  expect(resolveSignalSources({signalSources:['fomo_trending_new_project','top_cluster_first_buy']})).toEqual(['top_cluster_first_buy','fomo_trending_new_project']);
+  expect(()=>resolveSignalSources({signalSource:'all',signalSources:['top_cluster_first_buy','fomo_trending_new_project']})).toThrow();
+ });
+ it('returns and writes the exact multi-selection, not the legacy all summary',async()=>{
+  const c=new LiveController(),sources=['top_cluster_first_buy','fomo_trending_new_project'];
+  const q=vi.spyOn((c as any).pool,'query').mockResolvedValueOnce({rows:[{mode:'paper'}]}).mockResolvedValueOnce({rowCount:1,rows:[{mode:'paper',signal_source:'all',signal_sources:sources}]});
+  expect(await c.sources('r',{signalSources:[...sources].reverse()},'',{})).toMatchObject({signalSources:sources});
+  expect(q.mock.calls[1][1]).toEqual(['r','all',sources]);await c.onModuleDestroy();
  });
  it('requires an administrator secret and HTTPS in production',()=>{
   const salt=randomBytes(16).toString('hex');
