@@ -9,6 +9,9 @@ import { eventLabels as labels, duration, formatNumber as fmt, preciseValue } fr
 import ResultValue from './ResultValue.vue';
 import ExitReason from './ExitReason.vue';
 import { invalidationLabels } from '../format';
+import ProjectIdentity from './ProjectIdentity.vue';
+import {provideProjectDirectory} from '../composables/useProjectDirectory';
+provideProjectDirectory();
 const props=defineProps<{runId:string}>();defineEmits(["back"]);
 const run=ref<any>(),report=ref<any>(),summary=ref<any>(),rows=ref<any[]>([]),equity=ref<any[]>([]);
 const includeEnd=ref(false),analytics=ref<any>(),refreshing=ref(false);
@@ -138,10 +141,10 @@ onBeforeUnmount(()=>{filterEpoch++;loadEpoch++;epoch++;caEpoch++;poolEpoch++;loc
    </template>
 <p class="help" role="status">下方交易筛选：{{selectedSignals.length?selectedSignals.map(s=>labels[s]).join('、'):'全部'}}。按任一信号匹配整笔交易；顶部统计不随标签筛选变化。</p>   <div class="toolbar"><h3>CA 汇总{{selectedSignals.length?' · 筛选结果':''}}</h3><a-input-search v-model:value="search" :disabled="lowerBusy" placeholder="搜索 CA" @search="page=1;loadCas()" /><a-select v-model:value="sort" :disabled="lowerBusy" :options="[{value:'pnl_desc',label:'已实现盈亏降序'},{value:'pnl_asc',label:'已实现盈亏升序'}]" /></div>
    <a-table :loading="lowerBusy" :data-source="rows" :row-key="(r:any)=>r.chain+':'+r.ca" size="small" :scroll="{x:800}" :pagination="{disabled:lowerBusy,current:page,pageSize:20,total,showSizeChanger:false,onChange:(p:number)=>{page=p;loadCas()}}" :columns="[{title:'链',dataIndex:'chain'},{title:'CA',key:'ca'},{title:'池数',dataIndex:'poolCount'},{title:'已平仓次数',dataIndex:'trades'},{title:'已实现净盈亏',key:'realizedPnl'},{title:'浮动净盈亏',key:'unrealizedPnl'}]">
-    <template #bodyCell="{column,record}"><a-button v-if="column.key==='ca'" type="link" class="address" :disabled="lowerBusy" @click="openCa(record)">{{record.ca}}</a-button><template v-else-if="['realizedPnl','unrealizedPnl'].includes(column.key)"><ResultValue :value="record[column.key]" /></template></template>
+    <template #bodyCell="{column,record}"><ProjectIdentity v-if="column.key==='ca'" :chain="record.chain" :ca="record.ca" selectable :disabled="lowerBusy" @select="openCa(record)" /><template v-else-if="['realizedPnl','unrealizedPnl'].includes(column.key)"><ResultValue :value="record[column.key]" /></template></template>
    </a-table>
    <section v-if="ca" class="ca-detail">
-    <header><h3>{{ca.chain}} · {{ca.ca}}</h3><a-button @click="ca=undefined;pairId=undefined;caEpoch++">收起 CA</a-button></header>
+    <header><ProjectIdentity :chain="ca.chain" :ca="ca.ca" full /><a-button @click="ca=undefined;pairId=undefined;caEpoch++">收起 CA</a-button></header>
     <a-table :data-source="ca.pools" row-key="pairId" size="small" :pagination="false" :scroll="{x:800}" :columns="[{title:'交易池',key:'pair'},{title:'状态',key:'state'},{title:'已平仓次数',dataIndex:'trades'},{title:'已实现净盈亏',key:'realizedPnl'},{title:'浮动净盈亏',key:'unrealizedPnl'},{title:'总成本（含滑点/税）',key:'fees'}]">
      <template #bodyCell="{column,record}"><a-button v-if="column.key==='pair'" class="address" type="link" :disabled="lowerBusy" @click="pairId=record.pairId">{{record.pairId}}</a-button><template v-else-if="column.key==='state'">{{record.noData===true?'无数据':record.noData===null?'历史范围':'可回测'}}</template><template v-else-if="['realizedPnl','unrealizedPnl'].includes(column.key)"><ResultValue :value="record[column.key]" /></template><template v-else-if="column.key==='fees'">{{fmt(record.fees)}}</template></template>
     </a-table>

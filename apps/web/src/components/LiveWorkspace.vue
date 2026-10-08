@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {computed,nextTick,onBeforeUnmount,onMounted,ref,watch} from 'vue';
+import {computed,h,nextTick,onBeforeUnmount,onMounted,ref,watch} from 'vue';
 import {message,Modal} from 'ant-design-vue';
 import {api} from '../api';
 import {beijingTime} from '../time';
@@ -8,6 +8,10 @@ import TradingViewChart from './TradingViewChart.vue';
 import LivePortfolio from './LivePortfolio.vue';
 import {liveSignalSources} from '@meme/domain';
 import {signalSourceOptions as signalSources,sourceText as signalSourceText,runSourceText,monitoringRows} from '../live-monitor';
+import ProjectIdentity from './ProjectIdentity.vue';
+import {provideProjectDirectory} from '../composables/useProjectDirectory';
+import {shortCa} from '../project-identity';
+const projectDirectory=provideProjectDirectory();
 
 const props=defineProps<{mode:'paper'|'live'}>();
 const templates=ref<any[]>([]),versions=ref<any[]>([]),runs=ref<any[]>([]),detail=ref<any>();
@@ -32,7 +36,9 @@ const current=computed(()=>runs.value.find(r=>r.id===selectedRunId.value));
 const secureAdminContext=window.location.protocol==='https:'||['localhost','127.0.0.1'].includes(window.location.hostname);
 const chosenWatch=computed(()=>detail.value?.watches?.find((w:any)=>`${w.chain}:${w.ca}:${w.pair_id}`===selectedWatch.value));
 const chartSymbol=computed(()=>selectedWatch.value&&detail.value?`${selectedWatch.value}:${detail.value.run.value_type}`:'');
-const watchOptions=computed(()=>{const options=(detail.value?.watches??[]).map((w:any)=>({value:`${w.chain}:${w.ca}:${w.pair_id}`,label:`${w.chain.toUpperCase()} · ${w.ca} · ${w.pair_id}`}));for(const pair of chartAnchor.value?.pairIds??[]){const [chain,ca]=String(chartAnchor.value.symbol).split(':');const value=`${chain}:${ca}:${pair}`;if(!options.some((o:any)=>o.value===value))options.push({value,label:`${chain.toUpperCase()} · ${ca} · ${pair}（历史交易池）`});}return options;});
+function projectOption(chain:string,ca:string,pair:string,historical=false){return {value:`${chain}:${ca}:${pair}`,label:h('span',{class:'live-project-option'},[h(ProjectIdentity,{chain,ca,compact:true}),h('small',`池 ${shortCa(pair)}${historical?'（历史）':''}`)])};}
+const watchOptions=computed(()=>{const options=(detail.value?.watches??[]).map((w:any)=>projectOption(w.chain,w.ca,w.pair_id));for(const pair of chartAnchor.value?.pairIds??[]){const [chain,ca]=String(chartAnchor.value.symbol).split(':');const value=`${chain}:${ca}:${pair}`;if(!options.some((o:any)=>o.value===value))options.push(projectOption(chain,ca,pair,true));}return options;});
+const filterWatchOption=(input:string,option:any)=>String(option.value).toLowerCase().includes(input.toLowerCase());
 const real=props.mode==='live';let timer:number|undefined,request=0,locateRequest=0;
 function statusText(s:string){return ({paused:'已暂停',running:'运行中',stopped:'已停止'} as Record<string,string>)[s]??s;}
 function statusColor(s:string){return ({paused:'default',running:'green',stopped:'default'} as Record<string,string>)[s]??'default';}
@@ -89,6 +95,7 @@ async function emergency(){
 }
 watch(templateId,()=>void loadVersions().catch(()=>message.error('策略版本加载失败')));
 watch(selectedRunId,async id=>{
+ projectDirectory.clear();
  request++;editingSources.value=false;watchSearch.value='';watchSource.value=undefined;watchPage.value=1;
  locateRequest++;chartAnchor.value=undefined;detail.value=undefined;selectedWatch.value=undefined;
  if(!id)return;
@@ -148,22 +155,24 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
    <p class="live-context">包含补行情和等待平仓后移除的项目；暂停任务保留名单但不执行策略。监控时间为首次加入本任务的时间，不是信号触发时间。来源为入组信号，修改任务来源不改写已有 CA 的来源。</p>
    <div class="live-monitor-tools"><a-input v-model:value="watchSearch" allow-clear placeholder="搜索 CA / 交易池" aria-label="搜索监控 CA" /><a-select v-model:value="watchSource" allow-clear :options="signalSources" placeholder="全部入组信号" aria-label="筛选入组信号" /><a-select v-model:value="watchSort" :options="[{label:'监控时间：新到旧',value:'desc'},{label:'监控时间：旧到新',value:'asc'}]" aria-label="监控时间排序" /></div>
    <a-table :data-source="monitored" :row-key="(w:any)=>`${w.chain}:${w.ca}`" size="small" :scroll="{x:1100}" :pagination="{current:watchPage,pageSize:10,showSizeChanger:false,onChange:(page:number)=>watchPage=page,showTotal:(n:number)=>`共 ${n} 个 CA`}" :locale="{emptyText:'暂无符合条件的监控 CA；等待所选来源的新信号通过准入。'}" :columns="[{title:'CA / 交易池',key:'ca',width:270},{title:'入组信号',key:'source',width:190},{title:'首次监控时间',key:'time',width:180},{title:'信号触发时间',key:'signalTime',width:180},{title:'状态 / 原因',key:'status',width:230},{title:'操作',key:'action',width:90}]">
-    <template #bodyCell="{column,record}"><template v-if="column.key==='ca'"><strong>{{record.chain.toUpperCase()}}</strong><span class="live-address">{{record.ca}}</span><small class="live-pair">池：{{record.pair_id}}</small></template><template v-else-if="column.key==='source'"><a-tag>{{signalSourceText(record.signal_source)}}</a-tag></template><template v-else-if="column.key==='time'">{{beijingTime(record.created_at)}}</template><template v-else-if="column.key==='signalTime'">{{beijingTime(record.signal_time,true)}}</template><template v-else-if="column.key==='status'"><a-tag :color="record.status==='monitoring'?'green':'orange'">{{watchText(record.status)}}</a-tag><p class="live-context">{{record.recovery_reason||'—'}}</p></template><template v-else-if="column.key==='action'"><a-button size="small" @click="selectPair(`${record.chain}:${record.ca}:${record.pair_id}`)">查看 K 线</a-button></template></template>
+    <template #bodyCell="{column,record}"><template v-if="column.key==='ca'"><ProjectIdentity :chain="record.chain" :ca="record.ca" /><small class="live-pair">池：{{record.pair_id}}</small></template><template v-else-if="column.key==='source'"><a-tag>{{signalSourceText(record.signal_source)}}</a-tag></template><template v-else-if="column.key==='time'">{{beijingTime(record.created_at)}}</template><template v-else-if="column.key==='signalTime'">{{beijingTime(record.signal_time,true)}}</template><template v-else-if="column.key==='status'"><a-tag :color="record.status==='monitoring'?'green':'orange'">{{watchText(record.status)}}</a-tag><p class="live-context">{{record.recovery_reason||'—'}}</p></template><template v-else-if="column.key==='action'"><a-button size="small" @click="selectPair(`${record.chain}:${record.ca}:${record.pair_id}`)">查看 K 线</a-button></template></template>
    </a-table>
   </section>
   <a-empty v-if="!detail.watches.length&&!chartAnchor" description="等待符合来源与链筛选的新信号；历史信号不会追加入场。" />
-  <template v-else><div ref="chartElement" class="live-watch-picker"><label for="live-watch">项目 / 主池</label><a-select id="live-watch" :value="selectedWatch" show-search option-filter-prop="label" :options="watchOptions" @change="selectPair" /><a-button @click="chartEpoch++">刷新 K 线</a-button></div>
+  <template v-else><div ref="chartElement" class="live-watch-picker"><label for="live-watch">项目 / 主池</label><a-select id="live-watch" :value="selectedWatch" show-search :filter-option="filterWatchOption" :options="watchOptions" @change="selectPair" /><a-button @click="chartEpoch++">刷新 K 线</a-button></div>
+   <ProjectIdentity v-if="selectedWatch" :chain="selectedWatch.split(':')[0]" :ca="selectedWatch.split(':')[1]" full />
    <p v-if="locating" class="live-context">正在定位原始 K 线与成交点位…</p><p v-if="chartAnchor?.pairIds?.length>1" class="live-context">该笔持仓涉及 {{chartAnchor.pairIds.length}} 个交易池；当前仅绘制所选交易池的行情和点位，不拼接不同池 K 线。</p><p v-if="chartAnchor?.decision" class="live-context">当前定位的是{{chartAnchor.decision.status==='filled'?'成交':'未成交'}}决策；决策标记不代表实际成交。</p>
    <p v-if="chosenWatch" class="live-context">首次监控 {{beijingTime(chosenWatch.created_at)}} · 信号触发 {{beijingTime(chosenWatch.signal_time,true)}} · {{signalSourceText(chosenWatch.signal_source)}} · {{watchText(chosenWatch.status)}} · 市值 {{chosenWatch.current_mcap==null?'未知':formatNumber(chosenWatch.current_mcap)}} USD <span v-if="chosenWatch.recovery_reason">· {{chosenWatch.recovery_reason}}</span></p>
    <TradingViewChart v-if="chartSymbol" :key="`${chartSymbol}:${chartEpoch}`" :symbol="chartSymbol" :interval="detail.run.interval" :live-run-id="detail.run.id" :anchor="chartAnchor" />
   </template>
   <LivePortfolio :key="detail.run.id" :run-id="detail.run.id" :value-type="detail.run.value_type" @select-position="id=>locate('positionId',id)" @select-signal="id=>locate('orderId',id)" />
-  <a-divider orientation="left">运行事件</a-divider><a-empty v-if="!detail.events.length" description="暂无运行事件" /><ol v-else class="live-event-list"><li v-for="(e,i) in detail.events" :key="i"><time>{{beijingTime(e.event_time,true)}}</time><strong>{{eventText(e.kind)}}</strong><span>{{e.ca||'系统'}} · {{eventReason(e.payload)}}</span></li></ol>
+  <a-divider orientation="left">运行事件</a-divider><a-empty v-if="!detail.events.length" description="暂无运行事件" /><ol v-else class="live-event-list"><li v-for="(e,i) in detail.events" :key="i"><time>{{beijingTime(e.event_time,true)}}</time><strong>{{eventText(e.kind)}}</strong><ProjectIdentity v-if="e.ca" :chain="e.chain||detail.run.chain" :ca="e.ca" compact /><span v-else>系统</span><span>{{eventReason(e.payload)}}</span></li></ol>
  </section>
 </div>
 </template>
 
 <style scoped>
+.live-watch-picker :deep(.ant-select-selection-item){height:auto!important;line-height:normal!important;padding-block:4px}.live-watch-picker :deep(.ant-select-selector){height:auto!important;min-height:36px}.live-watch-picker :deep(.live-project-option){display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:100%}.live-watch-picker :deep(.live-project-option>small){color:#53635e;font-size:11px}.live-pair{display:block;margin-top:4px}
 .live-workspace,.live-detail,.live-history,.live-create{min-width:0;max-width:100%}
 .live-monitor-list{min-width:0;margin-bottom:20px}.live-monitor-tools,.live-source-editor{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}.live-monitor-tools>*{width:230px;max-width:100%}.live-source-editor .ant-select{flex:1;min-width:240px}.live-source-editor p{width:100%;font-size:12px;color:#53615d}.live-monitor-list :deep(.ant-table-cell){vertical-align:top}.live-monitor-list :deep(.ant-tag){white-space:normal}.live-monitor-list :deep(.ant-table-wrapper){max-width:100%}
 .live-workspace{display:grid;gap:18px}.live-notice{margin-bottom:2px}.live-auth,.live-create,.live-history,.live-detail{background:#fff;border:1px solid #dfe6e3;border-radius:10px;padding:18px}.live-auth{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.live-auth>div{flex:1;min-width:240px}.live-auth strong{font-size:15px}.live-auth p,.live-section-head p{margin:3px 0 0;color:#53615d;font-size:12px}.live-auth .ant-input-password{width:min(280px,100%)}.live-layout{display:grid;grid-template-columns:minmax(290px,390px) minmax(0,1fr);gap:18px;align-items:start}.live-section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px}.live-section-head h2{font-size:16px;margin:0}.live-section-head>span{font-size:12px;color:#53615d}.live-form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.live-form-row>.ant-form-item{min-width:0}.live-create :deep(.ant-input-number){width:100%}.live-run-list{max-height:420px;overflow:auto}.live-run-row{width:100%;display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:12px 8px;background:transparent;border:0;border-bottom:1px solid #e8eeeb;text-align:left;cursor:pointer}.live-run-row:hover,.live-run-row.selected{background:#f1f7f4}.live-run-row:focus-visible{outline:2px solid #176b5b}.live-run-row>span{min-width:0}.live-run-row strong,.live-run-row small{display:block}.live-run-row strong{overflow-wrap:anywhere}.live-run-row small{color:#53615d;margin-top:4px}.live-summary{display:flex;flex-wrap:wrap;gap:8px 24px;padding:13px 0;border-block:1px solid #e8eeeb}.live-summary span{font-size:12px;color:#53615d}.live-summary strong{display:block;font-size:15px;color:#18211f;font-variant-numeric:tabular-nums}.live-summary strong.value-positive{color:#2f7d5b}.live-summary strong.value-negative{color:#c2413b}.live-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:15px}.live-actions span,.live-context{font-size:12px;color:#53615d}.live-watch-picker{display:flex;align-items:center;gap:10px}.live-watch-picker label{white-space:nowrap;font-size:13px}.live-watch-picker .ant-select{flex:1;min-width:0}.live-context{margin:10px 0}.live-address{display:block;max-width:260px;overflow-wrap:anywhere}.live-pair{color:#53615d;overflow-wrap:anywhere}.live-event-list{padding:0;margin:0;list-style:none;max-height:240px;overflow:auto}.live-event-list li{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid #e8eeeb;font-size:12px}.live-event-list time{color:#53615d;white-space:nowrap}.live-event-list strong{min-width:100px}

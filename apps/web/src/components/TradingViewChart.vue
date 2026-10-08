@@ -6,6 +6,7 @@ import { eventLabels as labels, marketValue, changePercent, formatNumber, precis
 import FibAudit from './FibAudit.vue';
 import { partitionMarkers } from '../chartMarkers';
 import {externalBuckets} from '../externalSignals';
+import ProjectIdentity from './ProjectIdentity.vue';
 const props=defineProps<{symbol:string;interval:string;runId?:string;liveRunId?:string;startTime?:number|null;endTime?:number|null;includeEndOfBacktest?:boolean;signalTypes?:string;anchor?:{tradeId?:string;from?:number;to?:number;start?:number;end?:number;empty?:boolean;fib?:any;fibFrom?:number;fibTo?:number}}>();
 const filters=()=>({includeEndOfBacktest:props.includeEndOfBacktest ?? false,signalTypes:props.signalTypes ?? ''});
 const showFib=ref(true),fibView=ref('full'),fib=ref<any>();let fibIds:any[]=[],fibEpoch=0;
@@ -234,7 +235,11 @@ watch(()=>[props.includeEndOfBacktest,props.signalTypes],async()=>{
 watch(showFib,()=>{if(ready)void drawFib(widget.activeChart(),version).catch(()=>{error.value='Fib 绘图失败，请重新加载';});});
 watch(fibView,()=>{if(!ready)return;const a=focused ?? props.anchor;if(!a||a.empty)return;const full=fibView.value==='full'&&a.fib?.status==='available';const from=full?a.fibFrom:a.from,to=full?a.fibTo:a.to;if(from!=null&&to!=null)void widget.activeChart().setVisibleRange({from:from/1000,to:to/1000+(seconds[props.interval]||30)}).catch(()=>{error.value='视野切换失败，请重新加载';});});
 </script>
+<style scoped>
+.chart-project{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:12px 0}.chart-project>span{font-size:12px;color:#53635e}
+</style>
 <template>
+<div class="chart-project"><ProjectIdentity :chain="props.symbol.split(':')[0]" :ca="props.symbol.split(':')[1]" /><span>{{interval}} · {{isMcap?'市值':'价格'}}</span></div>
 <div class="measurement"><a-switch v-model:checked="showExternal" size="small" aria-label="显示外部信号" />显示外部信号 <span>蓝色虚线为监控触发，不是买卖成交；北京时间 UTC+8</span></div>
 <p v-if="externalMissing" class="event-detail">{{externalMissing}} 个可见外部信号对应 K 线缺失或未加载，未在其他 K 线上补画。</p>
 <p v-for="e in externalSelection" :key="e.id" class="event-detail">{{externalText(e)}}</p>

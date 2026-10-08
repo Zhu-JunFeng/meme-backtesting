@@ -3,6 +3,7 @@ import { beijingTime } from "../time";
 import { computed, ref, onMounted } from "vue";
 import { api } from "../api";
 import { caKey, type CaSelection } from "../composables/useCaSelection";
+import ProjectIdentity from './ProjectIdentity.vue';
 const props=defineProps<{selection:CaSelection}>();
 const s=props.selection.state;
 const chains=ref<string[]>([]),chainError=ref("");
@@ -34,7 +35,7 @@ onMounted(loadChains);
   <a-button :disabled="!s.selected.length && !s.chains.length && !s.excluded.length && !s.bulkLoading" @click="selection.clear">清空选择</a-button>
  </div>
  <a-table :data-source="s.rows" :row-key="caKey" size="small" :loading="s.listLoading" :scroll="{x:680}" :row-selection="{selectedRowKeys:selectedKeys,preserveSelectedRowKeys:true,onChange:selection.change,getCheckboxProps:()=>({disabled:selection.blocked.value})}" :pagination="{current:s.page,pageSize:20,total:s.total,showSizeChanger:false,onChange:selection.setPage}" :columns="[{title:'链',dataIndex:'chain',width:65},{title:'合约地址',dataIndex:'ca'},{title:'有效池 / 全部池',key:'pools',width:120},{title:'有效 K 线覆盖范围',key:'range',width:185}]">
-  <template #bodyCell="{column,record}"><template v-if="column.key==='pools'">{{record.availablePoolCount}} / {{record.poolCount}}</template><template v-if="column.key==='range'"><small>{{date(record.minTime)}}<br/>{{date(record.maxTime)}}</small></template><code v-if="column.dataIndex==='ca'">{{record.ca}}</code></template>
+  <template #bodyCell="{column,record}"><template v-if="column.key==='pools'">{{record.availablePoolCount}} / {{record.poolCount}}</template><template v-if="column.key==='range'"><small>{{date(record.minTime)}}<br/>{{date(record.maxTime)}}</small></template><ProjectIdentity v-if="column.dataIndex==='ca'" :chain="record.chain" :ca="record.ca" /></template>
   <template #expandedRowRender="{record}"><div v-for="pair in record.pairIds" :key="pair"><code>{{pair}}</code></div></template>
   <template #emptyText>当前条件下没有有效 K 线，请调整链、周期、类型或时间范围。</template>
  </a-table>

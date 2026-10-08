@@ -128,3 +128,6 @@
  .app-shell .live-summary{grid-template-columns:1fr 1fr}
 }
 @media(max-height:500px) and (orientation:landscape){.app-shell .tv-chart{height:360px}}
+/* Project selector labels also render in Ant Design's portalled dropdown. */
+.live-project-option{display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:100%}
+.live-project-option>small{color:#53635e;font-size:11px}

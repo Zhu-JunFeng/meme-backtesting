@@ -8,6 +8,8 @@ import { useCaSelection } from "../composables/useCaSelection";
 import CaSelector from "./CaSelector.vue";
 import RunDetail from "./RunDetail.vue";
 import RunActions from "./RunActions.vue";
+import {provideProjectDirectory} from '../composables/useProjectDirectory';
+const projectDirectory=provideProjectDirectory();
 
 const templates = ref<any[]>([]);
 const versions = ref<any[]>([]);
@@ -65,6 +67,7 @@ async function create() {
   finally { loading.value = false; }
 }
 function openRun(run:any) { activeRun.value=run; }
+watch(activeRun,()=>projectDirectory.clear());
 
 watch(selectedTemplateId, loadVersions);
 watch(selectedVersionId, loadVersion);

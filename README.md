@@ -33,6 +33,8 @@ pnpm dev:web
 
 ## TradingView Advanced Charts
 
+项目列表和图表区域通过统一组件展示 Logo、Symbol 和缩略 CA，复制与查询始终使用完整地址。`POST /api/projects/lookup` 接收 `{ projects: [{ chain, ca }] }`（每批最多 20 个），代理固定的 MemeInfo lookup 接口。前端最多并发两批，资料仅在当前页面内存中复用；离开页面后清除，不写数据库、Redis 或浏览器持久化存储。加载失败可重试，缺失资料或图片使用占位展示，不阻塞行情和交易记录。
+
 组件来源：`/Users/zhujf/Documents/code/tradingview组件/charting_library-master_0421`。
 
 将其中的 `charting_library/` 目录复制到：

@@ -3,6 +3,7 @@ import {computed,onBeforeUnmount,onMounted,ref,watch} from 'vue';
 import {api} from '../api';
 import {beijingTime} from '../time';
 import {eventLabels,formatNumber,preciseValue,signedValue,valueTone} from '../format';
+import ProjectIdentity from './ProjectIdentity.vue';
 
 const props=defineProps<{runId:string;valueType:'price'|'mcap'}>();
 const emit=defineEmits<{selectPosition:[id:string];selectSignal:[id:string]}>();
@@ -70,10 +71,10 @@ onBeforeUnmount(()=>{epoch++;window.clearInterval(timer);window.clearInterval(cl
    <a-tab-pane key="signals" :tab="`买／卖信号${summary?` (${summary.buySignalCount+summary.sellSignalCount})`:''}`" />
   </a-tabs>
   <a-table class="portfolio-table" :columns="headers" :data-source="items" row-key="id" size="small" :loading="loading" :scroll="{x:tab==='history'?1500:1200}" :pagination="{current:page,pageSize:20,total,showSizeChanger:false,showTotal:(n:number)=>`共 ${n} 条`}" :locale="{emptyText:tab==='current'?'暂无已核实的当前持仓':tab==='history'?'暂无已完成的历史持仓':'暂无买卖决策'}" @change="(p:any)=>page=p.current??1">
-   <template #bodyCell="{column,record}"><a-button v-if="column.key==='locate'" type="link" size="small" @click="tab==='signals'?emit('selectSignal',record.id):emit('selectPosition',record.id)">查看点位</a-button><span v-else :class="cellTone(String(column.key),record)" :title="column.key==='unrealizedPnl'&&record.valuationTime?`行情时间：${beijingTime(record.valuationTime)}`:undefined">{{cell(record,String(column.key))}}</span></template>
+   <template #bodyCell="{column,record}"><ProjectIdentity v-if="column.key==='ca'" :chain="record.chain" :ca="record.ca" /><a-button v-else-if="column.key==='locate'" type="link" size="small" @click="tab==='signals'?emit('selectSignal',record.id):emit('selectPosition',record.id)">查看点位</a-button><span v-else :class="cellTone(String(column.key),record)" :title="column.key==='unrealizedPnl'&&record.valuationTime?`行情时间：${beijingTime(record.valuationTime)}`:undefined">{{cell(record,String(column.key))}}</span></template>
   </a-table>
   <div class="portfolio-mobile" :aria-busy="loading"><a-empty v-if="!items.length&&!loading" :description="tab==='current'?'暂无已核实的当前持仓':tab==='history'?'暂无已完成的历史持仓':'暂无买卖决策'" />
-   <article v-for="row in items" :key="row.id" class="portfolio-mobile-row"><strong class="portfolio-ca">{{row.ca}}</strong><dl><template v-for="column in headers.filter(c=>c.key!=='ca')" :key="column.key"><dt>{{column.title}}</dt><dd v-if="column.key==='locate'"><a-button type="link" size="small" @click="tab==='signals'?emit('selectSignal',row.id):emit('selectPosition',row.id)">查看点位</a-button></dd><dd v-else :class="cellTone(String(column.key),row)">{{cell(row,String(column.key))}}</dd></template></dl></article>
+   <article v-for="row in items" :key="row.id" class="portfolio-mobile-row"><ProjectIdentity :chain="row.chain" :ca="row.ca" /><dl><template v-for="column in headers.filter(c=>c.key!=='ca')" :key="column.key"><dt>{{column.title}}</dt><dd v-if="column.key==='locate'"><a-button type="link" size="small" @click="tab==='signals'?emit('selectSignal',row.id):emit('selectPosition',row.id)">查看点位</a-button></dd><dd v-else :class="cellTone(String(column.key),row)">{{cell(row,String(column.key))}}</dd></template></dl></article>
    <a-pagination v-if="total>20" v-model:current="page" :page-size="20" :total="total" simple />
   </div>
  </section>
