@@ -23,6 +23,15 @@ const loading = ref(false);
 const saving = ref(false);
 const createOpen = ref(false);
 const cloneOpen = ref(false);
+const activeTab=ref('impulse');
+const tabGuides:Record<string,{title:string;description:string}>={
+ impulse:{title:'拉升识别',description:'确定 Swing Low、Swing High 与有效拉升范围。'},
+ entry:{title:'入场条件',description:'组合回撤区间、量能、K 线与指标确认条件。'},
+ invalidation:{title:'信号失效',description:'设置入场前后需要取消或退出的风险信号。'},
+ risk:{title:'止盈止损',description:'统一设置固定退出、持仓时限与多档动态锁盈。'},
+ position:{title:'仓位与加仓',description:'控制每次投入、同时持仓和再次入场。'},
+ cost:{title:'成本模型',description:'这些默认值将随策略版本保存，创建任务时可覆盖。'}
+};
 const dialog = ref({ name: "", description: "" });
 const definitionMap = computed(() => new Map(definitions.value.map(item => [item.code, item])));
 
@@ -154,7 +163,9 @@ onMounted(async () => { definitions.value = (await api.get("/condition-definitio
         <StrategyDescription :description="fullDescription" preview />
         <a-form-item label="新版本补充备注（可选）"><a-textarea v-model:value="notes" :rows="4" :maxlength="20000" show-count placeholder="补充适用场景、验证结论或注意事项；修改备注也将保存为新版本。" /></a-form-item>
         <section class="config-section"><div class="section-copy"><h3>入场时间限制</h3><p>保存到策略版本。创建回测时读取项目最早外部信号，信号前历史仍用于指标预热。</p></div><a-form-item label="仅在信号触发后买入"><a-switch v-model:checked="strategy.entryAfterSignal" /><p>开启时，买入及加仓 K 线开盘必须严格晚于信号时间。缺失信号的 CA 会排除并提示。</p></a-form-item></section>
-        <a-tabs class="strategy-tabs">
+        <div class="strategy-editor-lead"><div><strong>参数配置</strong><p>依次检查六组规则；切换分组不会保存，点击“保存新版本”才会生成不可变版本。</p></div><span>{{activeTab==='impulse'?'1':activeTab==='entry'?'2':activeTab==='invalidation'?'3':activeTab==='risk'?'4':activeTab==='position'?'5':'6'}} / 6</span></div>
+        <a-tabs v-model:activeKey="activeTab" class="strategy-tabs" :animated="false">
+          <template #rightExtra><span class="strategy-tab-count">策略版本 v{{ versions.find(item => item.id===selectedVersionId)?.version }}</span></template>
           <a-tab-pane key="impulse" tab="拉升识别">
             <section class="config-section"><div class="section-copy"><h3>Fractal Pivot</h3><p>{{ definitionMap.get('impulse_fractal_swing')?.description }}</p></div><SchemaFields v-model="strategy.impulseCondition" :schema="definitionMap.get('impulse_fractal_swing')?.parameterSchema" /></section>
           </a-tab-pane>
@@ -205,6 +216,7 @@ onMounted(async () => { definitions.value = (await api.get("/condition-definitio
             <section class="config-section form-grid"><div class="section-copy full"><h3>默认执行成本</h3><p>创建任务时可覆盖这些值，覆盖后的完整配置会写入任务快照。</p></div><a-form-item label="初始资金"><a-input-number v-model:value="strategy.executionConfig.initialCapital" :min="1" style="width:100%" /></a-form-item><a-form-item label="手续费 (%)"><a-input-number v-model:value="strategy.executionConfig.feePercent" :min="0" :step=".1" style="width:100%" /></a-form-item><a-form-item label="滑点 (%)"><a-input-number v-model:value="strategy.executionConfig.slippagePercent" :min="0" :step=".1" style="width:100%" /></a-form-item><a-form-item label="买入税 (%)"><a-input-number v-model:value="strategy.executionConfig.buyTaxPercent" :min="0" :step=".1" style="width:100%" /></a-form-item><a-form-item label="卖出税 (%)"><a-input-number v-model:value="strategy.executionConfig.sellTaxPercent" :min="0" :step=".1" style="width:100%" /></a-form-item><a-form-item label="成交时点"><a-select v-model:value="strategy.executionConfig.fillMode"><a-select-option value="current_bar_close">当前 K 线收盘</a-select-option><a-select-option value="next_bar_open" disabled>下一根开盘（预留）</a-select-option></a-select></a-form-item></section>
           </a-tab-pane>
         </a-tabs>
+        <div class="strategy-tab-foot"><div><strong>{{tabGuides[activeTab]?.title}}</strong><p>{{tabGuides[activeTab]?.description}}</p></div><a-button type="primary" :loading="saving" @click="saveVersion"><SaveOutlined />保存新版本</a-button></div>
       </template>
       <a-empty v-else description="请选择一个策略模板" />
     </a-spin>
@@ -218,4 +230,6 @@ onMounted(async () => { definitions.value = (await api.get("/condition-definitio
 .lock-tier{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
 .add-group > :deep(.ant-switch){align-self:flex-start;min-width:64px}
 .workspace-grid{display:grid;grid-template-columns:240px minmax(0,1fr);gap:18px;align-items:start}.template-panel,.editor-panel{background:#fff;border:1px solid #dfe6e3;border-radius:10px}.template-panel{position:sticky;top:20px;overflow:hidden}.panel-heading{display:flex;align-items:center;justify-content:space-between;padding:18px 16px 12px}.panel-heading h2,.editor-header h1{margin:2px 0 0;color:#18211f}.panel-heading h2{font-size:17px}.eyebrow{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#6a7773;font-weight:700}.template-list{padding:0 8px 10px;display:flex;flex-direction:column;gap:3px}.template-row{border:0;background:transparent;text-align:left;border-radius:7px;padding:11px 10px;cursor:pointer;color:#26312e}.template-row:hover{background:#f4f7f6}.template-row.active{background:#eaf3f0;color:#125548}.template-name{display:block;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.template-meta{display:flex;justify-content:space-between;align-items:center;margin-top:7px;font-size:12px;color:#74817d}.editor-panel{padding:22px;min-height:620px}.editor-header{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:18px}.editor-header h1{font-size:22px}.editor-header p{margin:7px 0 0;color:#66736f;max-width:70ch}.summary-panel,.config-section{margin-top:18px;border:1px solid #dfe6e3;border-radius:9px;padding:18px;background:#fff}.summary-panel{background:#f8faf9}.section-title{display:flex;gap:11px;align-items:flex-start}.section-title h3,.section-copy h3{margin:0;color:#18211f;font-size:16px}.section-title p,.section-copy p,.add-group p{margin:4px 0 0;color:#66736f;font-size:13px}.summary-panel ol{margin:14px 0 0;padding-left:21px;color:#35423e}.summary-panel li+li{margin-top:6px}.strategy-tabs{margin-top:12px}.config-section{margin-top:0;display:flex;flex-direction:column;gap:18px}.section-copy{padding-bottom:14px;border-bottom:1px solid #edf1ef}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 20px}.full{grid-column:1/-1}.add-group{display:flex;flex-direction:column;gap:12px;border-top:1px solid #edf1ef;padding-top:18px}.add-group h4{margin:0}.form-grid :deep(.ant-form-item){margin-bottom:15px}@media(max-width:980px){.workspace-grid{grid-template-columns:1fr}.template-panel{position:static}.template-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.editor-header{flex-direction:column}}@media(max-width:680px){.template-list,.form-grid{grid-template-columns:1fr}.editor-panel{padding:15px}}
+.strategy-editor-lead,.strategy-tab-foot{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:16px 0;border-top:1px solid #e8eeeb}.strategy-editor-lead{margin-top:18px}.strategy-editor-lead strong,.strategy-tab-foot strong{font-size:15px}.strategy-editor-lead p,.strategy-tab-foot p{font-size:12px;color:#53615d;margin:4px 0 0}.strategy-editor-lead>span,.strategy-tab-count{font-size:12px;color:#53615d;white-space:nowrap}.strategy-tabs{max-width:100%}.strategy-tabs :deep(.ant-tabs-content-holder){max-width:100%}.strategy-tabs .config-section{max-width:980px}.strategy-tab-foot{margin-top:16px;border-top:1px solid #e8eeeb}.strategy-tab-foot .ant-btn{flex:none}
+@media(max-width:680px){.strategy-tab-count{display:none}.strategy-tab-foot{align-items:stretch;flex-direction:column}.strategy-tab-foot .ant-btn{width:100%}}
 </style>

@@ -55,6 +55,42 @@ export class LiveController {
    FROM live_runs r WHERE ($1::text IS NULL OR r.mode=$1) ORDER BY r.created_at DESC LIMIT 300`,[mode??null])).rows;
   return rows.map(publicRow);
  }
+ @Get('live-runs/overview') async overview(@Query() q:Record<string,string>){
+  const mode=q.mode;
+  if(mode&&!['paper','live'].includes(mode))throw new BadRequestException('模式无效');
+  const status=q.status??'all';
+  if(!['all','running','paused','stopped'].includes(status))throw new BadRequestException('任务状态无效');
+  const page=Number(q.page??1),pageSize=Number(q.pageSize??12);
+  if(!Number.isInteger(page)||page<1||!Number.isInteger(pageSize)||pageSize<1||pageSize>50)throw new BadRequestException('分页参数无效');
+  const counts=(await this.pool.query(`SELECT COUNT(*)::int AS all,
+   COUNT(*) FILTER (WHERE status='running')::int AS running,
+   COUNT(*) FILTER (WHERE status='paused')::int AS paused,
+   COUNT(*) FILTER (WHERE status='stopped')::int AS stopped
+   FROM live_runs WHERE ($1::text IS NULL OR mode=$1)`,[mode??null])).rows[0];
+  const total=Number(counts[status]??0);
+  const rows=(await this.pool.query(`SELECT r.id,r.name,r.mode,r.chain,r.interval,r.value_type,r.signal_source,r.strategy_version_id,r.strategy_json,r.initial_capital,r.wallet_address,r.risk_json,r.status,r.cash,r.realized_pnl,r.started_at,r.heartbeat_at,r.error_message,r.feed_state,r.feed_reason,r.execution_hold_reason,r.reconnect_count,r.late_trade_count,r.dropped_trade_count,r.last_signal_at,r.last_trade_at,r.created_at,r.updated_at,
+   r.execution_version,r.execution_switched_at,r.market_source,r.market_switched_at,r.market_status,r.signal_sources,
+   (SELECT COUNT(*)::int FROM live_watches w WHERE w.run_id=r.id AND w.status IN ('monitoring','recovering','pending_eviction')) AS active_ca_count
+   FROM live_runs r WHERE ($1::text IS NULL OR r.mode=$1) AND ($2::text='all' OR r.status=$2)
+   ORDER BY r.created_at DESC,r.id DESC LIMIT $3 OFFSET $4`,[mode??null,status,pageSize,(page-1)*pageSize])).rows;
+  if(!rows.length)return {items:[],total,counts,page,pageSize};
+  const ids=rows.map(r=>r.id);
+  const [fills,watches]=await Promise.all([
+   this.pool.query(`SELECT o.run_id,o.id,o.position_id,o.chain,o.ca,o.pair_id,o.side,o.reason,o.decision_time,f.fill_time,f.fill_value,f.fill_price,f.market_cap,f.quantity,f.gross_amount,f.fee,f.slippage_cost,f.tax_cost
+    FROM live_orders o JOIN live_fills f ON f.order_id=o.id WHERE o.run_id=ANY($1::uuid[]) AND o.status='filled' ORDER BY o.run_id,f.fill_time,o.decision_time,o.id`,[ids]),
+   this.pool.query('SELECT run_id,chain,ca,last_trade_at,state_json FROM live_watches WHERE run_id=ANY($1::uuid[])',[ids])
+  ]);
+  const fillsByRun=new Map<string,any[]>(),watchesByRun=new Map<string,any[]>();
+  for(const row of fills.rows){const group=fillsByRun.get(row.run_id)??[];group.push(row);fillsByRun.set(row.run_id,group);}
+  for(const row of watches.rows){const group=watchesByRun.get(row.run_id)??[];group.push(row);watchesByRun.set(row.run_id,group);}
+  const asOf=Date.now();
+  const items=rows.map(row=>{
+   const {strategy_json,...safeRow}=row;
+   const performance=buildLivePortfolio(fillsByRun.get(row.id)??[],watchesByRun.get(row.id)??[],strategy_json,row.value_type,row.interval,asOf).summary;
+   return {...publicRow(safeRow),performance};
+  });
+  return {items,total,counts,page,pageSize};
+ }
  @Post('live-runs') async create(@Body() body:RequestBody,@Headers('x-live-admin-password') password:string,@Req() request:any){
   if(!body || !body.name?.trim() || !['paper','live'].includes(body.mode) || !['sol','bsc','robin'].includes(body.chain) || !['30s','1m'].includes(body.interval)||!['price','mcap'].includes(body.valueType)||!positive(body.initialCapital))throw new BadRequestException('实时任务配置无效');
   const signalSources=resolveSignalSources(body),signalSource=legacyLiveSource(signalSources);

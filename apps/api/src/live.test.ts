@@ -11,6 +11,35 @@ afterEach(()=>{
 });
 
 describe('live order safety boundaries',()=>{
+ it('pages the overview and computes the same closed-trade performance without N+1 queries',async()=>{
+  const controller=new LiveController();
+  const run={id:'00000000-0000-0000-0000-000000000001',name:'策略 A',mode:'paper',chain:'sol',interval:'30s',value_type:'mcap',signal_source:'all',status:'running',strategy_json:{},wallet_address:null,risk_json:null,active_ca_count:2};
+  const fill=(id:string,side:'buy'|'sell',gross:number,time:number)=>({run_id:run.id,id,position_id:'position-1',chain:'sol',ca:'CA',pair_id:'pair',side,reason:side==='buy'?'entry':'take_profit',decision_time:time,fill_time:time,fill_value:100,fill_price:1,market_cap:100,quantity:1,gross_amount:gross,fee:0,slippage_cost:0,tax_cost:0});
+  const query=vi.spyOn((controller as any).pool,'query')
+   .mockResolvedValueOnce({rows:[{all:3,running:1,paused:1,stopped:1}]})
+   .mockResolvedValueOnce({rows:[run]})
+   .mockResolvedValueOnce({rows:[fill('buy','buy',10,1000),fill('sell','sell',15,2000)]})
+   .mockResolvedValueOnce({rows:[]});
+  const result=await controller.overview({mode:'paper',status:'running',page:'1',pageSize:'12'});
+  expect(result).toMatchObject({total:1,counts:{all:3,running:1},items:[{performance:{openCount:0,closedCount:1,winRate:100,realizedPnl:5}}]});
+  expect(result.items[0]).not.toHaveProperty('strategy_json');
+  expect(query).toHaveBeenCalledTimes(4);
+  expect(query.mock.calls[1][1]).toEqual(['paper','running',12,0]);
+  await controller.onModuleDestroy();
+ });
+ it('keeps zero-trade overview rates unavailable and rejects invalid paging',async()=>{
+  const controller=new LiveController();
+  const query=vi.spyOn((controller as any).pool,'query')
+   .mockResolvedValueOnce({rows:[{all:1,running:0,paused:1,stopped:0}]})
+   .mockResolvedValueOnce({rows:[{id:'00000000-0000-0000-0000-000000000002',mode:'paper',interval:'1m',value_type:'price',status:'paused',signal_source:'all',strategy_json:{}}]})
+   .mockResolvedValueOnce({rows:[]}).mockResolvedValueOnce({rows:[]});
+  const result=await controller.overview({mode:'paper',status:'paused'});
+  expect(result.items[0].performance).toMatchObject({closedCount:0,winRate:null,realizedPnl:0});
+  await expect(controller.overview({status:'unknown'})).rejects.toThrow('任务状态无效');
+  await expect(controller.overview({pageSize:'300'})).rejects.toThrow('分页参数无效');
+  expect(query).toHaveBeenCalledTimes(4);
+  await controller.onModuleDestroy();
+ });
  it('normalizes multi-source selections without changing legacy callers',()=>{
   expect(resolveSignalSource({})).toBe('all');
   expect(resolveSignalSource({signalSource:'top_cluster_first_buy'})).toBe('top_cluster_first_buy');

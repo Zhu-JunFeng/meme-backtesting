@@ -109,9 +109,8 @@
  .app-shell .fib-audit summary{padding:10px 0;line-height:1.5}
  .app-shell .fib-audit dl{grid-template-columns:1fr;gap:4px}
  .app-shell .fib-audit dd{margin-bottom:10px}
- .app-shell .live-run-list{max-height:320px}
- .app-shell .live-run-row{min-height:64px;align-items:flex-start}
- .app-shell .live-run-row>.ant-tag{flex-shrink:0;margin-inline-end:0}
+ .app-shell .live-run-list{max-height:none;overflow:visible}
+ .app-shell .live-run-row{min-height:64px}
  .app-shell .live-section-head{align-items:flex-start;flex-wrap:wrap}
  .app-shell .live-section-head>div{min-width:0;overflow-wrap:anywhere}
  .app-shell .live-detail{scroll-margin-top:12px}
