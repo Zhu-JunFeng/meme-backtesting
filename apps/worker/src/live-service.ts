@@ -410,19 +410,21 @@ export class LiveService {
   const step=ctx.run.interval==='30s'?30_000:60_000,to=Math.floor(Date.now()/step)*step;
   const from=ctx.watch.last_candle_time?Number(ctx.watch.last_candle_time)+step:to-600*step;
   void (async()=>{
-   let issue='历史接口未返回当前范围的已收盘 K 线',count=0;
+   let issue='历史接口未返回当前范围的已收盘 K 线',count=0,discarded=0;
    try{
     for(const window of backfillWindows(from,to,step)){
      if(!valid())return;
      const types=ctx.run.value_type==='mcap'?['price','mcap'] as const:['price'] as const;
      const results=await Promise.all(types.map(type=>this.history.get({chain:ctx.watch.chain,pair,interval:ctx.run.interval,type,from:window.from,to:window.to})));
      if(!valid())return;
+     discarded+=results.reduce((sum,result)=>sum+(result.quality?.discarded??0),0);
      const target=results[types.findIndex(type=>type===ctx.run.value_type)]!;count+=target.rows.length;
      await this.queuedRecovery(valid,()=>this.applyHistory(ctx,types.map((type,i)=>({type,result:results[i]})),valid));
     }
     const required=localWarmupBars(ctx.run.strategy_json);
     issue=count===0?'历史接口返回空数据':ctx.evaluator.state.history.length<required?`历史指标预热不足 ${ctx.evaluator.state.history.length}/${required} 根`:'历史尾部未覆盖最近收盘桶';
    }catch(error){issue=redact(error);}
+   if(discarded)issue=`已丢弃 ${discarded} 条非法历史 K 线（各维度合计）；${issue}`;
    await this.queuedRecovery(valid,()=>this.finishRecovery(ctx,issue,valid));
   })().catch(error=>console.error('history recovery:',redact(error))).finally(()=>{if(this.recovering.get(ctx)===token)this.recovering.delete(ctx);});
  }
@@ -432,12 +434,18 @@ export class LiveService {
    await c.query('BEGIN');
    const run=(await c.query('SELECT status FROM live_runs WHERE id=$1 FOR UPDATE',[ctx.run.id])).rows[0];
    if(!valid()||run?.status!=='running'){await c.query('ROLLBACK');return;}
+   for(const {type,result} of series)if(result.quality?.discarded){
+    const key=createHash('sha256').update(JSON.stringify([ctx.run.id,ctx.watch.chain,ctx.watch.pair_id,ctx.run.interval,type,result.quality])).digest('hex');
+    await c.query(`INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload)
+     VALUES($1,$2,$3,$4,'history_candles_discarded',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING`,
+     [ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,`history-discard:${key}`,Date.now(),JSON.stringify({type,interval:ctx.run.interval,retained:result.rows.length,...result.quality,endpoint:result.endpoint,traceId:result.traceId})]);
+   }
    for(const {type,result} of series)for(let i=0;i<result.rows.length;i+=500){
     if(!valid()){await c.query('ROLLBACK');return;}
     await c.query(`INSERT INTO meme_kline(chain,ca,pair_id,interval,open_time,close_time,open,high,low,close,volume,trade_count,type,source,raw_data,valid)
      SELECT $1,$2,$3,$4,x.time,x.time+$5,x.open,x.high,x.low,x.close,x.volume,0,$6,'memeinfo_xxyy',$8::jsonb,true
      FROM jsonb_to_recordset($7::jsonb) AS x(time bigint,open numeric,high numeric,low numeric,close numeric,volume numeric)
-     ON CONFLICT(chain,pair_id,interval,open_time,type) DO NOTHING`,[ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,step,type,JSON.stringify(result.rows.slice(i,i+500)),JSON.stringify({upstream:'xxyy',endpoint:result.endpoint,traceId:result.traceId})]);
+     ON CONFLICT(chain,pair_id,interval,open_time,type) DO NOTHING`,[ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,ctx.run.interval,step,type,JSON.stringify(result.rows.slice(i,i+500)),JSON.stringify({upstream:'xxyy',endpoint:result.endpoint,traceId:result.traceId,quality:result.quality})]);
    }
    const target=series.find(s=>s.type===ctx.run.value_type)!.result.rows;
    const evaluator=new LiveEvaluator(ctx.run.strategy_json,Number(ctx.watch.signal_time),ctx.evaluator.snapshot());

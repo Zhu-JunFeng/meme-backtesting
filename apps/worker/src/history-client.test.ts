@@ -12,8 +12,31 @@ describe('MemeInfo history contract',()=>{
  it('allows an empty successful result without pretending to cover the range',()=>expect(parseHistory(envelope([]),request,'url').rows).toEqual([]));
  it.each([0,200,'0'])('rejects non-contract success code %s',code=>expect(()=>parseHistory({...envelope(),code},request,'url')).toThrow());
  it.each(['chain','pair_address','interval','value_type'])('rejects a mismatched %s',field=>{const data=envelope();(data.data as any)[field]='wrong';expect(()=>parseHistory(data,request,'url')).toThrow('不匹配');});
- it.each([{open:null},{high:'NaN'},{low:'3'},{close:'0'},{volume:'-1'},{start_time:60_001},{high:'1e999'}])('rejects invalid candles %o',change=>expect(()=>parseHistory(envelope([{...row,...change}]),request,'url')).toThrow());
- it('rejects conflicting duplicate timestamps',()=>expect(()=>parseHistory(envelope([row,{...row,close:'1.6'}]),request,'url')).toThrow('冲突'));
+ it.each([{open:null},{high:'NaN'},{low:'3'},{close:'0'},{volume:'-1'},{start_time:60_001},{high:'1e999'},{volume:''},{start_time:null}])('discards invalid candles and retains subsequent valid rows %o',change=>{
+  const result=parseHistory(envelope([{...row,...change},{...row,start_time:120000}]),request,'url');
+  expect(result.rows.map(r=>r.time)).toEqual([120000]);expect(result.quality?.discarded).toBe(1);expect(result.quality?.samples).toHaveLength(1);
+ });
+ it('discards every conflicting copy without choosing an arbitrary value',()=>{
+  const items=[row,row,{...row,close:'1.6'},row,{...row,start_time:120000}];
+  for(const input of [items,[...items].reverse()]){
+   const result=parseHistory(envelope(input),request,'url');expect(result.rows.map(r=>r.time)).toEqual([120000]);expect(result.quality?.discarded).toBe(4);
+  }
+ });
+ it('retains valid neighbours of the production malformed open/high candle in both intervals and dimensions',()=>{
+  for(const interval of ['30s','1m'] as const)for(const type of ['price','mcap'] as const){
+   const step=interval==='30s'?30000:60000,r={...request,interval,type,to:60000+3*step};
+   const result=parseHistory(envelope([row,{...row,start_time:60000+step,open:'702624.8259',high:'599601.3927',low:'599601.3927',close:'599601.3927'},{...row,start_time:60000+2*step}],r),r,'url');
+   expect(result.rows.map(r=>r.time)).toEqual([60000,60000+2*step]);expect(result.quality?.reasons).toEqual({'历史 K 线 OHLC 关系非法':1});
+  }
+ });
+ it('bounds diagnostics and returns no usable data when all rows are invalid',()=>{
+  const result=parseHistory(envelope([null,...Array.from({length:100},()=>({...row,close:'0'}))]),request,'url');
+  expect(result.rows).toEqual([]);expect(result.quality?.discarded).toBe(101);expect(result.quality?.samples).toHaveLength(10);
+ });
+ it('does not retry a successful response containing discarded candles',async()=>{
+  const fetcher=vi.fn(async()=>json(envelope([{...row,low:'3'},{...row,start_time:120000}])));
+  const result=await new HistoryClient('url',fetcher as never).get(request);expect(result.rows).toHaveLength(1);expect(fetcher).toHaveBeenCalledOnce();
+ });
  it('maps exactly seven fields for both resolutions and dimensions',async()=>{
   for(const interval of ['30s','1m'] as const)for(const type of ['price','mcap'] as const){
    const r={...request,interval,type};const fetcher=vi.fn(async(_url:any,_init:any)=>json(envelope([],r)));const client=new HistoryClient('https://history',fetcher as never);

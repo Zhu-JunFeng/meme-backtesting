@@ -2,7 +2,8 @@ import {Decimal} from 'decimal.js';
 
 export type HistoryRequest={chain:string;pair:string;interval:'30s'|'1m';type:'price'|'mcap';from:number;to:number};
 export type HistoryRow={time:number;open:string;high:string;low:string;close:string;volume:string};
-export type HistoryResult={rows:HistoryRow[];traceId?:string;endpoint:string};
+export type HistoryQuality={discarded:number;reasons:Record<string,number>;samples:Array<{time:number|null;reason:string}>};
+export type HistoryResult={rows:HistoryRow[];traceId?:string;endpoint:string;quality?:HistoryQuality};
 export class HistoryError extends Error {
  constructor(message:string,readonly retryable=false,readonly status?:number,readonly code?:string,readonly traceId?:string){
   super(`${message}${status?` · HTTP ${status}`:''}${code?` · code ${code}`:''}${traceId?` · traceId ${traceId}`:''}`);
@@ -14,9 +15,15 @@ export function parseHistory(data:any,request:HistoryRequest,endpoint:string):Hi
  if(data?.success!==true||data?.code!=='200')throw new HistoryError(String(data?.message??'历史补数业务响应失败'),false,undefined,String(data?.code??'unknown'),traceId);
  const d=data.data,step=request.interval==='30s'?30_000:60_000;
  if(d?.chain!==request.chain||d?.pair_address!==request.pair||d?.interval!==request.interval||d?.value_type!==(request.type==='mcap'?'market_cap':'price')||!Array.isArray(d?.items))throw new HistoryError('历史补数响应链／池／周期／维度不匹配',false,undefined,undefined,traceId);
- const rows=new Map<number,HistoryRow>();
+ const rows=new Map<number,HistoryRow>(),conflicts=new Set<number>(),copies=new Map<number,number>();
+ const quality:HistoryQuality={discarded:0,reasons:{},samples:[]};
+ const discard=(time:unknown,reason:string,count=1)=>{
+  quality.discarded+=count;quality.reasons[reason]=(quality.reasons[reason]??0)+count;
+  if(quality.samples.length<10)quality.samples.push({time:Number.isSafeInteger(time)?time as number:null,reason});
+ };
  for(const item of d.items){
   const time=item?.start_time;
+  try{
   if(!Number.isSafeInteger(time)||time<=0||time%step!==0)throw new HistoryError('历史 K 线时间非法',false,undefined,undefined,traceId);
   if(time<request.from||time+step>request.to)continue;
   const values:Record<string,Decimal>={};
@@ -26,13 +33,22 @@ export function parseHistory(data:any,request:HistoryRequest,endpoint:string):Hi
    const v=new Decimal(raw);values[field]=v;
    if(!v.isFinite()||!Number.isFinite(v.toNumber())||(field==='volume'?v.isNegative():v.lte(0)||v.toNumber()<=0))throw new HistoryError(`历史 K 线 ${field} 超出有效范围`,false,undefined,undefined,traceId);
   }
-  if(values.low.gt(Decimal.min(values.open,values.close))||values.high.lt(Decimal.max(values.open,values.close))||values.low.gt(values.high))throw new HistoryError(`历史 K 线 OHLC 关系非法：${new Date(time).toISOString()}，拒绝本窗口`,false,undefined,undefined,traceId);
+  if(values.low.gt(Decimal.min(values.open,values.close))||values.high.lt(Decimal.max(values.open,values.close))||values.low.gt(values.high))throw new HistoryError('历史 K 线 OHLC 关系非法');
   const row={time,open:item.open,high:item.high,low:item.low,close:item.close,volume:item.volume};
+  if(conflicts.has(time)){discard(time,'历史 K 线重复时间数据冲突');continue;}
   const previous=rows.get(time);
-  if(previous&&(['open','high','low','close','volume'] as const).some(k=>!new Decimal(previous[k]).eq(row[k])))throw new HistoryError(`历史 K 线重复时间数据冲突：${time}`,false,undefined,undefined,traceId);
-  rows.set(time,row);
+  if(previous&&(['open','high','low','close','volume'] as const).some(k=>!new Decimal(previous[k]).eq(row[k]))){
+   // Neither conflicting value is authoritative; exclude the whole timestamp, independent of input order.
+   rows.delete(time);conflicts.add(time);discard(time,'历史 K 线重复时间数据冲突',(copies.get(time)??1)+1);continue;
+  }
+  rows.set(time,row);copies.set(time,(copies.get(time)??0)+1);
+  }catch(error){
+   if(!(error instanceof HistoryError))throw error;
+   // Envelope/identity errors still fail above; a bad candle does not poison its valid neighbours.
+   discard(time,error.message.replace(/ · traceId .*$/,''));
+  }
  }
- return {rows:[...rows.values()].sort((a,b)=>a.time-b.time),traceId,endpoint};
+ return {rows:[...rows.values()].sort((a,b)=>a.time-b.time),traceId,endpoint,quality};
 }
 
 /** A worker-wide two-request limiter and single-flight cache; never runs on the live event queue. */

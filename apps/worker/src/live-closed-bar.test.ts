@@ -5,6 +5,7 @@ import {randomUUID} from 'node:crypto';
 import {LiveEvaluator,type ClosedMarketBar} from '@meme/engine';
 import type {StrategyConfig} from '@meme/domain';
 import {LiveService,simulatedBarPrice,LIVE_EXECUTION_VERSION} from './live-service.js';
+import {parseHistory} from './history-client.js';
 
 const strategy:StrategyConfig={schemaVersion:1,entryAfterSignal:true,
  impulseCondition:{type:'impulse_fractal_swing',leftBars:1,rightBars:1,lookbackBars:30,minGainPercent:50,maxDurationBars:20,requireVolumeExpansion:false},
@@ -77,6 +78,19 @@ const url=process.env.TEST_DATABASE_URL;
   const stored=(await pool.query("SELECT * FROM meme_kline WHERE ca='history' AND type='mcap'")).rows[0];expect(stored.open).toBe('12000.0000000000000001');expect(stored.volume).toBe('1.1234567890123456789');expect(stored.source).toBe('memeinfo_xxyy');expect(stored.raw_data.traceId).toBe('trace');
   await service.applyHistory(ctx,[{type:'mcap',result:{...result,rows:result.rows.map(r=>({...r,close:'12000'}))}}],()=>true);
   expect(ctx.evaluator.state.history.at(-1)!.close).toBe(12500);expect((await pool.query('SELECT count(*) n FROM live_orders WHERE run_id=$1',[run.id])).rows[0].n).toBe('0');
+ });
+ it('stores valid history after dropping bad rows, audits once and preserves positions without replaying orders',async()=>{
+  const {run,service,add}=await fixture();const ctx=await add('drop-history'),before=structuredClone(ctx.evaluator.state.position);
+  const request={chain:'sol',pair:'drop-history',interval:'30s' as const,type:'price' as const,from:180000,to:270000};
+  const items=[180000,210000,240000].map(start_time=>({start_time,open:'10',high:'12',low:'9',close:'11',volume:'1'}));items[1].open='20';
+  const result=parseHistory({success:true,code:'200',traceId:'bad-row',data:{chain:'sol',pair_address:request.pair,interval:'30s',value_type:'price',items}},request,'history');
+  await service.applyHistory(ctx,[{type:'price',result}],()=>true);
+  await service.applyHistory(ctx,[{type:'price',result:{...result,traceId:'retry'}}],()=>true);
+  expect((await pool.query("SELECT open_time FROM meme_kline WHERE ca='drop-history' ORDER BY open_time")).rows.map(r=>Number(r.open_time))).toEqual([180000,240000]);
+  expect(ctx.evaluator.state.lastCandleTime).toBe(240000);expect(ctx.evaluator.state.position).toEqual(before);
+  expect((await pool.query('SELECT count(*) n FROM live_orders WHERE run_id=$1',[run.id])).rows[0].n).toBe('0');
+  const events=(await pool.query("SELECT payload FROM live_events WHERE run_id=$1 AND kind='history_candles_discarded'",[run.id])).rows;
+  expect(events).toHaveLength(1);expect(events[0].payload).toMatchObject({discarded:1,retained:2,traceId:'bad-row'});
  });
  it('rolls back history and checkpoint when the recovery epoch is lost during storage',async()=>{
   const {run,service,add}=await fixture();const ctx=await add('stale-history'),before=ctx.evaluator.snapshot();let valid=true;
