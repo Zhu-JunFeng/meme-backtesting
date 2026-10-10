@@ -1,7 +1,12 @@
 import {afterEach,describe,expect,it,vi} from 'vitest';
 import {randomBytes,scryptSync} from 'node:crypto';
-import {LiveController,requireLiveAdmin,validateRisk,validLiveSignalSource,resolveSignalSource,resolveSignalSources} from './live.js';
-import {liveSignalSources} from '@meme/domain';
+import {LiveController,requireLiveAdmin,validateRisk,validLiveSignalSource,resolveSignalSource,resolveSignalSources,resolveProjectSources} from './live.js';
+import {liveSignalSources,defaultProjectSources} from '@meme/domain';
+
+function sourceTransaction(controller:LiveController,existing:any){
+ const query=vi.fn(async(sql:string,args:any[]=[])=>({rows:sql.startsWith('SELECT')?[existing]:sql.startsWith('UPDATE')?[{...existing,id:'r',signal_source:args[1],signal_sources:args[2],project_sources:JSON.parse(args[3])}]:[]}));
+ vi.spyOn((controller as any).pool,'connect').mockResolvedValue({query,release:vi.fn()});return query;
+}
 
 const previousHash=process.env.LIVE_ADMIN_PASSWORD_HASH;
 const previousMode=process.env.NODE_ENV;
@@ -51,20 +56,20 @@ describe('live order safety boundaries',()=>{
  });
  it('updates paper admission sources only, leaving watches and funds untouched',async()=>{
   const controller=new LiveController();
-  const query=vi.spyOn((controller as any).pool,'query').mockResolvedValueOnce({rows:[{mode:'paper'}]}).mockResolvedValueOnce({rowCount:1,rows:[{id:'r',mode:'paper',signal_source:'all',wallet_address:null}]});
+  const query=sourceTransaction(controller,{mode:'paper',status:'running',chain:'sol',signal_source:'all'});
   expect(await controller.sources('r',{signalSources:['top_cluster_first_buy','fomo_new_project_expanded']},'',{})).toMatchObject({id:'r',signalSources:['fomo_new_project_expanded','top_cluster_first_buy']});
-  expect(query.mock.calls[1]).toEqual([expect.stringContaining("status IN ('paused','running')"),['r','all',['fomo_new_project_expanded','top_cluster_first_buy']]]);
+  expect(query.mock.calls.find(c=>String(c[0]).startsWith('UPDATE'))?.[1]?.slice(0,3)).toEqual(['r','all',['fomo_new_project_expanded','top_cluster_first_buy']]);
   expect(query.mock.calls.every(call=>!String(call[0]).includes('live_watches'))).toBe(true);
   await controller.onModuleDestroy();
  });
  it('refuses source writes to live tasks without administrator authorization',async()=>{
   delete process.env.LIVE_ADMIN_PASSWORD_HASH;
-  const controller=new LiveController();const query=vi.spyOn((controller as any).pool,'query').mockResolvedValue({rows:[{mode:'live'}]});
+  const controller=new LiveController();const query=sourceTransaction(controller,{mode:'live',status:'running'});
   await expect(controller.sources('r',{signalSources:['top_cluster_first_buy']},'',{})).rejects.toThrow();
-  expect(query).toHaveBeenCalledTimes(1);await controller.onModuleDestroy();
+  expect(query.mock.calls.some(c=>String(c[0]).startsWith('UPDATE'))).toBe(false);expect(query.mock.calls.at(-1)?.[0]).toBe('ROLLBACK');await controller.onModuleDestroy();
  });
  it('refuses source edits for a stopped task',async()=>{
-  const controller=new LiveController();vi.spyOn((controller as any).pool,'query').mockResolvedValueOnce({rows:[{mode:'paper'}]}).mockResolvedValueOnce({rowCount:0,rows:[]});
+  const controller=new LiveController();sourceTransaction(controller,{mode:'paper',status:'stopped'});
   await expect(controller.sources('r',{signalSources:['top_cluster_first_buy']},'',{})).rejects.toThrow('已停止');await controller.onModuleDestroy();
  });
  it('accepts only the two configured signal sources and legacy all',()=>{
@@ -82,9 +87,18 @@ describe('live order safety boundaries',()=>{
  });
  it('returns and writes the exact multi-selection, not the legacy all summary',async()=>{
   const c=new LiveController(),sources=['top_cluster_first_buy','fomo_trending_new_project'];
-  const q=vi.spyOn((c as any).pool,'query').mockResolvedValueOnce({rows:[{mode:'paper'}]}).mockResolvedValueOnce({rowCount:1,rows:[{mode:'paper',signal_source:'all',signal_sources:sources}]});
+  const q=sourceTransaction(c,{mode:'paper',status:'paused',chain:'sol',signal_source:'all'});
   expect(await c.sources('r',{signalSources:[...sources].reverse()},'',{})).toMatchObject({signalSources:sources});
-  expect(q.mock.calls[1][1]).toEqual(['r','all',sources]);await c.onModuleDestroy();
+  expect(q.mock.calls.find(c=>String(c[0]).startsWith('UPDATE'))?.[1]?.slice(0,3)).toEqual(['r','all',sources]);await c.onModuleDestroy();
+ });
+ it('accepts wallet-only configs, protects chain scope and audits updates',async()=>{
+  const cfg=defaultProjectSources();cfg.memeinfo.enabled=false;cfg.wallet.enabled=true;
+  expect(resolveProjectSources({projectSources:cfg},'sol').wallet.enabled).toBe(true);
+  expect(()=>resolveProjectSources({projectSources:cfg},'bsc')).toThrow('SOL');
+  const c=new LiveController(),q=sourceTransaction(c,{mode:'paper',status:'running',chain:'sol',signal_source:'all'});
+  const updated=await c.sources('r',{projectSources:cfg},'',{});expect(updated.projectSources).toEqual(cfg);
+  expect(q.mock.calls.find(c=>String(c[0]).startsWith('UPDATE'))?.[1]?.[4]).toContain('wallet');
+  expect(q.mock.calls.some(c=>String(c[0]).includes('source_config_changed'))).toBe(true);await c.onModuleDestroy();
  });
  it('requires an administrator secret and HTTPS in production',()=>{
   const salt=randomBytes(16).toString('hex');

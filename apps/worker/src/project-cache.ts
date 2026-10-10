@@ -7,7 +7,7 @@ const decimal=(v:unknown):v is string=>typeof v==='string'&&v.length<=100&&/^\d+
 export const normalizeProject=(p:Project):Project=>({chain:p.chain.trim().toLowerCase(),ca:p.chain.trim().toLowerCase()==='sol'?p.ca.trim():p.ca.trim().toLowerCase()});
 export const cacheKey=(p:Project)=>{const n=normalizeProject(p);return `meme:project-info:v1:${n.chain}:${n.ca}`;};
 export type Supply={original:string;unit:'raw'|'tokens';decimals:number|null;tokens:string;fetchedAt:number};
-export type ProjectInfo={chain:string;ca:string;pairId:string;dexId:string;marketCap?:number;fetchedAt:number;supply?:Supply};
+export type ProjectInfo={chain:string;ca:string;pairId:string;dexId:string;marketCap?:number;createdAt?:number;fetchedAt:number;supply?:Supply};
 type RecordState={version:1;attempts:number;status:'ready'|'failed';nextRetryAt:number;error?:string;info?:ProjectInfo};
 export type CacheStore={get:(key:string)=>Promise<string|null>;set:(key:string,value:string)=>Promise<unknown>};
 
@@ -26,7 +26,14 @@ export function projectInfo(item:any,p:Project,now:number):ProjectInfo{
  const meta=item.project_meta??{};
  // Contract: project_meta.total_supply is raw unless its unit is explicitly declared.
  const unit=meta.total_supply_unit??'raw';
- return {...n,...pool,fetchedAt:now,supply:normalizedSupply(meta.total_supply,unit,meta.decimals,now)};
+ return {...n,...pool,createdAt:projectCreatedAt(item),fetchedAt:now,supply:normalizedSupply(meta.total_supply,unit,meta.decimals,now)};
+}
+export function projectCreatedAt(item:any):number|undefined {
+ for(const value of [item?.token_create_time,item?.project_meta?.create_time]){
+  if(value==null||value==='')continue;
+  const n=Number(value),t=Number.isFinite(n)?(n<1e12?n*1000:n):Date.parse(String(value));
+  if(Number.isSafeInteger(t)&&t>0&&t<=Date.now())return t;
+ }
 }
 export type MarketCapBasis={source:'ws'|'price_supply';value:string;supply?:Supply};
 export function resolveMarketCap(raw:any,info?:ProjectInfo):MarketCapBasis|undefined{
@@ -40,10 +47,27 @@ export function resolveMarketCap(raw:any,info?:ProjectInfo):MarketCapBasis|undef
 /** Persistent success/attempt ledger plus single-flight in-process reads. Never expire successful supply. */
 export class ProjectCache {
  private memory=new Map<string,RecordState>();private pending=new Map<string,Promise<ProjectInfo>>();
+ private freshPending=new Map<string,Promise<ProjectInfo>>();
  storageStatus:'redis'|'memory'='memory';
  constructor(private readonly store?:CacheStore,private readonly request:typeof fetch=fetch,private readonly now=()=>Date.now()){}
  peek(p:Project){return this.memory.get(cacheKey(p))?.status==='ready'?this.memory.get(cacheKey(p))!.info:undefined;}
  status(p:Project){const r=this.memory.get(cacheKey(p));return r?{status:r.status,attempts:r.attempts,nextRetryAt:r.nextRetryAt,error:r.error}:undefined;}
+ /** Dynamic cap/creation metadata cannot use the permanent supply cache. */
+ fresh(p:Project):Promise<ProjectInfo>{
+  const key=cacheKey(p),pending=this.freshPending.get(key);if(pending)return pending;
+  const task=this.loadFresh(p).finally(()=>this.freshPending.delete(key));this.freshPending.set(key,task);return task;
+ }
+ private async loadFresh(p:Project):Promise<ProjectInfo>{
+  const n=normalizeProject(p),key=cacheKey(p),prior=await this.read(key);
+  if(prior?.info&&this.now()-prior.info.fetchedAt<60000)return prior.info;
+  const r=await this.request('https://app.memeinfo.net/api/projects/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({caList:[n.ca],symbolList:['']}),signal:AbortSignal.timeout(8000)});
+  if(!r.ok)throw new Error(`lookup HTTP ${r.status}`);const data=await r.json() as any;
+  const item=(data?.data?.caListTokenList??[]).find((x:any)=>String(x.chain??'').trim().toLowerCase()===n.chain&&normalizeProject({chain:n.chain,ca:String(x.token_address??'')}).ca===n.ca);
+  const pool=resolveLivePool(item,true);if(!pool)throw new Error('lookup 缺少匹配主池');
+  let supply=prior?.info?.supply;try{supply=normalizedSupply(item.project_meta?.total_supply,item.project_meta?.total_supply_unit??'raw',item.project_meta?.decimals,this.now());}catch{/* original WS market cap remains usable; derived cap will fail closed */}
+  const info={...n,...pool,createdAt:projectCreatedAt(item),fetchedAt:this.now(),supply};
+  await this.save(key,{version:1,status:'ready',attempts:0,nextRetryAt:0,info});return info;
+ }
  get(p:Project):Promise<ProjectInfo>{
   const key=cacheKey(p),existing=this.pending.get(key);if(existing)return existing;
   const task=this.load(normalizeProject(p)).finally(()=>this.pending.delete(key));this.pending.set(key,task);return task;

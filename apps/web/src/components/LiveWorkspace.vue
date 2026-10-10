@@ -6,7 +6,8 @@ import {beijingTime} from '../time';
 import {eventLabels,formatNumber,signedValue,valueTone} from '../format';
 import TradingViewChart from './TradingViewChart.vue';
 import LivePortfolio from './LivePortfolio.vue';
-import {liveSignalSources} from '@meme/domain';
+import {defaultProjectSources,normalizeProjectSources,selectedProjectSources} from '@meme/domain';
+import ProjectSourceSettings from './ProjectSourceSettings.vue';
 import {signalSourceOptions as signalSources,sourceText as signalSourceText,runSourceText,monitoringRows} from '../live-monitor';
 import ProjectIdentity from './ProjectIdentity.vue';
 import {provideProjectDirectory} from '../composables/useProjectDirectory';
@@ -20,16 +21,20 @@ const password=ref(''),authorized=ref(false),loading=ref(false),busy=ref(false),
 const detailElement=ref<HTMLElement|null>(null);
 const chartElement=ref<HTMLElement|null>(null);
 const form=ref({name:'',chain:'sol',signalSources:['fomo_new_project_expanded'],interval:'30s',valueType:'mcap',initialCapital:1000,walletAddress:'',maxOrderNative:0.01,maxTotalNative:0.05,maxDailyLossUsd:20,maxPositions:1,tip:0.001,slippagePercent:5});
-const editingSources=ref(false),sourceSelection=ref<string[]>([]),watchSearch=ref(''),watchSource=ref<string>(),watchSort=ref<'asc'|'desc'>('desc'),watchPage=ref(1);
+const projectSources=ref(defaultProjectSources()),editingProjectSources=ref(defaultProjectSources());
+watch(()=>form.value.chain,chain=>{if(chain!=='sol'){projectSources.value.wallet.enabled=false;projectSources.value.xxyy.enabled=false;projectSources.value.memeinfo.enabled=true;}});
+const editingSources=ref(false),watchSearch=ref(''),watchSource=ref<string>(),watchSort=ref<'asc'|'desc'>('desc'),watchPage=ref(1);
+const watchSourceOptions=[...signalSources,{label:'钱包买入',value:'wallet'},{label:'XXYY 项目列表',value:'xxyy'}];
+const discoveryState=(s:string)=>({connected:'已连接／最近查询成功',connecting:'连接中',retrying:'重试中',unconfigured:'未配置密钥',idle:'未启动'} as Record<string,string>)[s]??'等待更新';
 const monitored=computed(()=>monitoringRows(detail.value?.watches??[],watchSearch.value,watchSource.value,watchSort.value));
 watch([watchSearch,watchSource,watchSort],()=>watchPage.value=1);
 watch(()=>monitored.value.length,()=>{watchPage.value=Math.min(watchPage.value,Math.max(1,Math.ceil(monitored.value.length/10)));});
-function editSources(){sourceSelection.value=[...(detail.value.run.signalSources??liveSignalSources(detail.value.run.signal_source))];editingSources.value=true;}
+function editSources(){editingProjectSources.value=JSON.parse(JSON.stringify(detail.value.run.projectSources??selectedProjectSources(detail.value.run)));editingSources.value=true;}
 async function saveSources(){
- if(!sourceSelection.value.length)return message.warning('至少选择一个信号来源');
+ try{normalizeProjectSources(editingProjectSources.value,detail.value.run.chain);}catch(e:any){return message.warning(e.message);}
  if(real&&!authorized.value)return message.warning('先验证管理员口令');
  const id=detail.value.run.id;busy.value=true;
- try{await api.patch(`/live-runs/${id}/signal-sources`,{signalSources:sourceSelection.value},{headers:adminHeader()});if(id===selectedRunId.value)editingSources.value=false;await refresh();message.success('信号来源已更新，仅影响后续新 CA；现有监控和持仓不变');}
+ try{await api.patch(`/live-runs/${id}/signal-sources`,{projectSources:editingProjectSources.value},{headers:adminHeader()});if(id===selectedRunId.value)editingSources.value=false;await refresh();message.success('来源已更新；市值门槛会同步已有监控，不强制清仓');}
  catch(e:any){message.error(e.response?.data?.message??'保存信号来源失败');}finally{busy.value=false;}
 }
 const runFilter=ref<'all'|'running'|'paused'|'stopped'>('all');
@@ -45,7 +50,7 @@ const real=props.mode==='live';let timer:number|undefined,request=0,locateReques
 function statusText(s:string){return ({paused:'已暂停',running:'运行中',stopped:'已停止'} as Record<string,string>)[s]??s;}
 function statusColor(s:string){return ({paused:'default',running:'green',stopped:'default'} as Record<string,string>)[s]??'default';}
 function feedText(s:string){return ({connecting:'连接中',recovering:'补行情',connected:'行情正常',paused:'已暂停'} as Record<string,string>)[s]??'连接中';}
-function watchText(s:string){return ({monitoring:'监控中',recovering:'补行情中',pending_eviction:'等待平仓后移除',evicted:'已移除',paused:'已暂停'} as Record<string,string>)[s]??'状态未识别';}
+function watchText(s:string){return ({monitoring:'监控中',recovering:'补行情中',pending_eviction:'等待平仓后移除',evicted:'已移除',evicted_low_mcap:'低市值已移除',paused:'已暂停'} as Record<string,string>)[s]??'状态未识别';}
 function eventText(s:string){return ({external_signal:'外部信号',decision:'买卖决策',fill:'成交',execution_switched:'执行口径切换',order_rejected:'订单被拒绝',feed_disconnect:'行情断开',feed_reconnected:'行情已重连',late_trade:'乱序成交',eviction:'退出监控'} as Record<string,string>)[s]??'运行事件';}
 function eventReason(payload:any){const reason=payload?.reason;return reason?eventLabels[reason]??(typeof reason==='string'&&reason.includes('_')?'原因未识别':reason):signalSourceText(payload?.source);}
 function adminHeader(){return real?{'x-live-admin-password':password.value}:{};}
@@ -75,12 +80,12 @@ async function checkPassword(){
  catch(e:any){authorized.value=false;message.error(e.response?.data?.message??'验证失败；生产环境需通过 HTTPS 访问');}
 }
 async function create(){
- if(!form.value.signalSources.length)return message.warning('至少选择一个信号来源');
+ try{normalizeProjectSources(projectSources.value,form.value.chain);}catch(e:any){return message.warning(e.message);}
  if(!versionId.value)return message.warning('请选择不可变策略版本');
  if(real&&!authorized.value)return message.warning('先验证管理员口令');
  busy.value=true;
  try{
-  const body:any={name:form.value.name.trim()||`${real?'实盘':'模拟盘'} · ${form.value.chain.toUpperCase()}`,mode:props.mode,chain:form.value.chain,signalSources:form.value.signalSources,interval:form.value.interval,valueType:form.value.valueType,strategyVersionId:versionId.value,initialCapital:Number(form.value.initialCapital)};
+  const body:any={name:form.value.name.trim()||`${real?'实盘':'模拟盘'} · ${form.value.chain.toUpperCase()}`,mode:props.mode,chain:form.value.chain,projectSources:projectSources.value,interval:form.value.interval,valueType:form.value.valueType,strategyVersionId:versionId.value,initialCapital:Number(form.value.initialCapital)};
   if(real){body.walletAddress=form.value.walletAddress.trim();body.risk={maxOrderNative:Number(form.value.maxOrderNative),maxTotalNative:Number(form.value.maxTotalNative),maxDailyLossUsd:Number(form.value.maxDailyLossUsd),maxPositions:Number(form.value.maxPositions),tip:Number(form.value.tip),slippagePercent:Number(form.value.slippagePercent)};}
   const created=(await api.post('/live-runs',body,{headers:adminHeader()})).data;
   message.success('任务已创建，默认暂停；检查配置后手动启动');await refresh();selectedRunId.value=created.id;await loadDetail(created.id);
@@ -128,7 +133,7 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
     <a-form-item label="任务名称"><a-input v-model:value="form.name" :placeholder="`${real?'实盘':'模拟盘'} · ${form.chain.toUpperCase()}`" /></a-form-item>
     <a-form-item label="策略模板"><a-select v-model:value="templateId" :options="templates.map(t=>({label:t.name,value:t.id}))" placeholder="选择策略模板" /></a-form-item>
     <a-form-item label="不可变版本"><a-select v-model:value="versionId" :options="versions.map(v=>({label:`v${v.version}`,value:v.id}))" placeholder="选择版本" /></a-form-item>
-    <a-form-item label="外部信号来源（多选）" extra="至少选择一项；任一所选来源触发均可纳入，仍需通过准入和预热。不追收启动前的信号。"><a-select v-model:value="form.signalSources" mode="multiple" :options="signalSources" placeholder="选择接入的信号" aria-label="外部信号来源（多选）" /></a-form-item>
+    <a-form-item label="项目来源（多选）"><ProjectSourceSettings v-model="projectSources" :chain="form.chain" :disabled="busy" /></a-form-item>
     <div class="live-form-row"><a-form-item label="链"><a-select v-model:value="form.chain" :options="(real?['sol','bsc']:['sol','bsc','robin']).map(x=>({label:x.toUpperCase(),value:x}))" /></a-form-item><a-form-item label="周期"><a-select v-model:value="form.interval" :options="[{label:'30s',value:'30s'},{label:'1m',value:'1m'}]" /></a-form-item></div>
     <div class="live-form-row"><a-form-item label="判断维度"><a-select v-model:value="form.valueType" :options="[{label:'市值',value:'mcap'},{label:'价格',value:'price'}]" /></a-form-item><a-form-item :label="real?'额度基准（USD）':'初始资金（USD）'"><a-input-number v-model:value="form.initialCapital" :min="1" :precision="2" /></a-form-item></div>
     <template v-if="real"><a-form-item label="专用 XXYY 钱包地址"><a-input v-model:value="form.walletAddress" placeholder="每条链、每个策略实例使用独立钱包" autocomplete="off" /></a-form-item>
@@ -144,12 +149,13 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
    <a-skeleton v-if="!runLoaded&&loading" active :paragraph="{rows:5}" />
    <a-empty v-else-if="runLoaded&&!runCounts.all" description="还没有任务。先选择策略版本，创建后再启动监控。" />
    <a-empty v-else-if="runLoaded&&!runs.length" description="当前状态下没有策略任务，可切换上方状态查看。" />
-   <div v-else class="live-run-list" :aria-busy="loading"><button v-for="r in runs" :key="r.id" class="live-run-row" :class="{selected:selectedRunId===r.id}" :aria-pressed="selectedRunId===r.id" @click="selectedRunId=r.id"><span class="live-run-top"><strong>{{r.name}}</strong><a-tag :color="statusColor(r.status)">{{statusText(r.status)}}</a-tag></span><small class="live-run-meta">{{r.chain.toUpperCase()}} · {{r.interval}} · {{r.value_type==='mcap'?'市值':'价格'}} · {{runSourceText(r)}}</small><span class="live-run-metrics"><span><small>{{r.status==='stopped'?'保留监控 CA':'监控 CA'}}</small><strong>{{Number(r.active_ca_count||0)}} / 20</strong></span><span><small>当前 / 已平仓</small><strong>{{r.performance?.openCount??'—'}} / {{r.performance?.closedCount??'—'}}</strong></span><span><small>已平仓胜率</small><strong>{{r.performance?.winRate==null?'—':formatNumber(r.performance.winRate)+'%'}}</strong></span><span><small>已平仓净盈亏</small><strong :class="valueTone(r.performance?.realizedPnl)">{{r.performance?signedValue(r.performance.realizedPnl)+' USD':'—'}}</strong></span><span><small>估算浮盈亏</small><strong :class="valueTone(r.performance?.unrealizedPnl)">{{r.performance?.unrealizedPnl==null?'不可用':signedValue(r.performance.unrealizedPnl)+' USD'}}</strong></span></span><span class="live-run-foot"><span>{{r.status==='running'?feedText(r.feed_state):'最近更新'}} · {{beijingTime(r.status==='running'?r.heartbeat_at:r.updated_at)}}</span><span v-if="r.error_message||r.execution_hold_reason" class="live-run-warning">{{r.execution_hold_reason?'订单核验中':'有运行提示'}}</span><span class="live-run-open">查看详情 →</span></span></button></div>
+   <div v-else class="live-run-list" :aria-busy="loading"><button v-for="r in runs" :key="r.id" class="live-run-row" :class="{selected:selectedRunId===r.id}" :aria-pressed="selectedRunId===r.id" @click="selectedRunId=r.id"><span class="live-run-top"><strong>{{r.name}}</strong><a-tag :color="statusColor(r.status)">{{statusText(r.status)}}</a-tag></span><small class="live-run-meta">{{r.chain.toUpperCase()}} · {{r.interval}} · {{r.value_type==='mcap'?'市值':'价格'}} · {{runSourceText(r)}}</small><small v-if="r.status==='running'&&r.source_status" class="live-run-meta"><span v-for="(s,p) in r.source_status" :key="p">{{signalSourceText(String(p))}}：{{discoveryState(s.state)}} · 接收 {{s.admission?.accepted??0}} / 过滤 {{s.admission?.filtered??0}}　</span></small><span class="live-run-metrics"><span><small>{{r.status==='stopped'?'保留监控 CA':'监控 CA'}}</small><strong>{{Number(r.active_ca_count||0)}} / 20</strong></span><span><small>当前 / 已平仓</small><strong>{{r.performance?.openCount??'—'}} / {{r.performance?.closedCount??'—'}}</strong></span><span><small>已平仓胜率</small><strong>{{r.performance?.winRate==null?'—':formatNumber(r.performance.winRate)+'%'}}</strong></span><span><small>已平仓净盈亏</small><strong :class="valueTone(r.performance?.realizedPnl)">{{r.performance?signedValue(r.performance.realizedPnl)+' USD':'—'}}</strong></span><span><small>估算浮盈亏</small><strong :class="valueTone(r.performance?.unrealizedPnl)">{{r.performance?.unrealizedPnl==null?'不可用':signedValue(r.performance.unrealizedPnl)+' USD'}}</strong></span></span><span class="live-run-foot"><span>{{r.status==='running'?feedText(r.feed_state):'最近更新'}} · {{beijingTime(r.status==='running'?r.heartbeat_at:r.updated_at)}}</span><span v-if="r.error_message||r.execution_hold_reason" class="live-run-warning">{{r.execution_hold_reason?'订单核验中':'有运行提示'}}</span><span class="live-run-open">查看详情 →</span></span></button></div>
    <a-pagination v-if="runTotal>runPageSize" class="live-run-pagination" :current="runPage" :page-size="runPageSize" :total="runTotal" :show-size-changer="false" :show-total="(n:number)=>`共 ${n} 个策略任务`" @change="setRunPage" />
   </section>
  </div>
  <section v-if="detail" ref="detailElement" class="live-detail" aria-label="实时任务详情"><div class="live-section-head"><div><h2>{{detail.run.name}}</h2><p>{{detail.run.chain.toUpperCase()}} · {{detail.run.interval}} · {{detail.run.value_type==='mcap'?'市值':'价格'}} · {{runSourceText(detail.run)}} · 仅新信号</p></div><a-tag :color="statusColor(detail.run.status)">{{statusText(detail.run.status)}}</a-tag></div>
-  <div class="live-source-editor"><template v-if="editingSources"><a-select v-model:value="sourceSelection" mode="multiple" :options="signalSources" :disabled="busy" aria-label="修改任务信号来源" /><a-button type="primary" :loading="busy" :disabled="!sourceSelection.length" @click="saveSources">保存来源</a-button><a-button :disabled="busy" @click="editingSources=false">取消</a-button><p>仅影响后续新 CA 准入；现有监控 CA 和持仓继续管理，不补发历史买卖。</p></template><a-button v-else :disabled="busy||detail.run.status==='stopped'||(real&&!authorized)" @click="editSources">修改接入信号</a-button></div>
+  <div class="live-source-editor"><template v-if="editingSources"><ProjectSourceSettings v-model="editingProjectSources" :chain="detail.run.chain" :disabled="busy" /><a-button type="primary" :loading="busy" @click="saveSources">保存来源配置</a-button><a-button :disabled="busy" @click="editingSources=false">取消</a-button><p>入组条件控制后续接收；剔除市值会同步已有监控。有仓位时保留卖出监控，不强制清仓。</p></template><a-button v-else :disabled="busy||detail.run.status==='stopped'||(real&&!authorized)" @click="editSources">修改项目来源</a-button></div>
+  <div class="source-health" aria-label="项目发现来源状态"><p v-for="(s,p) in detail.run.source_status" :key="p"><strong>{{signalSourceText(String(p))}}</strong> · {{discoveryState(s.state)}} · 最近成功 {{beijingTime(s.lastSuccessAt??s.admission?.lastReceivedAt,true)}} · 接收 {{s.admission?.accepted??0}} / 过滤 {{s.admission?.filtered??0}}<span v-if="s.scanned!=null"> · 全局扫描 {{s.scanned}}</span><br/><span v-if="s.error||s.admission?.reason">{{s.error??s.admission?.reason}} · </span><small>当前服务会话计数；来源健康不代表交易行情完整。</small></p></div>
   <p class="live-context" v-if="detail.run.execution_version==='closed-bar-v2'">执行口径：完整 K 线收盘后判断；止损／止盈检查整根高低值，模拟按回测阈值或跳空开盘值撮合，实盘以真实成交为准。正常无成交时补平价 K 线，断线补数不追单。切换时间：{{beijingTime(detail.run.execution_switched_at)}}（北京时间）。此前成交不重算。</p>
   <p class="live-context" v-else>执行口径：旧版逐笔退出。任务切换后将在此显示生效时间，历史成交保持原样。</p>
   <a-alert v-if="detail.run.market_source==='meme_market_v2'" type="warning" show-icon message="Meme Market 协议 2 · 尽力投递，不保证成交完整" description="健康连接下的零量平线为推定无成交。断线、已知缺口或预热未完成时暂停策略交易；已有持仓的止损可能无法及时执行。历史补数仍使用 XXYY，不追补历史订单。" />
@@ -163,10 +169,10 @@ onBeforeUnmount(()=>{window.clearInterval(timer);password.value='';authorized.va
   <a-divider orientation="left">监控项目与成交</a-divider>
   <section aria-label="正在监控的 CA" class="live-monitor-list">
    <div class="live-section-head"><h2>正在监控的 CA · {{detail.run.active_ca_count}}</h2><span>每 5 秒刷新 · 北京时间 UTC+8</span></div>
-   <p class="live-context">包含补行情和等待平仓后移除的项目；暂停任务保留名单但不执行策略。监控时间为首次加入本任务的时间，不是信号触发时间。来源为入组信号，修改任务来源不改写已有 CA 的来源。</p>
-   <div class="live-monitor-tools"><a-input v-model:value="watchSearch" allow-clear placeholder="搜索 CA / 交易池" aria-label="搜索监控 CA" /><a-select v-model:value="watchSource" allow-clear :options="signalSources" placeholder="全部入组信号" aria-label="筛选入组信号" /><a-select v-model:value="watchSort" :options="[{label:'监控时间：新到旧',value:'desc'},{label:'监控时间：旧到新',value:'asc'}]" aria-label="监控时间排序" /></div>
+   <p class="live-context">包含补行情和等待平仓后移除的项目；暂停任务保留名单但不执行策略。监控时间为本轮接收时间；多来源显示实际匹配来源，采用最低剔除门槛。修改市值门槛会同步已有监控，不强制清仓。</p>
+   <div class="live-monitor-tools"><a-input v-model:value="watchSearch" allow-clear placeholder="搜索 CA / 交易池" aria-label="搜索监控 CA" /><a-select v-model:value="watchSource" allow-clear :options="watchSourceOptions" placeholder="全部项目来源" aria-label="筛选入组信号" /><a-select v-model:value="watchSort" :options="[{label:'监控时间：新到旧',value:'desc'},{label:'监控时间：旧到新',value:'asc'}]" aria-label="监控时间排序" /></div>
    <a-table :data-source="monitored" :row-key="(w:any)=>`${w.chain}:${w.ca}`" size="small" :scroll="{x:1100}" :pagination="{current:watchPage,pageSize:10,showSizeChanger:false,onChange:(page:number)=>watchPage=page,showTotal:(n:number)=>`共 ${n} 个 CA`}" :locale="{emptyText:'暂无符合条件的监控 CA；等待所选来源的新信号通过准入。'}" :columns="[{title:'CA / 交易池',key:'ca',width:270},{title:'入组信号',key:'source',width:190},{title:'首次监控时间',key:'time',width:180},{title:'信号触发时间',key:'signalTime',width:180},{title:'状态 / 原因',key:'status',width:230},{title:'操作',key:'action',width:90}]">
-    <template #bodyCell="{column,record}"><template v-if="column.key==='ca'"><ProjectIdentity :chain="record.chain" :ca="record.ca" /><small class="live-pair">池：{{record.pair_id}}</small></template><template v-else-if="column.key==='source'"><a-tag>{{signalSourceText(record.signal_source)}}</a-tag></template><template v-else-if="column.key==='time'">{{beijingTime(record.created_at)}}</template><template v-else-if="column.key==='signalTime'">{{beijingTime(record.signal_time,true)}}</template><template v-else-if="column.key==='status'"><a-tag :color="record.status==='monitoring'?'green':'orange'">{{watchText(record.status)}}</a-tag><p class="live-context">{{record.recovery_reason||'—'}}</p></template><template v-else-if="column.key==='action'"><a-button size="small" @click="selectPair(`${record.chain}:${record.ca}:${record.pair_id}`)">查看 K 线</a-button></template></template>
+    <template #bodyCell="{column,record}"><template v-if="column.key==='ca'"><ProjectIdentity :chain="record.chain" :ca="record.ca" /><small class="live-pair">池：{{record.pair_id}}</small></template><template v-else-if="column.key==='source'"><a-tag v-for="p in (record.matched_sources??[record.signal_source])" :key="p">{{signalSourceText(p)}}</a-tag><small class="live-pair">剔除市值 {{formatNumber(record.exit_market_cap??50000)}} USD</small></template><template v-else-if="column.key==='time'">{{beijingTime(record.admitted_at??record.created_at,record.admitted_at!=null)}}</template><template v-else-if="column.key==='signalTime'">{{beijingTime(record.signal_time,true)}}</template><template v-else-if="column.key==='status'"><a-tag :color="record.status==='monitoring'?'green':'orange'">{{watchText(record.status)}}</a-tag><p class="live-context">{{record.recovery_reason||'—'}}</p></template><template v-else-if="column.key==='action'"><a-button size="small" @click="selectPair(`${record.chain}:${record.ca}:${record.pair_id}`)">查看 K 线</a-button></template></template>
    </a-table>
   </section>
   <a-empty v-if="!detail.watches.length&&!chartAnchor" description="等待符合来源与链筛选的新信号；历史信号不会追加入场。" />

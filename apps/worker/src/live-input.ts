@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 import type {MarketTrade} from '@meme/engine';
 import {LIVE_SIGNAL_SOURCES,type LiveSignalSourceCode} from '@meme/domain';
-export interface ProjectSignal {key:string;chain:'sol'|'bsc'|'robin';ca:string;source:LiveSignalSourceCode;time:number;identity:Record<string,unknown>}
+export interface ProjectSignal {key:string;chain:'sol'|'bsc'|'robin';ca:string;source:LiveSignalSourceCode|'wallet_buy'|'xxyy_completed';time:number;identity:Record<string,unknown>}
 const object=(v:unknown):Record<string,unknown>|undefined=>v&&typeof v==='object'&&!Array.isArray(v)?v as Record<string,unknown>:undefined;
 const str=(...values:unknown[])=>values.find(v=>typeof v==='string'&&v.trim()) as string|undefined;
 const numeric=(...values:unknown[])=>{for(const v of values){const n=typeof v==='number'?v:typeof v==='string'&&v.trim()?Number(v):NaN;if(Number.isFinite(n))return n;}return undefined;};

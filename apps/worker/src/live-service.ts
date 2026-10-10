@@ -8,11 +8,12 @@ import WebSocket from 'ws';
 import type {Pool,PoolClient} from 'pg';
 import {LiveCandleAggregator,LiveEvaluator,detectImpulse,validCandle,type ClosedMarketBar,type LiveDecision,type MarketTrade} from '@meme/engine';
 import type {Candle,StrategyConfig} from '@meme/domain';
-import {selectedLiveSources} from '@meme/domain';
+import {selectedLiveSources,selectedProjectSources,qualifiesSource,effectiveExitCap,type ProjectSources,type ProjectProvider} from '@meme/domain';
 import {parseProjectSignal,type ProjectSignal} from './live-input.js';
+import {ProjectDiscovery,type Discovery} from './project-discovery.js';
 
-type Run={id:string;mode:'paper'|'live';chain:string;signal_source:string;interval:'30s'|'1m';value_type:'price'|'mcap';status:string;execution_hold_reason:string|null;strategy_json:StrategyConfig;cash:string;realized_pnl:string;wallet_address:string|null;risk_json:any;started_at:Date;execution_version:string;execution_switched_at:Date|null};
-type Watch={run_id:string;chain:string;ca:string;pair_id:string;dex_id:string|null;signal_time:string;state_json:any;last_candle_time:string|null;status:string;current_mcap:string|null;last_trade_at:string|null};
+type Run={id:string;mode:'paper'|'live';chain:string;signal_source:string;project_sources?:ProjectSources;interval:'30s'|'1m';value_type:'price'|'mcap';status:string;execution_hold_reason:string|null;strategy_json:StrategyConfig;cash:string;realized_pnl:string;wallet_address:string|null;risk_json:any;started_at:Date;execution_version:string;execution_switched_at:Date|null};
+type Watch={run_id:string;chain:string;ca:string;pair_id:string;dex_id:string|null;signal_time:string;state_json:any;last_candle_time:string|null;status:string;current_mcap:string|null;last_trade_at:string|null;matched_sources?:ProjectProvider[];exit_market_cap?:string;exit_only?:boolean};
 type Context={run:Run;watch:Watch;evaluator:LiveEvaluator;ready:boolean;nextRecoveryAt:number;noOrdersBefore:number};
 const watchKey=(r:string,c:string,a:string)=>`${r}:${c}:${a}`;
 const pairKey=(c:string,p:string)=>`${c}:${p.toLowerCase()}`;
@@ -44,7 +45,14 @@ export function localWarmupBars(config:StrategyConfig):number{
  return Math.max(impulse.lookbackBars+impulse.leftBars+impulse.rightBars+1,...periods.map(period=>period+2),1);
 }
 export const acceptsNewSignal=(run:{signal_source:string;signal_sources?:string[]|null;started_at:Date|string},signal:ProjectSignal)=>
- selectedLiveSources(run).includes(signal.source)&&signal.time>new Date(run.started_at).getTime();
+ selectedLiveSources(run).includes(signal.source as any)&&signal.time>new Date(run.started_at).getTime();
+export function acceptsDiscovery(run:any,signal:Discovery){
+ const rule=selectedProjectSources(run)[signal.provider];
+ const after=Math.max(new Date(run.started_at).getTime(),Number(run.source_activated_at?.[signal.provider]??0));
+ if(!rule.enabled||signal.time<=after)return false;
+ if(signal.provider==='wallet'&&Number(signal.identity.transactionTime)<=after)return false;
+ return signal.provider!=='memeinfo'||rule.signalSources!.includes(signal.source as any);
+}
 const redact=(error:unknown)=>String(error).replace(/Bearer\s+[^\s]+/gi,'Bearer [redacted]').slice(0,300);
 const wait=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
 
@@ -166,10 +174,13 @@ export class LiveService {
  private readonly history=new HistoryClient();
  private readonly recovering=new Map<Context,symbol>();
  private readonly xxyy=process.env.XXYY_API_KEY?new XxyyTradeClient(process.env.XXYY_API_KEY):undefined;
- constructor(private readonly pool:Pool){}
+ private readonly discovery:ProjectDiscovery;
+ private readonly admissionCounts=new Map<string,{accepted:number;filtered:number;lastReceivedAt:number;reason?:string}>();
+ private sourceRuns:Run[]=[];
+ private mcapBusy=false;
+ constructor(private readonly pool:Pool){this.discovery=new ProjectDiscovery(pool,signal=>this.receiveDiscovery(signal));}
  private enqueue(fn:()=>Promise<void>){this.chain=this.chain.then(fn).catch(e=>console.error('live service:',redact(e)));}
  async start(){
-  if(!process.env.MEMEINFO_SIGNAL_TOKEN){console.log('live service disabled: signal feed token missing');return;}
   const client=await this.pool.connect();
   const locked=(await client.query('SELECT pg_try_advisory_lock(63920924) AS acquired')).rows[0]?.acquired;
   if(!locked){client.release();console.log('live service standby: another owner holds advisory lock');return;}
@@ -181,7 +192,7 @@ export class LiveService {
   this.flushTimer=setInterval(()=>{const receivedAt=Date.now();this.enqueue(()=>this.flushBars(receivedAt));},1_000);
   console.log('live service started; real orders',process.env.LIVE_TRADING_ENABLED==='true'?'armed by server configuration':'disabled');
  }
- async close(){this.stopped=true;this.history.close();if(this.refreshTimer)clearInterval(this.refreshTimer);if(this.flushTimer)clearInterval(this.flushTimer);for(const timer of this.signalRetries.values())clearTimeout(timer);this.signalRetries.clear();this.signal?.close();this.market.stop();this.projectRedis.disconnect();await this.chain;await this.flushTelemetry();if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(63920924)');this.lock.release();}}
+ async close(){this.stopped=true;this.history.close();if(this.refreshTimer)clearInterval(this.refreshTimer);if(this.flushTimer)clearInterval(this.flushTimer);for(const timer of this.signalRetries.values())clearTimeout(timer);this.signalRetries.clear();this.signal?.close();this.market.stop();this.projectRedis.disconnect();await this.discovery.close();await this.chain;await this.flushTelemetry();if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(63920924)');this.lock.release();}}
  private async switchExecution(){
   const c=await this.pool.connect();try{await c.query('BEGIN');
    const switched=await c.query("UPDATE live_runs SET execution_version=$1,execution_switched_at=now() WHERE status='running' AND execution_version<>$1 RETURNING id,mode",[LIVE_EXECUTION_VERSION]);
@@ -210,6 +221,7 @@ export class LiveService {
   if(this.stopped)return;
   await this.switchExecution();await this.switchMarket();
   const rows=(await this.pool.query("SELECT * FROM live_runs WHERE status='running'")).rows as Run[];
+  this.sourceRuns=rows;this.discovery.update(rows);
   const active=new Set(rows.map(r=>r.id));
   const watchRows=(await this.pool.query("SELECT w.* FROM live_watches w JOIN live_runs r ON r.id=w.run_id WHERE r.status='running' AND w.status IN ('monitoring','recovering','pending_eviction')")).rows as Watch[];
   const runMap=new Map(rows.map(r=>[r.id,r]));
@@ -221,11 +233,22 @@ export class LiveService {
    await this.markRecovering(ctx,'服务启动，等待行情订阅并补数');
   }
   for(const [key,ctx] of this.watches)if(!active.has(ctx.run.id)||!watchRows.some(w=>watchKey(w.run_id,w.chain,w.ca)===key))this.watches.delete(key);
+  for(const ctx of this.watches.values()){
+   const cap=effectiveExitCap(selectedProjectSources(ctx.run),ctx.watch.matched_sources??['memeinfo']);
+   if(Number(ctx.watch.exit_market_cap??50000)!==cap){
+    ctx.watch.exit_market_cap=String(cap);
+    await this.pool.query('UPDATE live_watches SET exit_market_cap=$4 WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,cap]);
+    const last=this.latestCaps.get(projectKey(ctx.watch));
+    if(last&&Date.now()-last.time<60000&&last.value<cap)await this.evictOrRetain(ctx,`配置更新，市值低于 ${cap} USD`);
+    else this.lastMcapCheck=0;
+   }
+  }
   this.market.setProjects([...this.watches.values()].map(c=>({chain:c.watch.chain,ca:c.watch.ca})));
   for(const ctx of this.watches.values())this.prepareProject(ctx.watch);
   for(const ctx of this.watches.values())if(!ctx.ready&&!this.recovering.has(ctx)&&this.marketSessions.has(projectKey(ctx.watch))&&Date.now()>=ctx.nextRecoveryAt)await this.recover(ctx);
-  if(Date.now()-this.lastMcapCheck>=60_000){this.lastMcapCheck=Date.now();await this.recheckMarketCaps();}
+  if(Date.now()-this.lastMcapCheck>=60_000&&!this.mcapBusy){this.lastMcapCheck=Date.now();this.mcapBusy=true;void this.recheckMarketCaps().catch(e=>console.error('市值复查:',redact(e))).finally(()=>this.mcapBusy=false);}
   await this.reconcileOrders();
+  for(const ctx of [...this.watches.values()])if(ctx.watch.exit_only&&!ctx.evaluator.state.position&&!await this.pending(ctx))await this.evictOrRetain(ctx,'低市值项目仓位及订单已结清');
   await this.flushTelemetry();
   await this.pool.query(`UPDATE live_runs r SET feed_state=CASE
    WHEN EXISTS(SELECT 1 FROM live_watches w WHERE w.run_id=r.id AND w.status='recovering') THEN 'recovering'
@@ -234,21 +257,39 @@ export class LiveService {
    feed_reason=CASE WHEN EXISTS(SELECT 1 FROM live_watches w WHERE w.run_id=r.id AND w.status='recovering') THEN feed_reason ELSE NULL END
    WHERE r.status='running'`);
   if(rows.length)await this.pool.query("UPDATE live_runs SET heartbeat_at=now() WHERE status='running'");
+  for(const r of rows){const status:any={};for(const p of ['memeinfo','wallet','xxyy'] as const){if(!selectedProjectSources(r)[p].enabled)continue;status[p]={...(p==='memeinfo'?{state:this.feedHealthy?'connected':process.env.MEMEINFO_SIGNAL_TOKEN?'connecting':'unconfigured'}:this.discovery.status[p]),admission:this.admissionCounts.get(`${r.id}:${p}`)??{accepted:0,filtered:0},scope:'当前服务会话'};}await this.pool.query('UPDATE live_runs SET source_status=$2 WHERE id=$1',[r.id,JSON.stringify(status)]);}
   for(const r of rows){const contexts=[...this.watches.values()].filter(c=>c.run.id===r.id),subscribed=contexts.filter(c=>this.marketSessions.has(projectKey(c.watch))).length;await this.pool.query('UPDATE live_runs SET market_status=$2 WHERE id=$1',[r.id,JSON.stringify({expectedProtocol:2,protocol:subscribed?2:null,delivery:'best_effort',lastMessageAt:this.market.lastMessageAt,subscribed,ready:contexts.filter(c=>c.ready).length,cache:this.projects.storageStatus,supplyReady:contexts.filter(c=>this.projects.peek(c.watch)).length,quality:this.quality,qualityScope:'当前 Worker 会话全部任务'})]);}
  }
  private connectSignals(){
-  if(this.stopped)return;
+  if(this.stopped||!process.env.MEMEINFO_SIGNAL_TOKEN)return;
   const ws=new WebSocket(process.env.MEMEINFO_SIGNAL_URL??'wss://app.memeinfo.net/api/ws/external/signal-events',{headers:{Authorization:`Bearer ${process.env.MEMEINFO_SIGNAL_TOKEN}`}});
   this.signal=ws;
   ws.on('open',()=>{this.feedHealthy=true;});
-  ws.on('message',raw=>{const signal=parseProjectSignal(raw.toString());if(signal)this.enqueue(()=>this.onSignal(signal));});
+  ws.on('message',raw=>{const s=parseProjectSignal(raw.toString());if(!s)return;const signal:Discovery={...s,provider:'memeinfo',observedAt:Date.now()};if(this.sourceRuns.some(r=>r.chain===s.chain&&acceptsDiscovery(r,signal)))void this.discovery.accept(signal).catch(e=>console.error('信号持久化失败:',redact(e)));});
   ws.on('close',()=>{this.feedHealthy=false;if(!this.stopped)setTimeout(()=>this.connectSignals(),3_000);});
   ws.on('error',error=>console.error('MemeInfo signal connection:',redact(error)));
  }
- private async onSignal(signal:ProjectSignal){
-  if(!this.feedHealthy||signal.time>Date.now()+5_000)return;
-  const runs=(await this.pool.query("SELECT id,signal_source,signal_sources,started_at FROM live_runs WHERE status='running' AND chain=$1 AND started_at IS NOT NULL AND $2=ANY(COALESCE(signal_sources,CASE WHEN signal_source='all' THEN ARRAY['fomo_new_project_expanded','top_cluster_first_buy'] ELSE ARRAY[signal_source] END))",[signal.chain,signal.source])).rows;
-  const relevant=runs.filter(r=>acceptsNewSignal(r,signal));
+ private async receiveDiscovery(signal:Discovery){
+  if(this.stopped)return;
+  const runs=this.sourceRuns.filter(r=>r.chain===signal.chain&&acceptsDiscovery(r,signal));if(!runs.length)return;
+  if(signal.provider==='xxyy'&&!runs.some(r=>qualifiesSource('xxyy',selectedProjectSources(r).xxyy,signal.facts??{},Date.now()))){for(const r of runs)this.countAdmission(r.id,signal,false,'XXYY 本地复核未通过');return;}
+  const capacity=(await this.pool.query(`SELECT r.id,COUNT(w.*) FILTER(WHERE w.status IN ('monitoring','recovering','pending_eviction'))::int AS active,
+   BOOL_OR(w.ca=$2 AND w.status IN ('monitoring','recovering','pending_eviction')) AS existing
+   FROM live_runs r LEFT JOIN live_watches w ON w.run_id=r.id WHERE r.id=ANY($1::uuid[]) GROUP BY r.id`,[runs.map(r=>r.id),signal.ca])).rows;
+  if(!capacity.some(r=>canMonitor(Number(r.active),!!r.existing))){for(const r of runs)this.countAdmission(r.id,signal,false,'监控名额已满');return;}
+  // Lookup must not block the serialized market/decision queue.
+  const info=await this.projects.fresh(signal);
+  const latest=this.latestCaps.get(projectKey(signal));
+  const facts={createdAt:info.createdAt,marketCap:info.marketCap,...signal.facts};
+  if(latest?.pairId===info.pairId&&Date.now()-latest.time<60000)facts.marketCap=latest.value;
+  signal={...signal,facts};
+  await new Promise<void>((resolve,reject)=>this.enqueue(async()=>{try{if(!this.stopped)await this.onSignal(signal,info);resolve();}catch(e){reject(e);}}));
+ }
+ private countAdmission(id:string,signal:Discovery,accepted:boolean,reason?:string){const key=`${id}:${signal.provider}`,c=this.admissionCounts.get(key)??{accepted:0,filtered:0,lastReceivedAt:0};c[accepted?'accepted':'filtered']++;c.lastReceivedAt=Date.now();c.reason=reason;this.admissionCounts.set(key,c);}
+ private async onSignal(signal:Discovery,pool:{pairId:string;dexId:string}){
+  if(signal.time>Date.now()+5_000)return;
+  const runs=(await this.pool.query("SELECT * FROM live_runs WHERE status='running' AND chain=$1 AND started_at IS NOT NULL",[signal.chain])).rows;
+  const relevant=runs.filter(r=>acceptsDiscovery(r,signal));
   if(!relevant.length)return;
   const capacities=(await this.pool.query(`SELECT r.id,COUNT(w.*) FILTER(WHERE w.status IN ('monitoring','recovering','pending_eviction'))::int AS active,
    BOOL_OR(w.ca=$2 AND w.status IN ('monitoring','recovering','pending_eviction')) AS existing
@@ -256,25 +297,18 @@ export class LiveService {
   if(!capacities.some(r=>canMonitor(Number(r.active),!!r.existing))){
    await this.pool.query("INSERT INTO live_events(chain,ca,kind,event_time,payload) VALUES($1,$2,'signal_skipped',$3,$4)",[signal.chain,signal.ca,signal.time,JSON.stringify({reason:'all_matching_runs_full',limit:LIVE_CA_LIMIT})]);return;
   }
-  if(!this.projects.peek(signal)){
-   void this.projects.get(signal).then(()=>{if(!this.stopped)this.enqueue(()=>this.onSignal(signal));}).catch(e=>{
-    console.error('新信号项目资料:',redact(e));const state=this.projects.status(signal);
-    if(this.stopped||!state||state.attempts>=3||this.signalRetries.has(signal.key)||this.signalRetries.size>=1000)return;
-    const timer=setTimeout(()=>{this.signalRetries.delete(signal.key);if(!this.stopped)this.enqueue(()=>this.onSignal(signal));},Math.max(1000,state.nextRetryAt-Date.now()));this.signalRetries.set(signal.key,timer);
-   });return;
-  }
-  const pool=this.projects.peek(signal)!;
-  if(!pool){await this.pool.query("INSERT INTO live_events(chain,ca,kind,event_time,payload) VALUES($1,$2,'lookup_unmatched',$3,$4)",[signal.chain,signal.ca,signal.time,JSON.stringify({source:signal.source})]);return;}
-  const latest=this.latestCaps.get(projectKey(signal));
-  const marketCap=latest?.pairId===pool.pairId&&Date.now()-latest.time<=60_000?latest.value:Date.now()-pool.fetchedAt<=60_000?pool.marketCap:undefined;
-  if(!eligibleMarketCap(marketCap)){
-   await this.pool.query("INSERT INTO live_events(chain,ca,pair_id,kind,event_time,payload) VALUES($1,$2,$3,'signal_skipped',$4,$5)",[signal.chain,signal.ca,pool.pairId,signal.time,JSON.stringify({reason:'market_cap_below_threshold_or_missing',marketCap:marketCap??null})]);return;
-  }
+  const marketCap=signal.facts?.marketCap;
   const {pairId,dexId}=pool;
   const c=await this.pool.connect();
   try{await c.query('BEGIN');
    // Serialize admissions per run; concurrent signals cannot each claim the last slot.
-   const admitted=(await c.query("SELECT id,signal_source,signal_sources,started_at,status FROM live_runs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",[relevant.map(r=>r.id)])).rows.filter(r=>r.status==='running'&&acceptsNewSignal(r,signal));
+   let admitted=(await c.query("SELECT * FROM live_runs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",[relevant.map(r=>r.id)])).rows.filter(r=>r.status==='running'&&acceptsDiscovery(r,signal)&&qualifiesSource(signal.provider,selectedProjectSources(r)[signal.provider],signal.facts??{},Date.now()));
+   for(const r of relevant)if(!admitted.some(a=>a.id===r.id))this.countAdmission(r.id,signal,false,'市值、年龄、KOL 或来源条件不符合');
+   if(signal.provider==='xxyy'){
+    const seen=(await c.query("SELECT run_id FROM live_watches WHERE run_id=ANY($1::uuid[]) AND chain=$2 AND ca=$3 AND status<>'evicted_low_mcap' AND 'xxyy'=ANY(matched_sources)",[admitted.map(r=>r.id),signal.chain,signal.ca])).rows;
+    admitted=admitted.filter(r=>!seen.some(w=>w.run_id===r.id));
+   }
+   if(!admitted.length){await c.query('COMMIT');return;}
    await c.query(`INSERT INTO token_signal_events(chain,ca,signal_source,detail_id,signal_time,source_signal,provenance)
     VALUES($1,$2,$3,$4,$5,$6,'[]') ON CONFLICT(chain,ca,signal_source,detail_id) DO NOTHING`,[signal.chain,signal.ca,signal.source,signal.key,signal.time,JSON.stringify(signal.identity)]);
    await c.query(`INSERT INTO token_info(chain,ca,pair,signal_source,source_signal,signal_time) VALUES($1,$2,$3,$4,$5,$6)
@@ -283,17 +317,23 @@ export class LiveService {
     signal_time=LEAST(COALESCE(token_info.signal_time,EXCLUDED.signal_time),EXCLUDED.signal_time)`,[signal.chain,signal.ca,pairId,signal.source,JSON.stringify(signal.identity),signal.time]);
    for(const r of admitted){
     const active=Number((await c.query("SELECT COUNT(*) AS count FROM live_watches WHERE run_id=$1 AND status IN ('monitoring','recovering','pending_eviction')",[r.id])).rows[0].count);
-    const prior=(await c.query('SELECT status,signal_key FROM live_watches WHERE run_id=$1 AND chain=$2 AND ca=$3',[r.id,signal.chain,signal.ca])).rows[0];
+    const prior=(await c.query('SELECT status,signal_key,matched_sources FROM live_watches WHERE run_id=$1 AND chain=$2 AND ca=$3',[r.id,signal.chain,signal.ca])).rows[0];
+    const matched:ProjectProvider[]=prior&&prior.status!=='evicted_low_mcap'?[...new Set<ProjectProvider>([...(prior.matched_sources??['memeinfo']),signal.provider])]:[signal.provider];
+    const exitCap=effectiveExitCap(selectedProjectSources(r),matched);
     if(prior?.status!=='evicted_low_mcap'&&prior){
+     await c.query('UPDATE live_watches SET matched_sources=$4,exit_market_cap=$5 WHERE run_id=$1 AND chain=$2 AND ca=$3',[r.id,signal.chain,signal.ca,matched,exitCap]);
+     if(signal.provider==='xxyy'&&prior.matched_sources?.includes('xxyy'))continue;
      await c.query('UPDATE live_runs SET last_signal_at=GREATEST(COALESCE(last_signal_at,0),$2) WHERE id=$1',[r.id,signal.time]);
      await c.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'external_signal',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[r.id,signal.chain,signal.ca,pairId,`${r.id}:${signal.key}`,signal.time,JSON.stringify(signal.identity)]);
      continue;
     }
     if(!canMonitor(active,false)){await c.query("INSERT INTO live_events(run_id,chain,ca,kind,event_time,payload) VALUES($1,$2,$3,'signal_skipped',$4,$5)",[r.id,signal.chain,signal.ca,signal.time,JSON.stringify({reason:'run_full',limit:LIVE_CA_LIMIT})]);continue;}
     if(prior?.signal_key===signal.key)continue;
-    await c.query(`INSERT INTO live_watches(run_id,chain,ca,pair_id,dex_id,signal_source,signal_key,signal_time,status,state_json,last_candle_time,current_mcap,mcap_checked_at,recovery_reason)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,'recovering','{}',NULL,$9,now(),'新信号入组，预热指标')
-      ON CONFLICT(run_id,chain,ca) DO UPDATE SET pair_id=EXCLUDED.pair_id,dex_id=EXCLUDED.dex_id,signal_source=EXCLUDED.signal_source,signal_key=EXCLUDED.signal_key,signal_time=EXCLUDED.signal_time,status='recovering',state_json='{}',last_candle_time=NULL,current_mcap=EXCLUDED.current_mcap,mcap_checked_at=now(),recovery_reason=EXCLUDED.recovery_reason`,[r.id,signal.chain,signal.ca,pairId,dexId,signal.source,signal.key,signal.time,marketCap]);
+    const admittedAt=Date.now(),entryTime=signal.provider==='memeinfo'?signal.time:Math.max(signal.time,admittedAt);
+    await c.query(`INSERT INTO live_watches(run_id,chain,ca,pair_id,dex_id,signal_source,signal_key,signal_time,status,state_json,last_candle_time,current_mcap,mcap_checked_at,recovery_reason,matched_sources,exit_market_cap,admitted_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,'recovering','{}',NULL,$9,now(),'新信号入组，预热指标',$10,$11,$12)
+      ON CONFLICT(run_id,chain,ca) DO UPDATE SET pair_id=EXCLUDED.pair_id,dex_id=EXCLUDED.dex_id,signal_source=EXCLUDED.signal_source,signal_key=EXCLUDED.signal_key,signal_time=EXCLUDED.signal_time,status='recovering',state_json='{}',last_candle_time=NULL,current_mcap=EXCLUDED.current_mcap,mcap_checked_at=now(),recovery_reason=EXCLUDED.recovery_reason,matched_sources=EXCLUDED.matched_sources,exit_market_cap=EXCLUDED.exit_market_cap,admitted_at=EXCLUDED.admitted_at,exit_only=false`,[r.id,signal.chain,signal.ca,pairId,dexId,signal.source,signal.key,entryTime,marketCap,matched,exitCap,admittedAt]);
+    this.countAdmission(r.id,signal,true);
     await c.query("UPDATE live_runs SET last_signal_at=GREATEST(COALESCE(last_signal_at,0),$2),feed_state='connecting' WHERE id=$1",[r.id,signal.time]);
     await c.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'external_signal',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[r.id,signal.chain,signal.ca,pairId,`${r.id}:${signal.key}`,signal.time,JSON.stringify(signal.identity)]);
    }
@@ -321,7 +361,7 @@ export class LiveService {
    ctx.watch.last_trade_at=String(trade.time);if(trade.mcap!==undefined)ctx.watch.current_mcap=String(trade.mcap);
    this.dirtyWatches.add(watchKey(ctx.run.id,ctx.watch.chain,ctx.watch.ca));
    this.bump(ctx.run.id,'lastTradeAt',trade.time);
-   if(trade.mcap!==undefined&&trade.mcap<MIN_MARKET_CAP)await this.evictOrRetain(ctx,'实时市值低于 50,000 USD');
+   if(trade.mcap!==undefined&&trade.mcap<Number(ctx.watch.exit_market_cap??MIN_MARKET_CAP))await this.evictOrRetain(ctx,`实时市值低于 ${ctx.watch.exit_market_cap??MIN_MARKET_CAP} USD`);
    if(ctx.watch.status==='evicted_low_mcap')continue;
    if(!ctx.ready)continue;
    if(ctx.run.value_type==='mcap'&&(!trade.mcap||trade.mcap<=0)){await this.markRecovering(ctx,'实时成交缺少可靠市值');continue;}
@@ -390,7 +430,7 @@ export class LiveService {
   }finally{this.executionClient=undefined;client.release();}
   const submissions=this.submissions;this.submissions=[];
   for(const s of submissions)await this.submitLive(s.ctx,s.id,s.decision,s.amount);
-  for(const {ctx} of work)if(ctx.run.mode==='paper'&&!ctx.evaluator.state.position&&ctx.watch.status==='pending_eviction')await this.evictOrRetain(ctx,'低市值持仓已平仓');
+  for(const {ctx} of work)if(ctx.run.mode==='paper'&&!ctx.evaluator.state.position&&(ctx.watch.exit_only||ctx.watch.status==='pending_eviction'))await this.evictOrRetain(ctx,'低市值持仓已平仓');
  }
  private async recordEquity(run:Run,time:number){
   const watches=[...this.watches.values()].filter(c=>c.run.id===run.id),cash=Number(run.cash);
@@ -557,11 +597,11 @@ export class LiveService {
    if(!valid())return;
    await this.seedAggregation(ctx,boundary,valid);
    if(!valid())return;
-   await this.pool.query("UPDATE live_watches SET status='monitoring',recovery_reason=NULL WHERE run_id=$1 AND chain=$2 AND ca=$3",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);
+   await this.pool.query("UPDATE live_watches SET status=CASE WHEN exit_only THEN 'pending_eviction' ELSE 'monitoring' END,recovery_reason=CASE WHEN exit_only THEN '低市值：只允许退出，仓位及订单结清后移除' ELSE NULL END WHERE run_id=$1 AND chain=$2 AND ca=$3",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);
    if(!valid())return;
    if(![...this.watches.values()].some(other=>other!==ctx&&other.ready&&other.watch.chain===ctx.watch.chain&&other.watch.pair_id===ctx.watch.pair_id))
     this.aggregator.markClosedThrough(ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,boundary);
-   ctx.noOrdersBefore=boundary;ctx.ready=true;ctx.watch.status='monitoring';
+   ctx.noOrdersBefore=boundary;ctx.ready=true;ctx.watch.status=ctx.watch.exit_only?'pending_eviction':'monitoring';
   }catch(e){if(valid())await this.markRecovering(ctx,`补行情失败，稍后重试：${redact(e)}`,60_000);}
  }
  private async seedAggregation(ctx:Context,boundary=ctx.noOrdersBefore,valid=()=>true){
@@ -581,8 +621,8 @@ export class LiveService {
   if(ctx.run.mode==='paper')await this.pool.query("UPDATE live_orders SET status='cancelled',updated_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3 AND side='buy' AND status='pending'",[ctx.run.id,ctx.watch.chain,ctx.watch.ca]);
   const held=!!ctx.evaluator.state.position,pending=await this.pending(ctx);
   const status=held||pending?'pending_eviction':'evicted_low_mcap';
-  ctx.watch.status=status;
-  await this.pool.query('UPDATE live_watches SET status=$4,recovery_reason=$5 WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,status,reason]);
+  ctx.watch.status=status;ctx.watch.exit_only=true;
+  await this.pool.query('UPDATE live_watches SET exit_only=true,status=$4,recovery_reason=$5 WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,status,reason]);
   if(status==='evicted_low_mcap'){
    this.watches.delete(watchKey(ctx.run.id,ctx.watch.chain,ctx.watch.ca));
    await this.pool.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_time,payload) VALUES($1,$2,$3,$4,'watch_evicted',$5,$6)",[ctx.run.id,ctx.watch.chain,ctx.watch.ca,ctx.watch.pair_id,Date.now(),JSON.stringify({reason})]);
@@ -595,14 +635,22 @@ export class LiveService {
    const key=`${ctx.watch.chain}:${ctx.watch.ca}`;groups.set(key,[...(groups.get(key)??[]),ctx]);
   }
   for(const contexts of groups.values()){
+   if(this.stopped)return;
    const first=contexts[0]!;
-   const latest=this.latestCaps.get(projectKey(first.watch));
-   if(!latest||Date.now()-latest.time>60_000)continue;
-    for(const ctx of contexts){
-     if(ctx.watch.pair_id!==latest.pairId)continue;
-     await this.pool.query('UPDATE live_watches SET current_mcap=$4,mcap_checked_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,latest.value]);
-     if(latest.value<MIN_MARKET_CAP)await this.evictOrRetain(ctx,'最新成交市值低于 50,000 USD');
-    }
+   let latest=this.latestCaps.get(projectKey(first.watch));
+   if(!latest||Date.now()-latest.time>60_000){
+    try{const info=await this.projects.fresh(first.watch);if(info.marketCap==null)continue;latest={value:info.marketCap,pairId:info.pairId,time:info.fetchedAt};}
+    catch{continue;} // Missing/failed lookup is never zero market cap.
+    await wait(250);
+   }
+   const cap=latest;
+   this.enqueue(async()=>{if(this.stopped)return;for(const ctx of contexts){
+    if(this.watches.get(watchKey(ctx.run.id,ctx.watch.chain,ctx.watch.ca))!==ctx||ctx.watch.pair_id!==cap.pairId)continue;
+    const tick=this.latestCaps.get(projectKey(ctx.watch));const value=tick&&tick.time>cap.time?tick.value:cap.value;
+    ctx.watch.current_mcap=String(value);
+    await this.pool.query('UPDATE live_watches SET current_mcap=$4,mcap_checked_at=now() WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,value]);
+    if(value<Number(ctx.watch.exit_market_cap??MIN_MARKET_CAP))await this.evictOrRetain(ctx,`市值复查低于 ${ctx.watch.exit_market_cap??MIN_MARKET_CAP} USD`);
+   }});
   }
  }
  private bump(runId:string,field:'late'|'closed'|'tooOld'|'reconnect'|'lastTradeAt',time=0){
@@ -648,7 +696,9 @@ export class LiveService {
   const key=createHash('sha256').update(`${ctx.run.id}:${ctx.watch.chain}:${ctx.watch.ca}:${d.side}:${d.reason}:${d.time}`).digest('hex');
   const cfg=ctx.run.strategy_json,position=ctx.evaluator.state.position;
   if(d.side==='buy'){
-   if(ctx.watch.status==='pending_eviction'||!this.feedHealthy || d.time<=Number(ctx.watch.signal_time))return;
+   if(ctx.watch.exit_only||ctx.watch.status==='pending_eviction'||d.time<=Number(ctx.watch.signal_time))return;
+   const exitCap=effectiveExitCap(selectedProjectSources(ctx.run),ctx.watch.matched_sources??['memeinfo']);
+   if(ctx.watch.current_mcap!=null&&Number(ctx.watch.current_mcap)<exitCap)return;
    const active=[...this.watches.values()].filter(x=>x.run.id===ctx.run.id&&x.evaluator.state.position).length+this.submissions.filter(x=>x.ctx.run.id===ctx.run.id&&x.decision.side==='buy'&&!x.ctx.evaluator.state.position).length;
    if(!position && active>=cfg.positionConfig.maxConcurrentPositions)return;
   }

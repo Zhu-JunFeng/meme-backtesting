@@ -72,7 +72,7 @@ describe('monitor admission',()=>{
   const pool={query:vi.fn(async(sql:string)=>({rows:sql.includes('COUNT(w.*)')?[{id:'r',active:0,existing:false}]:[run]})),connect:async()=>({query:tx,release:vi.fn()})};
   const service:any=new LiveService(pool as never);service.feedHealthy=true;service.refresh=vi.fn();
   service.projects={peek:()=>({pairId:'p',dexId:null,marketCap:100000,fetchedAt:Date.now()})};
-  await service.onSignal({chain:'bsc',ca:'a',source:'top_cluster_first_buy',time:2000,key:'s',identity:{}});
+  await service.onSignal({provider:'memeinfo',observedAt:2000,facts:{marketCap:100000},chain:'bsc',ca:'a',source:'top_cluster_first_buy',time:2000,key:'s',identity:{}},{pairId:'p',dexId:''});
   expect(tx.mock.calls.some(([sql])=>sql.includes('FOR UPDATE'))).toBe(true);
   expect(tx.mock.calls.some(([sql])=>sql.includes('INSERT INTO live_watches'))).toBe(false);
  });

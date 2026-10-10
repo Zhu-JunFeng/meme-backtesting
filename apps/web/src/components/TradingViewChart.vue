@@ -6,6 +6,7 @@ import { eventLabels as labels, marketValue, changePercent, formatNumber, precis
 import FibAudit from './FibAudit.vue';
 import { partitionMarkers } from '../chartMarkers';
 import {externalBuckets} from '../externalSignals';
+import {sourceText} from '../live-monitor';
 import ProjectIdentity from './ProjectIdentity.vue';
 const props=defineProps<{symbol:string;interval:string;runId?:string;liveRunId?:string;startTime?:number|null;endTime?:number|null;includeEndOfBacktest?:boolean;signalTypes?:string;anchor?:{tradeId?:string;from?:number;to?:number;start?:number;end?:number;empty?:boolean;fib?:any;fibFrom?:number;fibTo?:number}}>();
 const filters=()=>({includeEndOfBacktest:props.includeEndOfBacktest ?? false,signalTypes:props.signalTypes ?? ''});
@@ -25,7 +26,7 @@ const missingMarkers=ref(0);
 const showExternal=ref(true),externalRows=ref<any[]>([]),externalPage=ref(1),externalSelection=ref<any[]>(),externalMissing=ref(0),externalLoading=ref(false);
 const externalIds=new Map<any,any[]>();let externalEpoch=0;
 const externalPageRows=computed(()=>externalRows.value.slice((externalPage.value-1)*20,externalPage.value*20));
-const externalText=(e:any)=>`${e.first?'首次监控':'外部信号'} · ${beijingTime(e.signalTime,true)} · ${e.signalSource}${e.sourceSignal?.name?' / '+e.sourceSignal.name:''}${e.sourceSignal?.signalId?' / 信号 '+e.sourceSignal.signalId:''} · 明细 ${e.detailId||'不可用'}${e.basis==='supplemental'?' · 补充展示，非当时回测依据':''}`;
+const externalText=(e:any)=>`${e.first?'首次监控':'外部信号'} · ${beijingTime(e.signalTime,true)} · ${e.sourceSignal?.signalName||sourceText(e.signalSource)}${e.sourceSignal?.name?' / '+e.sourceSignal.name:''}${e.sourceSignal?.wallet?' / 钱包 '+e.sourceSignal.wallet:''}${e.sourceSignal?.transactionTime?' / 链上时间 UTC '+new Date(e.sourceSignal.transactionTime).toISOString():''}${e.sourceSignal?.signature?' / 交易 '+e.sourceSignal.signature:''}${e.sourceSignal?.signalId?' / 信号 '+e.sourceSignal.signalId:''} · 明细 ${e.detailId||'不可用'}${e.basis==='supplemental'?' · 补充展示，非当时回测依据':''}`;
 function clearExternal(chart:any){externalEpoch++;for(const id of externalIds.keys())try{chart.removeEntity(id);}catch{}externalIds.clear();}
 async function drawExternal(chart:any,v:number){
  clearExternal(chart);const request=externalEpoch,range=chart.getVisibleRange();if(!showExternal.value||!range)return;

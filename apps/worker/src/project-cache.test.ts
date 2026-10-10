@@ -1,5 +1,5 @@
 import {describe,it,expect,vi} from 'vitest';
-import {ProjectCache,cacheKey,normalizedSupply,projectInfo,resolveMarketCap} from './project-cache.js';
+import {ProjectCache,cacheKey,normalizedSupply,projectInfo,resolveMarketCap,projectCreatedAt} from './project-cache.js';
 import {LiveCandleAggregator} from '@meme/engine';
 const project={chain:'robin',ca:'0xABC'},item={chain:'robin',token_address:'0xabc',main_pair_id:'p',current_market_cap:'150000',project_meta:{total_supply:'1000000000000000000',decimals:'9'}};
 const response=(x:any=item)=>({ok:true,json:async()=>({data:{caListTokenList:[x]}})}) as Response;
@@ -32,6 +32,21 @@ describe('exact supply and market cap',()=>{
  });
 });
 describe('single query and persistent retry ledger',()=>{
+ it('refreshes dynamic cap with single-flight and never returns expired cap after failure',async()=>{
+  let now=Date.now();const request=vi.fn(async()=>response({...item,token_create_time:now-100000})) as any;
+  const cache=new ProjectCache(memory(),request,()=>now);
+  await Promise.all([cache.fresh(project),cache.fresh(project)]);expect(request).toHaveBeenCalledTimes(1);
+  now+=61000;request.mockResolvedValueOnce(response({...item,current_market_cap:'23000'}));
+  expect((await cache.fresh(project)).marketCap).toBe(23000);expect(request).toHaveBeenCalledTimes(2);
+  now+=61000;request.mockRejectedValueOnce(new Error('offline'));await expect(cache.fresh(project)).rejects.toThrow('offline');
+ });
+ it('uses token creation time and validates seconds, milliseconds, fallback and future values',()=>{
+  const t=1700000000000;
+  expect(projectCreatedAt({token_create_time:t/1000})).toBe(t);
+  expect(projectCreatedAt({token_create_time:t})).toBe(t);
+  expect(projectCreatedAt({token_create_time:'bad',project_meta:{create_time:new Date(t).toISOString()}})).toBe(t);
+  expect(projectCreatedAt({token_create_time:Date.now()+100000})).toBeUndefined();
+ });
  it('shares concurrent lookups and reuses Redis after process restart',async()=>{
   const store=memory(),request=vi.fn(async()=>response()) as any;const cache=new ProjectCache(store,request);
   await Promise.all([cache.get(project),cache.get({chain:'robin',ca:'0xabc'}),cache.get(project)]);await cache.get(project);expect(request).toHaveBeenCalledTimes(1);

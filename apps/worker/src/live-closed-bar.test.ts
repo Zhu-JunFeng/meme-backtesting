@@ -3,7 +3,7 @@ import {Pool} from 'pg';
 import {readFileSync} from 'node:fs';
 import {randomUUID} from 'node:crypto';
 import {LiveEvaluator,type ClosedMarketBar} from '@meme/engine';
-import type {StrategyConfig} from '@meme/domain';
+import {defaultProjectSources,type StrategyConfig} from '@meme/domain';
 import {LiveService,simulatedBarPrice,LIVE_EXECUTION_VERSION} from './live-service.js';
 import {parseHistory} from './history-client.js';
 
@@ -37,9 +37,10 @@ const url=process.env.TEST_DATABASE_URL;
   pool=new Pool({connectionString:url,options:`-c search_path=${schema},public`});
   await pool.query('CREATE TABLE backtest_strategy_versions(id uuid PRIMARY KEY DEFAULT gen_random_uuid())');
   version=(await pool.query('INSERT INTO backtest_strategy_versions DEFAULT VALUES RETURNING id')).rows[0].id;
-  for(const name of ['010_live_trading','011_live_signal_sources','012_live_watch_dex','013_live_recovery_capacity','014_live_portfolio','015_live_closed_bar','016_live_market_protocol','017_live_signal_selections'])
+  for(const name of ['010_live_trading','011_live_signal_sources','012_live_watch_dex','013_live_recovery_capacity','014_live_portfolio','015_live_closed_bar','016_live_market_protocol','017_live_signal_selections','018_project_sources'])
    await pool.query(readFileSync(new URL(`../../api/migrations/${name}.sql`,import.meta.url),'utf8').replaceAll('public.',`${schema}.`));
   await pool.query(`CREATE TABLE meme_kline(chain text,ca text,pair_id text,interval text,open_time bigint,close_time bigint,open numeric,high numeric,low numeric,close numeric,volume numeric,trade_count bigint,type text,source text,raw_data jsonb,valid boolean,UNIQUE(chain,pair_id,interval,open_time,type))`);
+  await pool.query(`CREATE TABLE token_signal_events(chain text,ca text,signal_source text,detail_id text,signal_time bigint,source_signal jsonb,provenance jsonb,UNIQUE(chain,ca,signal_source,detail_id));CREATE TABLE token_info(chain text,ca text,pair text,signal_source text,source_signal jsonb,signal_time bigint,UNIQUE(chain,ca,pair))`);
  },20_000);
  afterEach(()=>vi.unstubAllEnvs());
  afterAll(async()=>{await pool?.end();if(admin){await admin.query(`DROP SCHEMA ${schema} CASCADE`);await admin.end();}});
@@ -68,6 +69,35 @@ const url=process.env.TEST_DATABASE_URL;
   stored=(await pool.query('SELECT * FROM live_runs WHERE id=$1',[run.id])).rows[0];expect(stored.signal_sources).toEqual(['top_cluster_first_buy','fomo_trending_new_project']);
   await expect(pool.query('UPDATE live_runs SET signal_sources=$2 WHERE id=$1',[run.id,[]])).rejects.toThrow();
   await expect(pool.query('UPDATE live_runs SET signal_sources=$2 WHERE id=$1',[run.id,['unknown']])).rejects.toThrow();
+ });
+ it('admits multiple sources once, uses their minimum exit cap, and can re-admit an evicted feed CA',async()=>{
+  const {run,service}=await fixture();const config=defaultProjectSources();config.wallet.enabled=config.xxyy.enabled=true;
+  await pool.query('UPDATE live_runs SET started_at=now()-interval \'1 hour\',project_sources=$2 WHERE id=$1',[run.id,JSON.stringify(config)]);
+  service.refresh=vi.fn();const now=Date.now(),facts={marketCap:80000,createdAt:now-100000,kol:3,dexId:'pfamm'},candidate={provider:'xxyy',observedAt:now,chain:'sol',ca:'multi',source:'xxyy_completed',key:'feed:1',time:now,facts,identity:{source:'xxyy_completed'}};
+  await service.onSignal(candidate,{pairId:'p',dexId:'pfamm'});
+  await service.onSignal({...candidate,key:'feed:2',time:now+1},{pairId:'p',dexId:'pfamm'});
+  let watches=(await pool.query('SELECT * FROM live_watches WHERE run_id=$1',[run.id])).rows;
+  expect(watches).toHaveLength(1);expect(watches[0].matched_sources).toEqual(['xxyy']);expect(watches[0].signal_key).toBe('feed:1');expect(watches[0].exit_market_cap).toBe('30000');
+  expect((await pool.query("SELECT * FROM live_events WHERE run_id=$1 AND kind='external_signal'",[run.id])).rows).toHaveLength(1);
+  await service.onSignal({...candidate,provider:'wallet',source:'wallet_buy',key:'wallet:1',identity:{source:'wallet_buy',transactionTime:now}},{pairId:'p',dexId:'pfamm'});
+  watches=(await pool.query('SELECT * FROM live_watches WHERE run_id=$1',[run.id])).rows;expect(watches[0].exit_market_cap).toBe('20000');expect(watches[0].matched_sources).toEqual(['xxyy','wallet']);
+  await pool.query("UPDATE live_watches SET status='evicted_low_mcap' WHERE run_id=$1",[run.id]);
+  await service.onSignal({...candidate,key:'feed:3',time:now+2},{pairId:'p',dexId:'pfamm'});
+  const restored=(await pool.query('SELECT * FROM live_watches WHERE run_id=$1',[run.id])).rows[0];expect(restored.signal_key).toBe('feed:3');expect(restored.status).toBe('recovering');expect(restored.matched_sources).toEqual(['xxyy']);
+ });
+ it('serializes concurrent last-slot admissions and retains held positions on eviction',async()=>{
+  const {run,service,add}=await fixture();await pool.query("UPDATE live_runs SET started_at=now()-interval '1 hour' WHERE id=$1",[run.id]);service.refresh=vi.fn();
+  for(let i=0;i<19;i++)await add(`capacity${i}`,false);
+  const signal=(ca:string)=>({provider:'memeinfo',observedAt:Date.now(),chain:'sol',ca,source:'fomo_new_project_expanded',key:ca,time:Date.now(),facts:{marketCap:80000},identity:{source:'fomo_new_project_expanded'}});
+  await Promise.all(['last1','last2'].map(ca=>service.onSignal(signal(ca),{pairId:ca,dexId:''})));
+  expect(Number((await pool.query('SELECT count(*) FROM live_watches WHERE run_id=$1',[run.id])).rows[0].count)).toBe(20);
+  const held=await add('held');await service.evictOrRetain(held,'below cap');expect(held.watch.status).toBe('pending_eviction');expect(held.evaluator.state.position).toBeDefined();
+  await service.markRecovering(held,'test reconnect');expect(held.watch.exit_only).toBe(true);
+  expect((await pool.query('SELECT exit_only FROM live_watches WHERE run_id=$1 AND ca=$2',[run.id,'held'])).rows[0].exit_only).toBe(true);
+  held.ready=true;held.watch.status='monitoring';held.watch.current_mcap='999999';
+  await service.createDecision(held,{side:'buy',reason:'pyramiding',time:180000,value:100},bar('held'),bar('held'));
+  expect((await pool.query('SELECT id FROM live_orders WHERE run_id=$1 AND ca=$2',[run.id,'held'])).rows).toHaveLength(0);
+  held.evaluator.state.position=undefined;await service.evictOrRetain(held,'closed');expect(held.watch.status).toBe('evicted_low_mcap');
  });
  it('imports history with exact decimals, retains authoritative conflicts, and never emits historical orders',async()=>{
   const {run,service,add}=await fixture('paper','mcap');const ctx=await add('history');ctx.evaluator.state.position!.lockPrice=10500;ctx.evaluator.state.position!.lockTier=1;
