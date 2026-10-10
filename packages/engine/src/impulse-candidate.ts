@@ -14,7 +14,8 @@ export function advanceImpulseCandidate(history: Candle[], config: ImpulseConfig
   const last = index - config.rightBars;
   const at = (i: number) => history[i - offset];
   const close = end ? at(index).close : NaN;
-  if (config.enabled !== false && pending && pending.lowIndex >= first && close <= pending.high && close >= pending.low)
+  if (config.enabled !== false && pending && pending.lowIndex >= first && pending.highIndex <= last
+    && pending.confirmedAtIndex <= index && close <= pending.high && close >= pending.low)
     return { impulse: pending, changed: false };
   const result = (impulse?: Impulse) => ({ impulse, changed: !!pending || !!impulse });
   if (config.enabled === false || end < config.leftBars + config.rightBars + 2) return result();

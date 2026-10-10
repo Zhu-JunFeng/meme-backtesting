@@ -93,6 +93,9 @@ export class LiveEvaluator {
  constructor(readonly config:StrategyConfig, readonly signalTime:number, state?:LiveEvaluatorState){
   this.state=state?structuredClone(state):{history:[],lastEntryMatch:false,lastAddMatch:false,trades:0};
   const s=this.state;
+  if(usesPullbackSelection(config.impulseCondition)&&!s.history.length){
+   s.pendingImpulse=undefined;s.lastEntryMatch=false;s.lastAddMatch=false;s.candidateHadPosition=!!s.position;
+  }
   if(usesPullbackSelection(config.impulseCondition)&&s.impulseSelectionVersion!==IMPULSE_SELECTION_VERSION){
    s.pendingImpulse=undefined;s.lastEntryMatch=false;
    // Rebuild only flat candidates, strictly prefix by prefix; never emit historical decisions.

@@ -78,6 +78,15 @@ describe('pullback-v2 selection and lifecycle',()=>{
   for(const c of bars([12,10,14,20,18,15]))decision=live.onClosedCandle(c)??decision;
   expect(decision?.impulse).toBeDefined();expect(decision!.impulse).not.toBe(live.state.pendingImpulse);
  });
+ it('clears old-pool candidates when a flat feed resets its history',()=>{
+  const config=withCurrentImpulseSelection(configuration());config.impulseCondition={...cfg};
+  const live=new LiveEvaluator(config,0);for(const c of bars([12,10,14,20,18]))live.onClosedCandle(c,true);
+  expect(live.state.pendingImpulse?.high).toBe(20);
+  const state=live.snapshot();state.history=[];state.lastCandleTime=undefined;
+  const reset=new LiveEvaluator(config,0,state);expect(reset.state.pendingImpulse).toBeUndefined();
+  reset.onClosedCandle(bars([15])[0],true);expect(reset.state.pendingImpulse).toBeUndefined();
+  expect(advanceImpulseCandidate(bars([15]),cfg,state.pendingImpulse).impulse).toBeUndefined();
+ });
  it('all three executors enter on the same closed bar and holding anchors survive later breakout/add/exit',()=>{
   const config=withCurrentImpulseSelection(configuration());config.impulseCondition={...cfg};config.entryAfterSignal=false;
   config.exitConfig={stopLoss:{type:'swing_low',bufferPercent:0},takeProfit:{type:'percent',value:1000},closeAtEnd:false};

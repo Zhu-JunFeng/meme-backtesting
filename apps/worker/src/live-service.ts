@@ -565,7 +565,7 @@ export class LiveService {
    if(pool.pairId!==ctx.watch.pair_id){
     if(ctx.evaluator.state.position&&pool.pairId!==ctx.watch.pair_id)throw new Error('已有持仓主池发生变化，暂停策略等待核验；不迁移旧持仓行情');
     this.aggregator.discardPair(ctx.watch.chain,ctx.watch.pair_id);
-    const state=ctx.evaluator.snapshot();if(!state.position){state.history=[];state.lastCandleTime=undefined;ctx.watch.last_candle_time=null;}
+    const state=ctx.evaluator.snapshot();if(!state.position){state.history=[];state.lastCandleTime=undefined;state.pendingImpulse=undefined;state.lastEntryMatch=false;state.lastAddMatch=false;state.candidateHadPosition=false;ctx.watch.last_candle_time=null;}
     ctx.watch.pair_id=pool.pairId;ctx.watch.dex_id=pool.dexId;ctx.evaluator=new LiveEvaluator(ctx.run.strategy_json,Number(ctx.watch.signal_time),state);
     await this.pool.query('UPDATE live_watches SET pair_id=$4,dex_id=$5,last_candle_time=$6,state_json=$7 WHERE run_id=$1 AND chain=$2 AND ca=$3',[ctx.run.id,ctx.watch.chain,ctx.watch.ca,pool.pairId,pool.dexId,ctx.watch.last_candle_time,JSON.stringify(state)]);
     ctx.noOrdersBefore=Date.now();this.connected.add(pairKey(ctx.watch.chain,ctx.watch.pair_id));
