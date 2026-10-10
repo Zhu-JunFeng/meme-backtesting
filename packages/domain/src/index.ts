@@ -78,6 +78,8 @@ export interface ConditionGroup {
 }
 
 export interface ImpulseConfig {
+  /** 缺省为旧规则；仅创建新版本/任务或显式实时切换时写入新规则。 */
+  selectionVersion?: "legacy-v1" | "pullback-v2";
   type: "impulse_fractal_swing";
   enabled?: boolean;
   leftBars: number;
@@ -87,6 +89,13 @@ export interface ImpulseConfig {
   maxDurationBars: number;
   requireVolumeExpansion: boolean;
   volumeExpansionRatio?: number;
+}
+
+/** Creation boundary only: never call this while restoring or cloning an existing task. */
+export function withCurrentImpulseSelection<T extends StrategyConfig>(strategy: T): T {
+  const copy = structuredClone(strategy);
+  copy.impulseCondition = { ...copy.impulseCondition, selectionVersion: 'pullback-v2' };
+  return copy;
 }
 
 export type StopLoss =

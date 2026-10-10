@@ -105,6 +105,7 @@ onBeforeUnmount(()=>{filterEpoch++;loadEpoch++;epoch++;caEpoch++;poolEpoch++;loc
    <p v-if="run.runtime_version" class="help" role="status">阶段：{{({freezing:'冻结输入',computing:'回测计算',saving:'保存结果',completed:'已完成'} as any)[run.phase] || run.phase}} · 恢复 {{run.recovery_count}} 次 · 最近检查点：{{run.checkpoint_at ? beijingTime(run.checkpoint_at) : '尚未生成'}}</p>
    <p class="help">所有展示时间：北京时间 UTC+8</p>
    <StrategyDescription :key="run.id" :description="run.strategy_description_json" :version="run.strategy_version" :execution="run.config_json.executionConfig" />
+   <p class="muted">本次实际选点规则：{{run.config_json.impulseCondition?.selectionVersion==='pullback-v2'?'pullback-v2 · 区间内不得有更高 High；未持仓锁定候选，收盘破高／破低或超出回看范围后重选；持仓锚点不变。':'legacy-v1 · 原快照选点规则；重试及重新回测不会切换新规则。'}} 以本次配置快照为准，版本说明不回填。</p>
    <p class="help">任务入场限制：{{run.config_json.entrySignals?.length?'仅在信号触发后买入':'未限制信号前买入'}}。{{run.config_json.signalSelection?.excluded?.length ? `因缺少信号排除 ${run.config_json.signalSelection.excluded.length} 个 CA` : ''}}</p>
    <a-alert v-if="run.status!=='completed'" type="info" show-icon message="当前为阶段性结果，最终盈亏报告在任务完成后生成。" />
    <a-progress v-if="['pending','running'].includes(run.status)" :percent="Math.round(Number(run.progress)*100)" />

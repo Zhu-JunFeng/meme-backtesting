@@ -1,12 +1,20 @@
 import {it,expect} from 'vitest';
 import {generateStrategyDescription} from '../src/strategy-description.js';
 import type {StrategyConfig} from '../src/index.js';
+import {withCurrentImpulseSelection} from '../src/index.js';
 const config=():StrategyConfig=>({schemaVersion:1,impulseCondition:{type:'impulse_fractal_swing',leftBars:2,rightBars:3,lookbackBars:120,minGainPercent:80,maxDurationBars:100,requireVolumeExpansion:true,volumeExpansionRatio:1.5},entryConditionGroup:{mode:'all',conditions:[{type:'fib_retracement',zoneLow:.618,zoneHigh:.786},{mode:'at_least',minMatches:1,conditions:[{type:'rsi_recovery',period:14,oversold:30,recovery:35},{type:'ema_reclaim',period:9,enabled:false}]}]},invalidationConditionGroup:{mode:'any',conditions:[{type:'break_swing_low_invalidation',bufferPercent:2}]},positionConfig:{mode:'pyramiding',maxEntries:3,maxConcurrentPositions:4,allowReentry:false,sizing:{type:'risk_percent',value:1}},executionConfig:{initialCapital:10000,feePercent:.5,slippagePercent:1,buyTaxPercent:2,sellTaxPercent:3,fillMode:'current_bar_close'},exitConfig:{stopLoss:{type:'fib_level',ratio:.886,bufferPercent:1},takeProfit:{type:'risk_reward',ratio:2},maxHoldingBars:100,closeAtEnd:true,profitLock:{enabled:true,tiers:[{activationPercent:50,floorPercent:20},{activationPercent:100,floorPercent:60}]}}});
 it('deterministic full prose preserves exact thresholds, nested groups, disabled conditions and notes without modifying strategy',()=>{
  const s=config(),original=JSON.stringify(s),d=generateStrategyDescription(s,'<script>note</script>\n备注');
  expect(d).toEqual(generateStrategyDescription(s,'<script>note</script>\n备注'));expect(JSON.stringify(s)).toBe(original);
  for(const text of ['0.618–0.786','右侧 3 根','全部满足','至少满足 1 项','[已禁用]','RSI','Fib 0.886 下方 1%','下一根才启用','盈利≥100% → 保底 60%','手续费 0.5%','卖出税 3%','10% 的估算距离','每个池平仓后不再入场','未配置加仓组','开盘时间必须严格晚于','末根新买入'])expect(d.generatedText).toContain(text);
- expect(d.notes).toBe('<script>note</script>\n备注');expect(d.generatorVersion).toBe(1);
+ expect(d.notes).toBe('<script>note</script>\n备注');expect(d.generatorVersion).toBe(2);
+});
+it('new creation defaults to pullback-v2 without altering source/old versions, and describes its exact lifecycle',()=>{
+ const old=config(),modern=withCurrentImpulseSelection(old);expect(old.impulseCondition.selectionVersion).toBeUndefined();
+ expect(modern.impulseCondition.selectionVersion).toBe('pullback-v2');
+ expect(generateStrategyDescription(old).generatedText).toContain('legacy-v1');
+ const text=generateStrategyDescription(modern).generatedText;
+ for(const item of ['pullback-v2','含端点','收盘严格高于高点','相等不算突破','可在同根收盘','候选失效不等于卖出','入场锚点','0.618–0.786'])expect(text).toContain(item);
 });
 it('distinguishes disabled group, no signal gate, closeAtEnd false and enabled lock false',()=>{
  const s=config();s.entryAfterSignal=false;s.addConditionGroup={enabled:false,mode:'any',conditions:[]};s.exitConfig.closeAtEnd=false;s.exitConfig.profitLock!.enabled=false;

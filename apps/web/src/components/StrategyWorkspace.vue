@@ -17,7 +17,7 @@ const strategy = ref<any>();
 const notes=ref("");
 const savedDescription=ref<any>();
 let versionEpoch=0,templateEpoch=0;
-const fullDescription=computed(()=>{try{return strategy.value ? generateStrategyDescription(strategy.value,notes.value) : null;}catch{return null;}});
+const fullDescription=computed(()=>{try{return strategy.value ? generateStrategyDescription({...strategy.value,impulseCondition:{...strategy.value.impulseCondition,selectionVersion:'pullback-v2'}},notes.value) : null;}catch{return null;}});
 const template = ref<any>();
 const loading = ref(false);
 const saving = ref(false);

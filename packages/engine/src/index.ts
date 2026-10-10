@@ -5,6 +5,8 @@ export * from './live.js';
 import { describeInvalidation } from './invalidation.js';
 import { createEntryGate } from './entry-gate.js';
 import { matchBarExit } from './bar-exit.js';
+import { advanceImpulseCandidate, usesPullbackSelection } from './impulse-candidate.js';
+export * from './impulse-candidate.js';
 export { matchBarExit } from './bar-exit.js';
 
 const finite = (n: number) => Number.isFinite(n);
@@ -35,7 +37,7 @@ export function normalizeCandles(input: Candle[], interval: keyof typeof periodS
   return { candles: out, syntheticBars, invalidBars };
 }
 
-export interface Impulse { low: number; high: number; lowIndex: number; highIndex: number; confirmedAtIndex: number; gainPercent: number; averageVolume: number; lowTime?:number; highTime?:number; confirmedTime?:number; lowSynthetic?:boolean; highSynthetic?:boolean; confirmedSynthetic?:boolean }
+export interface Impulse { low: number; high: number; lowIndex: number; highIndex: number; confirmedAtIndex: number; gainPercent: number; averageVolume: number; lowTime?:number; highTime?:number; confirmedTime?:number; lowSynthetic?:boolean; highSynthetic?:boolean; confirmedSynthetic?:boolean; selectionVersion?:ImpulseConfig['selectionVersion'] }
 
 function isPivot(candles: Candle[], index: number, left: number, right: number, side: "low" | "high") {
   if (index < left || index + right >= candles.length) return false;
@@ -45,6 +47,7 @@ function isPivot(candles: Candle[], index: number, left: number, right: number, 
 }
 
 export function detectImpulse(candles: Candle[], config: ImpulseConfig): Impulse | undefined {
+  if (usesPullbackSelection(config)) return advanceImpulseCandidate(candles, config).impulse;
   if (config.enabled === false || candles.length < config.leftBars + config.rightBars + 2) return undefined;
   const first = Math.max(config.leftBars, candles.length - config.lookbackBars);
   const lastConfirmed = candles.length - 1 - config.rightBars;
@@ -255,7 +258,7 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
       signals.push({ symbol, ...signal });
     } else {
       const trade: Trade = { symbol, entryTime: candle.time, entryPrice: candle.close, quantity, fees: entryFee, slippageCost: entrySlip, taxCost: entryTax, adds: [] };
-      activeTrades.set(symbolKey(symbol), { trade, entryIndex: index, entries: 1, impulse });
+      activeTrades.set(symbolKey(symbol), { trade, entryIndex: index, entries: 1, impulse: structuredClone(impulse) });
       signals.push({ symbol, time: candle.time, price: candle.close, type: "entry", quantity, reason: { impulse, conditionGroup: config.entryConditionGroup, ...entryGate.evidence(symbol) } });
     }
   };
@@ -265,10 +268,11 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
     .map(input => {
       const normalized = normalizeCandles(input.candles, config.interval);
       syntheticBars += normalized.syntheticBars; invalidBars += normalized.invalidBars;
-      return { ...input, candles: normalized.candles, index: 0, entryWasMet: false, addWasMet: false, traded: false, lastPrice: 0 };
+      return { ...input, candles: normalized.candles, index: 0, entryWasMet: false, addWasMet: false, traded: false, lastPrice: 0, pendingImpulse: undefined as Impulse | undefined };
     });
   const normalizedTotal = Math.max(1, states.reduce((sum,s) => sum+s.candles.length,0));
   const byKey = new Map(states.map(s => [symbolKey(s.symbol),s]));
+  const closedThisBar = new Set<string>();
   const close = (state: typeof states[number], candle: Candle, price: number, type: Signal["type"], reason: Record<string,unknown>) => {
     const key = symbolKey(state.symbol), active = activeTrades.get(key);
     if (!active) return;
@@ -284,6 +288,8 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
     cash += proceeds - fee - slip - tax;
     signals.push({symbol:state.symbol,time:candle.time,price,type,quantity:trade.quantity,reason});
     trades.push(trade); activeTrades.delete(key); state.traded = true; state.entryWasMet = true;
+    closedThisBar.add(key);
+    if (usesPullbackSelection(config.impulseCondition)) { state.pendingImpulse = undefined; state.entryWasMet = false; }
   };
 
   // A k-way merge retains independent per-pool indicator history and one shared account.
@@ -292,11 +298,12 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
     for (const state of states) time = Math.min(time, state.candles[state.index]?.time ?? Infinity);
     if (!Number.isFinite(time)) break;
     const batch = states.filter(state => state.candles[state.index]?.time === time);
+    closedThisBar.clear();
     const contexts = batch.map(state => {
       const candle = state.candles[state.index];
       state.lastPrice = candle.close;
       const history = state.candles.slice(0,state.index+1);
-      return {state,candle,history,impulse:detectImpulse(history,config.impulseCondition)};
+      return {state,candle,history};
     });
     // Exit priority within each pool remains stop > invalidation > target > timeout > end.
     for (const {state,candle,history} of contexts) {
@@ -309,7 +316,20 @@ function* backtestSteps(config: BacktestConfig, inputs: SymbolInput[], onProgres
         end:config.exitConfig.closeAtEnd && state.index===state.candles.length-1});
       if (exit) close(state,candle,exit.price,exit.type,{priority:exit.type,stop,target,...(exit.type==='invalidation'?{invalidation:describeInvalidation(config.invalidationConditionGroup,history,active.impulse)}:{})});
     }
-    for (const {state,candle,history,impulse} of contexts) {
+    for (const {state,candle,history} of contexts) {
+      let impulse: Impulse | undefined;
+      if (usesPullbackSelection(config.impulseCondition)) {
+        if (!activeTrades.has(symbolKey(state.symbol))) {
+          const next = advanceImpulseCandidate(history, config.impulseCondition, state.pendingImpulse);
+          state.pendingImpulse = next.impulse; impulse = next.impulse;
+          if (next.changed) state.entryWasMet = false;
+        } else state.pendingImpulse = undefined;
+      } else impulse = detectImpulse(history, config.impulseCondition);
+      // Retain no re-entry on a sell bar. A flat candidate invalidation is not a sell
+      // and may still select another confirmed pair and buy on this same close.
+      if (usesPullbackSelection(config.impulseCondition) && closedThisBar.has(symbolKey(state.symbol))) {
+        state.entryWasMet=false; state.addWasMet=false; state.index++; processed++; continue;
+      }
       if (!entryGate.allows(state.symbol,candle.time)) {state.entryWasMet=false;state.addWasMet=false;state.index++;processed++;continue;}
       const active = activeTrades.get(symbolKey(state.symbol));
       if (active) {

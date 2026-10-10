@@ -1,5 +1,6 @@
 import type { Candle, ConditionGroup, StrategyConfig, SymbolRef } from '@meme/domain';
 import { detectImpulse, evaluateConditionGroup, stopPrice, targetPrice, type Impulse } from './index.js';
+import { advanceImpulseCandidate, usesPullbackSelection, IMPULSE_SELECTION_VERSION } from './impulse-candidate.js';
 import { matchBarExit } from './bar-exit.js';
 
 export type MarketCapBasis={source:'ws'|'price_supply';value:string;supply?:{original:string;unit:'raw'|'tokens';decimals:number|null;tokens:string;fetchedAt:number}};
@@ -85,17 +86,35 @@ export class LiveCandleAggregator {
 
 export interface LivePosition {entryPrice:number;quantity:number;entries:number;entryTime:number;entryBar:number;impulse:Impulse;lockPrice?:number;lockTier?:number;tradeNo:number;costBasisUsd?:number;positionId?:string}
 export interface LiveDecision {side:'buy'|'sell';reason:'entry'|'add'|'stop_loss'|'profit_lock'|'take_profit'|'invalidation'|'timeout';time:number;value:number;impulse?:Impulse; stop?:number; target?:number}
-export interface LiveEvaluatorState {history:Candle[];position?:LivePosition;lastEntryMatch:boolean;lastAddMatch:boolean;trades:number;lastCandleTime?:number;lastTokenPrice?:number}
+export interface LiveEvaluatorState {history:Candle[];position?:LivePosition;lastEntryMatch:boolean;lastAddMatch:boolean;trades:number;lastCandleTime?:number;lastTokenPrice?:number;pendingImpulse?:Impulse;impulseSelectionVersion?:'legacy-v1'|'pullback-v2';candidateHadPosition?:boolean}
 function maxWindow(config:StrategyConfig){return Math.max(512,config.impulseCondition.lookbackBars+config.impulseCondition.leftBars+config.impulseCondition.rightBars+8);}
 export class LiveEvaluator {
  readonly state:LiveEvaluatorState;
- constructor(readonly config:StrategyConfig, readonly signalTime:number, state?:LiveEvaluatorState){this.state=state?structuredClone(state):{history:[],lastEntryMatch:false,lastAddMatch:false,trades:0};}
+ constructor(readonly config:StrategyConfig, readonly signalTime:number, state?:LiveEvaluatorState){
+  this.state=state?structuredClone(state):{history:[],lastEntryMatch:false,lastAddMatch:false,trades:0};
+  const s=this.state;
+  if(usesPullbackSelection(config.impulseCondition)&&s.impulseSelectionVersion!==IMPULSE_SELECTION_VERSION){
+   s.pendingImpulse=undefined;s.lastEntryMatch=false;
+   // Rebuild only flat candidates, strictly prefix by prefix; never emit historical decisions.
+   if(!s.position)for(let end=1;end<=s.history.length;end++)s.pendingImpulse=advanceImpulseCandidate(s.history,config.impulseCondition,s.pendingImpulse,0,undefined,end).impulse;
+   s.candidateHadPosition=!!s.position;s.impulseSelectionVersion=IMPULSE_SELECTION_VERSION;
+  }
+ }
  onClosedCandle(candle:Candle,warmup=false):LiveDecision|undefined{
   const s=this.state;if(s.lastCandleTime!==undefined && candle.time<=s.lastCandleTime)return;
   s.lastCandleTime=candle.time;s.history.push(candle);
   if(s.history.length>maxWindow(this.config)){
    s.history.shift();
+   if(s.pendingImpulse){s.pendingImpulse={...s.pendingImpulse,lowIndex:s.pendingImpulse.lowIndex-1,highIndex:s.pendingImpulse.highIndex-1,confirmedAtIndex:s.pendingImpulse.confirmedAtIndex-1};}
    if(s.position){s.position.entryBar--;s.position.impulse.lowIndex--;s.position.impulse.highIndex--;s.position.impulse.confirmedAtIndex--;}
+  }
+  if(usesPullbackSelection(this.config.impulseCondition)){
+   if(s.position){s.pendingImpulse=undefined;s.candidateHadPosition=true;}
+   else {
+    if(s.candidateHadPosition){s.pendingImpulse=undefined;s.lastEntryMatch=false;s.candidateHadPosition=false;}
+    const next=advanceImpulseCandidate(s.history,this.config.impulseCondition,s.pendingImpulse);
+    s.pendingImpulse=next.impulse;if(next.changed)s.lastEntryMatch=false;
+   }
   }
   if(warmup)return;
   const position=s.position,eligible=this.config.entryAfterSignal===false||candle.time>this.signalTime;
@@ -114,14 +133,20 @@ export class LiveEvaluator {
     }
   }else if(eligible){
     s.lastAddMatch=false;
-    const impulse=detectImpulse(s.history,this.config.impulseCondition);
+    const impulse=usesPullbackSelection(this.config.impulseCondition)?s.pendingImpulse:detectImpulse(s.history,this.config.impulseCondition);
     const matches=!!impulse && evaluateConditionGroup(this.config.entryConditionGroup,s.history,impulse);
-    if(matches && !s.lastEntryMatch && (this.config.positionConfig.allowReentry || s.trades===0))decision={side:'buy',reason:'entry',time:candle.closeTime,value:candle.close,impulse};
+    if(matches && !s.lastEntryMatch && (this.config.positionConfig.allowReentry || s.trades===0))decision={side:'buy',reason:'entry',time:candle.closeTime,value:candle.close,impulse:structuredClone(impulse)};
     s.lastEntryMatch=matches;
   }
   return decision;
  }
  confirmClose(candle:Candle){
+  const s=this.state;
+  if(usesPullbackSelection(this.config.impulseCondition)&&!s.position&&s.candidateHadPosition){
+   // Only after a confirmed fill. An unresolved real sell retains the old position.
+   s.pendingImpulse=advanceImpulseCandidate(s.history,this.config.impulseCondition).impulse;
+   s.lastEntryMatch=false;s.lastAddMatch=false;s.candidateHadPosition=false;
+  }
   const position=this.state.position;
   if(position && this.config.exitConfig.profitLock?.enabled)this.config.exitConfig.profitLock.tiers.forEach((tier,index)=>{
     if((position.lockTier??-1)>=index || candle.close<position.entryPrice*(1+tier.activationPercent/100))return;

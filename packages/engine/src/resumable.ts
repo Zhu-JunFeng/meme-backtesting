@@ -4,9 +4,10 @@ import { validateProfitLock } from '@meme/domain';
 import { describeInvalidation } from './invalidation.js';
 import { createEntryGate } from './entry-gate.js';
 import { matchBarExit } from './bar-exit.js';
+import { advanceImpulseCandidate, usesPullbackSelection } from './impulse-candidate.js';
 
-export const ENGINE_VERSION = 'portfolio-5';
-export const CHECKPOINT_VERSION = 4;
+export const ENGINE_VERSION = 'portfolio-6';
+export const CHECKPOINT_VERSION = 5;
 export const intervalMs = (interval: string) => ({'30s':30000,'1m':60000,'5m':300000,'15m':900000,'1h':3600000,'4h':14400000,'1d':86400000}[interval]!);
 export const poolKey = (s: SymbolRef) => `${s.chain}:${s.ca}:${s.pairId}`;
 export function validCandle(c: Candle) {
@@ -17,10 +18,11 @@ type PoolState = {
   symbol:SymbolRef; index:number; history:Candle[]; offset:number; highPivots:number[]; lowPivots:number[];
   ema:Record<string,number>; previousEma:Record<string,number>; obv:number; obvs:number[];
   rolling:Record<string,{volume:number;previousVolume:number;gain:number;loss:number;rsi?:number;previousRsi?:number}>;
-  active?:Active; traded:boolean; entryWasMet:boolean; addWasMet:boolean; lastPrice:number;
+  active?:Active; pendingImpulse?:Impulse; traded:boolean; entryWasMet:boolean; addWasMet:boolean; lastPrice:number;
   closed:number; wins:number; net:number;
 };
 export interface EngineCheckpoint {
+  impulseSelectionVersion?: 'legacy-v1'|'pullback-v2';
   version:number; engineVersion:string; states:PoolState[]; cash:number; peak:number; maxDrawdown:number; maxDrawdownPercent:number;
   processed:number; syntheticBars:number; invalidBars:number; lastTime:number|null; lastEquity:number;
   wins:number; losses:number; net:number; gross:number; grossProfit:number; grossLoss:number; holding:number; lossStreak:number; maxLossStreak:number;
@@ -44,20 +46,25 @@ export class ResumableEngine {
     this.entryGate=createEntryGate(config);
     const legacy=checkpoint?.version===2 && checkpoint.engineVersion==='portfolio-3' && !config.exitConfig.profitLock?.enabled && !config.entrySignals;
     const previous=checkpoint?.version===3 && checkpoint.engineVersion==='portfolio-4' && !config.entrySignals;
-    if(checkpoint && !legacy && !previous && (checkpoint.version!==CHECKPOINT_VERSION || checkpoint.engineVersion!==ENGINE_VERSION)) throw new Error('检查点版本不兼容，禁止从头自动重跑');
+    const previousFive=checkpoint?.version===4 && checkpoint.engineVersion==='portfolio-5';
+    const rule=config.impulseCondition.selectionVersion??'legacy-v1';
+    if(checkpoint && (checkpoint.impulseSelectionVersion??'legacy-v1')!==rule) throw new Error('检查点选点规则不兼容，禁止混用新旧规则');
+    if(checkpoint && !legacy && !previous && !previousFive && (checkpoint.version!==CHECKPOINT_VERSION || checkpoint.engineVersion!==ENGINE_VERSION)) throw new Error('检查点版本不兼容，禁止从头自动重跑');
+    if(checkpoint && checkpoint.version<CHECKPOINT_VERSION && usesPullbackSelection(config.impulseCondition)) throw new Error('旧检查点不兼容新选点规则');
     const all=[...conditions(config.entryConditionGroup),...conditions(config.invalidationConditionGroup),...conditions(config.addConditionGroup ?? config.entryConditionGroup)];
     this.emaPeriods=[...new Set(all.filter(c=>c.type==='ema_reclaim').map(c=>Number(c.period)))];
     this.rollingPeriods=[...new Set(all.flatMap(c=>'period' in c && c.type!=='ema_reclaim'?[Number(c.period)]:[]))];
     const i=config.impulseCondition;
     this.capacity=Math.max(i.lookbackBars+i.leftBars+Math.max(5,i.leftBars*2)+3,...all.map(c=>Number('period' in c?c.period:'lookbackBars' in c?c.lookbackBars:0)+3),10);
     this.s=checkpoint?structuredClone(checkpoint):{
-      version:CHECKPOINT_VERSION,engineVersion:ENGINE_VERSION,
+      version:CHECKPOINT_VERSION,engineVersion:ENGINE_VERSION,impulseSelectionVersion:rule,
       states:[...new Map(config.symbols.map(s=>[poolKey(s),s])).values()].sort((a,b)=>poolKey(a)<poolKey(b)?-1:1).map(symbol=>({symbol,index:-1,history:[],offset:0,highPivots:[],lowPivots:[],ema:{},previousEma:{},rolling:{},obv:0,obvs:[],traded:false,entryWasMet:false,addWasMet:false,lastPrice:0,closed:0,wins:0,net:0})),
       cash:config.executionConfig.initialCapital,peak:config.executionConfig.initialCapital,maxDrawdown:0,maxDrawdownPercent:0,processed:0,syntheticBars:0,invalidBars:0,lastTime:null,lastEquity:config.executionConfig.initialCapital,
       wins:0,losses:0,net:0,gross:0,grossProfit:0,grossLoss:0,holding:0,lossStreak:0,maxLossStreak:0
     };
     this.byKey=new Map(this.s.states.map(s=>[poolKey(s.symbol),s]));
     this.s.version=CHECKPOINT_VERSION;this.s.engineVersion=ENGINE_VERSION;
+    this.s.impulseSelectionVersion=rule;
     if(legacy)for(const s of this.s.states)if(s.active){const t=s.active.trade;t.tradeNo=s.closed+1;t.buyAmount=t.entryPrice*t.quantity;t.buyFees=t.fees;t.buySlippageCost=t.slippageCost;t.buyTaxCost=t.taxCost;}
   }
   checkpoint():EngineCheckpoint {return structuredClone(this.s);}
@@ -90,6 +97,11 @@ export class ResumableEngine {
   }
   private impulse(s:PoolState):Impulse|undefined {
     const cfg=this.config.impulseCondition;
+    if(usesPullbackSelection(cfg)) {
+      const next=advanceImpulseCandidate(s.history,cfg,s.pendingImpulse,s.offset,s);
+      s.pendingImpulse=next.impulse;if(next.changed)s.entryWasMet=false;
+      return next.impulse;
+    }
     if(cfg.enabled===false || s.index+1<cfg.leftBars+cfg.rightBars+2)return;
     let lowest=Infinity;for(const lo of s.lowPivots)lowest=Math.min(lowest,s.history[lo-s.offset].low);
     for(let h=s.highPivots.length-1;h>=0;h--){
@@ -146,7 +158,7 @@ export class ResumableEngine {
     if(existing){const t=existing.trade;t.entryPrice=(t.entryPrice*t.quantity+value)/(t.quantity+quantity);t.quantity+=quantity;t.fees+=fee;t.slippageCost+=slip;t.taxCost+=tax;existing.entries++;
       t.buyAmount=(t.buyAmount ?? 0)+value;t.buyFees=(t.buyFees ?? 0)+fee;t.buySlippageCost=(t.buySlippageCost ?? 0)+slip;t.buyTaxCost=(t.buyTaxCost ?? 0)+tax;
       const signal:Signal={time:c.time,price:c.close,type:'add',quantity,tradeNo:t.tradeNo,eventOrder:existing.entries,reason:{conditionGroup:cfg.addConditionGroup ?? cfg.entryConditionGroup,...this.entryGate.evidence(s.symbol)}};t.adds.push(signal);this.batch.signals.push({symbol:s.symbol,...signal});
-    }else{const trade:Trade={symbol:s.symbol,entryTime:c.time,entryPrice:c.close,quantity,fees:fee,slippageCost:slip,taxCost:tax,adds:[],tradeNo:s.closed+1,firstEntryPrice:c.close,buyAmount:value,buyFees:fee,buySlippageCost:slip,buyTaxCost:tax};s.active={trade,entryIndex:s.index,entries:1,impulse};this.batch.signals.push({symbol:s.symbol,time:c.time,price:c.close,type:'entry',quantity,tradeNo:trade.tradeNo,eventOrder:1,reason:{impulse,conditionGroup:cfg.entryConditionGroup,...this.entryGate.evidence(s.symbol)}});}
+    }else{const trade:Trade={symbol:s.symbol,entryTime:c.time,entryPrice:c.close,quantity,fees:fee,slippageCost:slip,taxCost:tax,adds:[],tradeNo:s.closed+1,firstEntryPrice:c.close,buyAmount:value,buyFees:fee,buySlippageCost:slip,buyTaxCost:tax};s.active={trade,entryIndex:s.index,entries:1,impulse:structuredClone(impulse)};s.pendingImpulse=undefined;this.batch.signals.push({symbol:s.symbol,time:c.time,price:c.close,type:'entry',quantity,tradeNo:trade.tradeNo,eventOrder:1,reason:{impulse:structuredClone(impulse),conditionGroup:cfg.entryConditionGroup,...this.entryGate.evidence(s.symbol)}});}
   }
   private close(s:PoolState,c:Candle,price:number,type:Signal['type'],reason:Record<string,unknown>) {
     if(!s.active)return;const a=s.active,t=a.trade,cost=this.config.executionConfig,proceeds=t.quantity*price;
@@ -156,6 +168,7 @@ export class ResumableEngine {
     s.closed++;s.net+=t.netPnl;this.s.net+=t.netPnl;this.s.gross+=t.grossPnl;this.s.holding+=t.holdingBars;
     if(t.netPnl>0){s.wins++;this.s.wins++;this.s.grossProfit+=t.netPnl;this.s.lossStreak=0;}else{this.s.losses++;this.s.grossLoss-=t.netPnl;this.s.lossStreak++;this.s.maxLossStreak=Math.max(this.s.maxLossStreak,this.s.lossStreak);}
     s.active=undefined;s.traded=true;s.entryWasMet=true;
+    if(usesPullbackSelection(this.config.impulseCondition)){s.pendingImpulse=undefined;s.entryWasMet=false;}
   }
   /** Caller supplies every pool at this timestamp; never checkpoint in the middle of this method. */
   step(ticks:Tick[]) {
@@ -163,6 +176,7 @@ export class ResumableEngine {
     const ordered=[...ticks].sort((a,b)=>poolKey(a.symbol)<poolKey(b.symbol)?-1:1),time=ordered[0].candle.time;
     if(ordered.some(t=>t.candle.time!==time) || (this.s.lastTime!==null && time<=this.s.lastTime))throw new Error('时间批次必须完整且严格递增');
     const contexts=ordered.map(t=>{const s=this.byKey.get(poolKey(t.symbol));if(!s)throw new Error('未知交易池');this.update(s,t.candle);if(t.candle.synthetic)this.s.syntheticBars++;return {...t,s};});
+    const heldBefore=new Set(contexts.filter(t=>t.s.active).map(t=>t.s));
     for(const {s,candle:c,last} of contexts){if(!s.active)continue;const baseStop=stopPrice(this.config,s.active),stop=Math.max(baseStop,s.active.lockPrice ?? -Infinity),target=targetPrice(this.config,s.active,baseStop);
       const exit=matchBarExit(c,{entry:s.active.trade.entryPrice,baseStop,lockPrice:s.active.lockPrice,target,
         invalid:()=>this.group(this.config.invalidationConditionGroup,s,s.active!.impulse),
@@ -172,10 +186,12 @@ export class ResumableEngine {
     }
     let positions=this.s.states.filter(s=>s.active).length;
     for(const {s,candle:c,last} of contexts){
+      const impulse=!s.active?this.impulse(s):undefined;
+      if(usesPullbackSelection(this.config.impulseCondition)&&heldBefore.has(s)&&!s.active){s.entryWasMet=false;s.addWasMet=false;this.s.processed++;continue;}
       // Warm history must not consume cash, the first-entry allowance, or a signal edge.
       if(!this.entryGate.allows(s.symbol,c.time)){s.entryWasMet=false;s.addWasMet=false;this.s.processed++;continue;}
       if(s.active){const add=this.group(this.config.addConditionGroup ?? this.config.entryConditionGroup,s,s.active.impulse);if(this.config.positionConfig.mode==='pyramiding' && s.active.entries<this.config.positionConfig.maxEntries && add && !s.addWasMet)this.enter(s,c,s.active.impulse);s.addWasMet=add;}
-      else{const impulse=this.impulse(s),entry=!!impulse && this.group(this.config.entryConditionGroup,s,impulse);if(entry && !s.entryWasMet && (this.config.positionConfig.allowReentry || !s.traded) && positions<this.config.positionConfig.maxConcurrentPositions){this.enter(s,c,impulse!);if(s.active)positions++;}s.entryWasMet=entry;s.addWasMet=false;}
+      else{const entry=!!impulse && this.group(this.config.entryConditionGroup,s,impulse);if(entry && !s.entryWasMet && (this.config.positionConfig.allowReentry || !s.traded) && positions<this.config.positionConfig.maxConcurrentPositions){this.enter(s,c,impulse!);if(s.active)positions++;}s.entryWasMet=entry;s.addWasMet=false;}
       if(last && this.config.exitConfig.closeAtEnd && s.active){this.close(s,c,c.close,'end_of_backtest',{closeAtEnd:true});positions--;}
       // Confirm at close, after this candle's exits/adds. This line is used only on the next tick.
       if(s.active && this.config.exitConfig.profitLock?.enabled){const a=s.active,cost=a.trade.entryPrice;

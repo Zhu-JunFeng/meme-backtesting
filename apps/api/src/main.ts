@@ -3,7 +3,7 @@ import {resolveSignalDataset,externalSignalsForRun} from './token-signals.js';
 import "reflect-metadata";
 import { locate } from './locator.js';
 import { statistics } from './results.js';
-import { generateStrategyDescription, validateProfitLock } from '@meme/domain';
+import { generateStrategyDescription, validateProfitLock, withCurrentImpulseSelection } from '@meme/domain';
 import { marketCas, resolveDataset, datasetCounts, resultRows, runCas } from "./datasets.js";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -23,7 +23,9 @@ const ajv = new AjvConstructor({ allErrors: true, strict: false });
 const AVAILABLE_DATA = new Set(["ohlcv"]);
 const asNumber = (value: unknown) => typeof value === "number" && Number.isFinite(value);
 const isGroup = (value: Condition | ConditionGroup): value is ConditionGroup => "conditions" in value;
-const checksum = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+// New immutable versions hash canonical keys: PostgreSQL JSONB may reorder them on read.
+const checksum = (value: unknown) => createHash("sha256").update(JSON.stringify(value, (_key, v) =>
+  v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a],[b])=>a<b?-1:a>b?1:0)) : v)).digest("hex");
 
 @Injectable()
 export class AppService {
@@ -150,6 +152,7 @@ export class AppService {
   }
 
   private async insertVersion(client: PoolClient, templateId: string, strategy: StrategyConfig, notes = '') {
+    strategy = withCurrentImpulseSelection(strategy);
     let description;
     try { description = generateStrategyDescription(strategy, notes); } catch(e) { throw new BadRequestException(String(e)); }
     await client.query("SELECT id FROM backtest_strategy_templates WHERE id=$1 FOR UPDATE", [templateId]);
@@ -187,7 +190,7 @@ export class AppService {
   async createBacktest(request: CreateBacktestRequest) {
     if (!request.name?.trim() || !request.strategyVersionId) throw new BadRequestException("任务名称和策略版本不能为空");
     const version = await this.version(request.strategyVersionId);
-    const strategy = structuredClone(version.strategyJson) as StrategyConfig;
+    const strategy = withCurrentImpulseSelection(version.strategyJson as StrategyConfig);
     strategy.entryAfterSignal ??= true;
     const dataset = await resolveSignalDataset(this.pool, request.dataset, strategy.entryAfterSignal);
     const overrides = request.executionOverrides ?? {};

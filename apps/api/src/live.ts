@@ -2,7 +2,7 @@ import {BadRequestException,ConflictException,Controller,Get,Headers,Param,Post,
 import {scryptSync,timingSafeEqual} from 'node:crypto';
 import {Pool} from 'pg';
 import type {StrategyConfig} from '@meme/domain';
-import {LIVE_SIGNAL_SOURCES,liveSignalSources,legacyLiveSource,normalizeLiveSources,selectedLiveSources,type LiveSignalSourceCode} from '@meme/domain';
+import {withCurrentImpulseSelection,LIVE_SIGNAL_SOURCES,liveSignalSources,legacyLiveSource,normalizeLiveSources,selectedLiveSources,type LiveSignalSourceCode} from '@meme/domain';
 import {selectedProjectSources,normalizeProjectSources,defaultProjectSources,PROJECT_PROVIDERS,type ProjectSources} from '@meme/domain';
 import {buildLivePortfolio} from './live-portfolio.js';
 import {liveFib,decisionBucket} from './live-locator.js';
@@ -115,7 +115,7 @@ export class LiveController {
   }
   const version=(await this.pool.query('SELECT strategy_json FROM backtest_strategy_versions WHERE id=$1',[body.strategyVersionId])).rows[0];
   if(!version)throw new BadRequestException('策略版本不存在');
-  const strategy=structuredClone(version.strategy_json) as StrategyConfig;
+  const strategy=withCurrentImpulseSelection(version.strategy_json as StrategyConfig);
   if(strategy.entryAfterSignal===false)throw new BadRequestException('实时任务只能使用仅在信号触发后买入的策略');
   strategy.entryAfterSignal=true;
   if(body.mode==='live' && strategy.positionConfig.maxConcurrentPositions>body.risk!.maxPositions)throw new BadRequestException('实盘硬性最大持仓数不能小于策略最大持仓数');

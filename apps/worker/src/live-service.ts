@@ -18,7 +18,7 @@ type Context={run:Run;watch:Watch;evaluator:LiveEvaluator;ready:boolean;nextReco
 const watchKey=(r:string,c:string,a:string)=>`${r}:${c}:${a}`;
 const pairKey=(c:string,p:string)=>`${c}:${p.toLowerCase()}`;
 export const LIVE_CA_LIMIT=20,MIN_MARKET_CAP=50_000;
-export const LIVE_EXECUTION_VERSION='closed-bar-v2';
+export const LIVE_EXECUTION_VERSION='closed-bar-v3';
 export function simulatedBarPrice(valueType:'price'|'mcap',value:number,bar:ClosedMarketBar,price:ClosedMarketBar|undefined){
  if(!price || !validCandle(price.candle) || !validCandle(bar.candle) || price.type!=='price' || price.interval!==bar.interval || price.candle.time!==bar.candle.time || price.candle.closeTime!==bar.candle.closeTime || price.symbol.ca!==bar.symbol.ca || price.symbol.pairId!==bar.symbol.pairId || price.symbol.chain!==bar.symbol.chain)return;
  if(valueType==='mcap' && (!bar.closeTradeId || !Number.isSafeInteger(bar.closeTradeTime) || price.closeTradeId!==bar.closeTradeId || price.closeTradeTime!==bar.closeTradeTime || !!price.candle.synthetic!==!!bar.candle.synthetic))return;
@@ -195,10 +195,11 @@ export class LiveService {
  async close(){this.stopped=true;this.history.close();if(this.refreshTimer)clearInterval(this.refreshTimer);if(this.flushTimer)clearInterval(this.flushTimer);for(const timer of this.signalRetries.values())clearTimeout(timer);this.signalRetries.clear();this.signal?.close();this.market.stop();this.projectRedis.disconnect();await this.discovery.close();await this.chain;await this.flushTelemetry();if(this.lock){await this.lock.query('SELECT pg_advisory_unlock(63920924)');this.lock.release();}}
  private async switchExecution(){
   const c=await this.pool.connect();try{await c.query('BEGIN');
-   const switched=await c.query("UPDATE live_runs SET execution_version=$1,execution_switched_at=now() WHERE status='running' AND execution_version<>$1 RETURNING id,mode",[LIVE_EXECUTION_VERSION]);
+   const switched=await c.query("UPDATE live_runs SET execution_version=$1,execution_switched_at=now(),strategy_json=jsonb_set(strategy_json,'{impulseCondition,selectionVersion}','\"pullback-v2\"'::jsonb) WHERE status='running' AND (execution_version<>$1 OR strategy_json#>>'{impulseCondition,selectionVersion}' IS DISTINCT FROM 'pullback-v2') RETURNING id,mode",[LIVE_EXECUTION_VERSION]);
    for(const r of switched.rows){
-    if(r.mode==='paper')await c.query("UPDATE live_orders SET status='cancelled',raw_result=COALESCE(raw_result,'{}'::jsonb)||$2::jsonb,updated_at=now() WHERE run_id=$1 AND status='pending'",[r.id,JSON.stringify({cancelReason:'切换收盘规则，旧待成交模拟订单不追溯成交'})]);
-    await c.query("INSERT INTO live_events(run_id,kind,event_key,event_time,payload) VALUES($1,'execution_switched',$2,$3,$4) ON CONFLICT(event_key) DO NOTHING",[r.id,`${r.id}:${LIVE_EXECUTION_VERSION}`,Date.now(),JSON.stringify({version:LIVE_EXECUTION_VERSION,reason:'改为完整K线收盘后决策；模拟按回测阈值撮合；实盘以真实成交为准'})]);
+    if(r.mode==='paper')await c.query("UPDATE live_orders SET status='cancelled',raw_result=COALESCE(raw_result,'{}'::jsonb)||$2::jsonb,updated_at=now() WHERE run_id=$1 AND status='pending'",[r.id,JSON.stringify({cancelReason:'切换 Fib 选点规则，旧待成交模拟订单不追溯成交'})]);
+    const holdings=(await c.query("SELECT chain,ca,pair_id,state_json->'position' AS position FROM live_watches WHERE run_id=$1 AND state_json->'position' IS NOT NULL AND state_json->'position'<>'null'::jsonb",[r.id])).rows;
+    await c.query("INSERT INTO live_events(run_id,kind,event_key,event_time,payload) VALUES($1,'execution_switched',$2,$3,$4) ON CONFLICT(event_key) DO NOTHING",[r.id,`${r.id}:${LIVE_EXECUTION_VERSION}`,Date.now(),JSON.stringify({version:LIVE_EXECUTION_VERSION,impulseSelectionVersion:'pullback-v2',preservedPositions:holdings,reason:'收盘决策保持不变；未持仓逐根重建 Fib 候选，收盘突破作废；已有持仓沿用原入场锚点、成本及锁盈状态，历史预热不补发订单'})]);
    }
    // A crash between durable intent and network submission has an uncertain outcome.
    // Fail closed rather than ever resending it automatically.
@@ -225,7 +226,7 @@ export class LiveService {
   const active=new Set(rows.map(r=>r.id));
   const watchRows=(await this.pool.query("SELECT w.* FROM live_watches w JOIN live_runs r ON r.id=w.run_id WHERE r.status='running' AND w.status IN ('monitoring','recovering','pending_eviction')")).rows as Watch[];
   const runMap=new Map(rows.map(r=>[r.id,r]));
-  for(const w of watchRows){const key=watchKey(w.run_id,w.chain,w.ca);const old=this.watches.get(key);if(old){old.run=runMap.get(w.run_id)!;old.watch={...w,last_trade_at:old.watch.last_trade_at??w.last_trade_at,current_mcap:old.watch.current_mcap??w.current_mcap};continue;}
+  for(const w of watchRows){const key=watchKey(w.run_id,w.chain,w.ca);const old=this.watches.get(key);if(old){const run=runMap.get(w.run_id)!;const changed=old.run.strategy_json.impulseCondition.selectionVersion!==run.strategy_json.impulseCondition.selectionVersion;old.run=run;old.watch={...w,last_trade_at:old.watch.last_trade_at??w.last_trade_at,current_mcap:old.watch.current_mcap??w.current_mcap};if(changed){old.evaluator=new LiveEvaluator(run.strategy_json,Number(w.signal_time),old.evaluator.snapshot());old.noOrdersBefore=Date.now();old.nextRecoveryAt=0;await this.markRecovering(old,'Fib 选点规则切换，保留持仓并重建候选');}continue;}
    const run=runMap.get(w.run_id);if(!run)continue;
    const ctx:Context={run,watch:w,evaluator:new LiveEvaluator(run.strategy_json,Number(w.signal_time),w.state_json?.history?w.state_json:undefined),ready:false,nextRecoveryAt:0,noOrdersBefore:Math.max(Date.now(),new Date(run.execution_switched_at??0).getTime())};
    this.watches.set(key,ctx);

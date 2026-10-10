@@ -176,9 +176,16 @@ const url=process.env.TEST_DATABASE_URL;
  });
  it('switches existing runs once, cancels old paper intents and preserves positions',async()=>{
   const {run,service,add}=await fixture();const ctx=await add('a'),before=ctx.evaluator.snapshot();
+  await pool.query('UPDATE live_watches SET state_json=$2 WHERE run_id=$1',[run.id,JSON.stringify(before)]);
   await pool.query("INSERT INTO live_orders(run_id,chain,ca,pair_id,intent_key,side,reason,status,decision_time,decision_value,requested_amount) VALUES($1,'sol','a','a',$2,'buy','entry','pending',0,100,10)",[run.id,randomUUID()]);
   await service.switchExecution();await service.switchExecution();
   const saved=(await pool.query('SELECT * FROM live_runs WHERE id=$1',[run.id])).rows[0];expect(saved.execution_version).toBe(LIVE_EXECUTION_VERSION);expect(saved.execution_switched_at).toBeTruthy();
+  expect(saved.strategy_json.impulseCondition.selectionVersion).toBe('pullback-v2');
+  const event=(await pool.query("SELECT payload FROM live_events WHERE run_id=$1 AND kind='execution_switched'",[run.id])).rows[0].payload;
+  expect(event.impulseSelectionVersion).toBe('pullback-v2');
+  const original=(await pool.query('SELECT state_json FROM live_watches WHERE run_id=$1',[run.id])).rows[0].state_json;
+  expect(event.preservedPositions[0].position).toEqual(original.position);
+  expect(new LiveEvaluator(saved.strategy_json,0,original).state.position).toEqual(original.position);
   expect((await pool.query('SELECT status FROM live_orders WHERE run_id=$1',[run.id])).rows[0].status).toBe('cancelled');expect(ctx.evaluator.snapshot()).toEqual(before);
   expect((await pool.query("SELECT COUNT(*) n FROM live_events WHERE run_id=$1 AND kind='execution_switched'",[run.id])).rows[0].n).toBe('1');
  });

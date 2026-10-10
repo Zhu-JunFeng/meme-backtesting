@@ -17,8 +17,9 @@ describe('resumable reference parity',()=>{
   const result=execute(config,[{symbol:symbols[0],candles:raw}],true),entries=result.signals.filter(s=>s.type==='entry');expect(entries.length).toBeGreaterThan(0);
   for(const signal of entries){const i=signal.reason.impulse as any;expect(i.lowTime).toBe(normalized[i.lowIndex].time);expect(i.highTime).toBe(normalized[i.highIndex].time);expect(i.confirmedTime).toBe(normalized[i.confirmedAtIndex].time);expect(i.confirmedTime).toBeLessThanOrEqual(signal.time);expect(i.lowSynthetic).toBe(!!normalized[i.lowIndex].synthetic);}
  });
- for(const extra of [undefined,...variants])it(`matches reference: ${extra?.type ?? 'fib'}`,()=>{
+ for(const selectionVersion of [undefined,'pullback-v2'] as const)for(const extra of [undefined,...variants])it(`matches reference: ${selectionVersion??'legacy'} / ${extra?.type ?? 'fib'}`,()=>{
   const c=configuration();if(extra)c.entryConditionGroup.conditions.push(extra);
+  c.impulseCondition.selectionVersion=selectionVersion;
   c.addConditionGroup={mode:'any',conditions:[{type:'bullish_volume_confirmation',period:3,minRatio:.9}]};
   c.invalidationConditionGroup={mode:'any',conditions:[{type:'break_fib_invalidation',ratio:.886},{type:'bearish_volume_invalidation',period:3,minBodyPercent:.2,minRatio:1}]};
   const inputs=symbols.map((symbol,i)=>({symbol,candles:candles(800,i*5)}));

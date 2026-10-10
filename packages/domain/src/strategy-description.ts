@@ -2,7 +2,7 @@ import type { Condition, ConditionGroup, ExecutionOverrides, StrategyConfig } fr
 
 export interface VersionDescription { generatedText: string; notes: string; generatorVersion: number }
 export interface RunStrategyDescription extends VersionDescription { version: number; executionOverrides: ExecutionOverrides }
-export const DESCRIPTION_GENERATOR_VERSION = 1;
+export const DESCRIPTION_GENERATOR_VERSION = 2;
 const patterns: Record<string,string> = {
   hammer:'锤子线（收盘≥开盘，下影≥实体2倍且≥振幅40%，上影≤振幅20%）',
   bullish_engulfing:'阳线吞没（前阴后阳，本根开盘≤前根收盘且本根收盘≥前根开盘）',
@@ -41,7 +41,8 @@ export function generateStrategyDescription(s: StrategyConfig, notes=''): Versio
   const parts=[
     `监控与回放\n${s.entryAfterSignal!==false?`仅在信号触发后买入：首次买入及加仓所在 K 线的开盘时间必须严格晚于该 CA 最早有效外部信号${s.minimumSignalAgeMinutes ? `加 ${s.minimumSignalAgeMinutes} 分钟` : ''}。等于边界时间、信号落在本根内部均不允许本根买入；缺失信号的 CA 全池排除，信号晚于行情末尾则没有买入机会。`:'不限制信号前买入；外部信号仅用于展示。'}信号前已经存在的行情可用于指标预热。单周期按时间推进，仅使用当时已完成的数据；周期、链、CA 和时间范围由任务选择，不属于本版本。`,
     `拉升识别\n${i.enabled===false?'[已禁用，无法产生首次入场] ':''}Fractal Pivot 左侧 ${i.leftBars} 根、右侧 ${i.rightBars} 根确认；回看 ${i.lookbackBars} 根。先从最近已确认高点向前寻找，再从最近的先行低点向前匹配；低点须早于高点，跨度≤${i.maxDurationBars} 根，涨幅≥${i.minGainPercent}%。右侧 K 线完成后才能确认高点。${i.requireVolumeExpansion?`拉升段均量≥低点之前最多 ${Math.max(5,i.leftBars*2)} 根均量的 ${i.volumeExpansionRatio ?? 1.5} 倍，缺少基准量不通过。`:'不要求拉升放量。'}Fib 值=High−(High−Low)×比例；0 为高点，1 为低点。`,
-    `首次入场\n${groupText(s.entryConditionGroup)}\n需要有效拉升；条件由不满足变为满足时尝试买入，持续满足不会逐根重复触发。持仓后锁定首次入场的拉升依据，不按后续新高低点替换。`,
+    `候选区间规则\n${i.selectionVersion==='pullback-v2'?'pullback-v2：高点按时间从近到远、每个高点再匹配最近合格低点。低点至高点（含端点）不得存在更高的 High。高点之后历史收盘曾严格突破高点或跌破低点的组合不可重用。未持仓时锁定候选，小波动或上影线突破后收回不切换；收盘严格高于高点、低于低点或低点超出回看范围时失效，并清除入场边沿。相等不算突破；可在同根收盘选用另一已确认且有效的组合，仍须通过原有涨幅、跨度和放量门槛；找不到则等待。候选失效不等于卖出，不能在回落后复活。平仓后允许再次入场时重新选点。':'legacy-v1：每根收盘重新寻找最近合格已确认组合；不执行新区间最高值校验及等待入场候选锁定。'}`,
+    `首次入场\n${groupText(s.entryConditionGroup)}\n需要有效拉升；条件由不满足变为满足时尝试买入，持续满足不会逐根重复触发。持仓后独立保存并锁定首次入场的拉升依据，不按后续新高低点替换；加仓、失效及 Fib 止盈止损继续使用入场锚点。`,
     `失效判断\n${groupText(s.invalidationConditionGroup)}\n持仓时按上述组关系判断，不能将每个子条件都描述为独立退出原因。失效退出按本根收盘值成交，可能盈利也可能亏损。`,
     `仓位与加仓\n${sizing}；实际金额进一步受可用现金及买入成本限制，资金不足不会透支。所有池共享初始资金 ${c.initialCapital}，全任务最多同时持有 ${p.maxConcurrentPositions} 个池。${p.allowReentry?'平仓后允许该池再次入场，但仍要求新的条件触发边沿。':'每个池平仓后不再入场；不是按 CA 限制，多个池独立。'}${p.mode==='single_entry'?'持仓期间仅首次买入，忽略加仓。':`每段持仓最多 ${p.maxEntries} 次买入（含首次），加仓按数量更新加权平均成本；最多加仓 ${Math.max(0,p.maxEntries-1)} 次。加仓也仅在条件从不满足变为满足时触发。\n${s.addConditionGroup?`采用已配置的加仓条件组${s.addConditionGroup.enabled===false?'；当前引擎禁用组不触发加仓，不自动回退入场组':''}：\n${groupText(s.addConditionGroup)}`:`未配置加仓组，复用首次入场条件：\n${groupText(s.entryConditionGroup)}`}`}`,
     `退出规则\n基础止损：${stop}。止盈：${target}；目标必须高于当前均价才执行。止损/锁盈优先，其次失效、止盈、超时、结束平仓。跳空低开穿过止损线按开盘值退出，否则最低值触线按止损线退出；跳空高开超过有效止盈目标按开盘值退出，否则最高值触线按目标退出。${e.maxHoldingBars?`首次入场起持仓达到 ${e.maxHoldingBars} 根仍未退出则按收盘值超时退出；加仓不重置计时。`:'未启用持仓超时。'}${e.closeAtEnd?'每池数据末尾或任务截止的最后一根按收盘值结束平仓；末根新买入也会在同根结束平仓。':'数据结束不强制卖出，未平仓部分保留浮动盈亏。'}仅一次性退出，不分批止盈。`,

@@ -13,5 +13,6 @@ it.each([undefined,true,false])('new tasks resolve database gates with setting %
  await service.createBacktest({name:'test',strategyVersionId:'v',dataset:{cas:[{chain:'sol',ca:'a'}],interval:'30s',valueType:'mcap'}});
  expect(resolveSignalDataset).toHaveBeenLastCalledWith(service.pool,expect.anything(),setting??true);
  const saved=JSON.parse(query.mock.calls[0][1][4]);expect(saved.entryAfterSignal).toBe(setting??true);expect(saved.entrySignals).toEqual(gates);
+ expect(saved.impulseCondition.selectionVersion).toBe('pullback-v2');expect(original.impulseCondition).toBeUndefined();
  expect(original.entryAfterSignal).toBe(setting);expect(original.entrySignals[0].signalTime).toBe(0);
 });

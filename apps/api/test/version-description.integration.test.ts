@@ -24,6 +24,8 @@ const url=process.env.TEST_DATABASE_URL;
  it('leaves old descriptions empty; generates new versions and rejects metadata edits',async()=>{
   expect((await service.version(legacy.id)).versionDescription).toBeNull();
   expect(v1.versionDescription.notes).toContain('第一版备注');expect(v1.versionDescription.generatedText).toContain('首次入场');
+  expect(v1.strategyJson.impulseCondition.selectionVersion).toBe('pullback-v2');
+  expect((await service.version(legacy.id)).strategyJson.impulseCondition.selectionVersion).toBeUndefined();
   await expect(pool.query("UPDATE backtest_strategy_versions SET description_json='{}' WHERE id=$1",[v1.id])).rejects.toThrow('不可变');
   await expect(pool.query('DELETE FROM backtest_strategy_versions WHERE id=$1',[v1.id])).rejects.toThrow('不可变');
   const v2=await service.createVersion(template.id,v1.strategyJson,'第二版备注');
@@ -47,6 +49,12 @@ const url=process.env.TEST_DATABASE_URL;
   const repeated=await rerun(pool,queue,created.id,randomUUID()),copy=await service.backtest(repeated.id);
   expect(copy.strategy_description_json).toEqual(run.strategy_description_json);expect(copy.config_json).toEqual(run.config_json);
   const oldRun=await service.createBacktest({...request,strategyVersionId:legacy.id});expect((await service.backtest(oldRun.id)).strategy_description_json).toBeNull();
+  expect((await service.backtest(oldRun.id)).config_json.impulseCondition.selectionVersion).toBe('pullback-v2');
+  // A genuinely old submitted task is cloned verbatim, not upgraded by rerun.
+  const historicalConfig={...run.config_json,impulseCondition:legacy.strategy_json.impulseCondition};
+  const historical=(await pool.query("INSERT INTO backtest_runs(name,status,config_json) VALUES('legacy-rule','completed',$1) RETURNING id",[JSON.stringify(historicalConfig)])).rows[0];
+  const repeatedLegacy=await rerun(pool,queue,historical.id,randomUUID());
+  expect((await service.backtest(repeatedLegacy.id)).config_json).toEqual(historicalConfig);
  });
  it('rejects invalid notes atomically',async()=>{
   const before=(await service.versions(template.id)).length;
