@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
+import {Worker} from 'node:worker_threads';
 import {normalizeStrategy,firstRound,secondRound,ranking,attribution,evaluate,research,reportMarkdown} from './sol-full-history-research.mjs';
 import {baseStrategy,COSTS} from './temporal-holdout-research.mjs';
 import {snapshot,saveJson} from './cohort-snapshot.mjs';
@@ -21,6 +22,10 @@ test('normalization fixes costs, signal gate and v2 without mutating input',()=>
  assert.equal(n.entryAfterSignal,false);assert.equal(n.impulseCondition.selectionVersion,'pullback-v2');assert.deepEqual(n.executionConfig,COSTS);
  assert.equal(n.exitConfig.closeAtEnd,true);assert.equal(n.positionConfig.maxEntries,1);assert.equal(n.addConditionGroup.enabled,false);
  assert.throws(()=>normalizeStrategy({...c,positionConfig:{...c.positionConfig,sizing:{type:'fixed_percent',value:90}}}));
+});
+test('later workers reject a changed code fingerprint before loading any market data',async()=>{
+ const worker=new Worker(new URL('./sol-full-history-research.mjs',import.meta.url),{workerData:{codeHash:'different-code'}});
+ try{await assert.rejects(new Promise((resolve,reject)=>{worker.once('message',resolve);worker.once('error',reject);}),/Research code changed/);}finally{await worker.terminate();}
 });
 test('1024 deterministic unique first-round candidates and bounded unique refinements',()=>{
  const bases=[{name:'base',config:baseStrategy()}],a=firstRound(bases),b=firstRound(bases);assert.deepEqual(a,b);assert.equal(a.length,1024);

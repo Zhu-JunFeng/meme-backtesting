@@ -171,7 +171,7 @@ export async function research({snapshot,output,priorPath='output/holdout-5050-2
    else{
     const active=[];
     try{await Promise.all(Array.from({length:Math.min(workers,selected.length)},()=>new Promise((resolve,reject)=>{
-     const w=new Worker(new URL(import.meta.url),{workerData:{snapshot,manifest,signals,asOf,interval}});active.push(w);
+     const w=new Worker(new URL(import.meta.url),{workerData:{snapshot,manifest,signals,asOf,interval,codeHash:protocol.codeHash}});active.push(w);
      const next=()=>{const c=selected[cursor++];if(c)w.postMessage(c);else resolve();};
      w.on('error',reject);w.on('exit',code=>{if(code!==0)reject(new Error(`Research worker exited ${code}`));});
      w.on('message',async message=>{try{if(message.ready){next();return;}if(message.error)throw Error(message.error);await record(message.result);next();}catch(e){reject(e);}});
@@ -202,7 +202,8 @@ export async function research({snapshot,output,priorPath='output/holdout-5050-2
  await saveJson(resolve(output,'report.json'),report);await writeFile(resolve(output,'report.md'),reportMarkdown(report));console.log(JSON.stringify({stage:'complete',candidates:all.length,profitable:report.profitable,best:leaders[0]?.accountReturn}));return report;
 }
 if(!isMainThread){
- const {snapshot,manifest,signals,asOf,interval}=workerData;
+ const {snapshot,manifest,signals,asOf,interval,codeHash}=workerData;
+ assert.equal(await codeFingerprint(),codeHash,'Research code changed while running; refusing mixed engine versions');
  const loaded=await loadInputs(snapshot,manifest,'sol',interval);
  const inputs=loaded.inputs.map(p=>({...p,candles:p.candles.filter(c=>c.time<asOf&&c.closeTime<=asOf)})).filter(p=>p.candles.length);
  parentPort.on('message',candidate=>{try{parentPort.postMessage({result:evaluate(candidate,inputs,signals,asOf)});}catch(e){parentPort.postMessage({error:e.stack??String(e)});}});parentPort.postMessage({ready:true});
