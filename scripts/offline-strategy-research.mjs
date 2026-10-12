@@ -32,7 +32,7 @@ export class LocalCandleReader{
  consume(c){this.previous=c;if(!c.synthetic)this.i++;}
 }
 
-export function evaluateWindow(candidate,inputs,from,to,{interval='30s',valueType='mcap',warmupBars=1500,detail=false}={}){
+export function evaluateWindow(candidate,inputs,from,to,{interval='30s',valueType='mcap',warmupBars=1500,detail=false,onBatch}={}){
  assert(['30s','1m'].includes(interval));assert(['price','mcap'].includes(valueType));assert(Number.isFinite(from)&&to>from);
  const step=interval==='30s'?30000:60000,started=performance.now(),config=structuredClone(candidate.config);
  config.symbols=inputs.map(p=>p.symbol);config.interval=interval;config.valueType=valueType;config.exitConfig.closeAtEnd=true;
@@ -46,8 +46,8 @@ export function evaluateWindow(candidate,inputs,from,to,{interval='30s',valueTyp
  const allByCa=new Map(),auditTrades=[],auditSignals=[];
  const gates=new Map((config.entrySignals??[]).map(s=>[`${s.chain}:${s.ca}`,s.signalTime]));
  let fees=0,slippageCost=0,taxCost=0,tradeReturnSum=0,tradeReturnCount=0,buyEvents=0;
- const drain=()=>{const batch=engine.drain();if(detail)for(const s of batch.signals){
-  auditSignals.push(s);if(s.type==='entry'||s.type==='add'){buyEvents++;assert(s.time>gates.get(`${s.symbol.chain}:${s.symbol.ca}`),'Entry before or at monitoring signal');}
+ const drain=()=>{const batch=engine.drain();onBatch?.(batch);if(detail)for(const s of batch.signals){
+  auditSignals.push(s);if(s.type==='entry'||s.type==='add'){buyEvents++;if(config.entryAfterSignal!==false)assert(s.time>gates.get(`${s.symbol.chain}:${s.symbol.ca}`),'Entry before or at monitoring signal');}
  }
  for(const t of batch.trades){
   if(detail){auditTrades.push(t);fees+=t.fees;slippageCost+=t.slippageCost;taxCost+=t.taxCost;

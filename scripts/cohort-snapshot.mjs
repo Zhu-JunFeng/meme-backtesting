@@ -21,36 +21,38 @@ export function importComplete(text){if(!text.trim())return false;try{if(JSON.pa
 export async function* candleLines(path){const stream=createReadStream(path).pipe(createGunzip());for await(const line of createInterface({input:stream,crlfDelay:Infinity}))if(line)yield JSON.parse(line);}
 export function decodeRow(chain,r){const [ca,pairId,time,closeTime,open,high,low,close,volume,valid]=r;return {symbol:{chain,ca,pairId},candle:{time,closeTime,open,high,low,close,volume,valid}};}
 
-export async function snapshot({connectionString,output,importReport,client,allKlines=false,researchMcapOnly=false}){
+export async function snapshot({connectionString,output,importReport,client,allKlines=false,researchMcapOnly=false,selectedChains,closedOnly=false}){
  assert(connectionString||client);output=resolve(output);
+ if(selectedChains)assert(selectedChains.length&&selectedChains.every(c=>chains.includes(c)),'Invalid chain selection');
  const audit=importReport?requireFinishedImport(await readFile(importReport,'utf8')):{source:'direct_read_only_database_snapshot'};
  await mkdir(output,{recursive:true});
  try{await access(resolve(output,'manifest.json'));throw Error('Snapshot already exists; do not overwrite');}catch(e){if(e.code!=='ENOENT')throw e;}
  const require=createRequire(new URL('../apps/api/package.json',import.meta.url)),{Client}=require('pg');
- const db=client??new Client({connectionString,application_name:'cohort-readonly-export'});
+ const db=client??new Client({connectionString,application_name:'cohort-readonly-export',connectionTimeoutMillis:15000});
  const manifest={version:1,engineVersion:ENGINE_VERSION,startedAt:new Date().toISOString(),importAudit:audit,files:[]};
  try{
   await db.connect();await db.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
   manifest.snapshot=(await db.query('SELECT txid_current_snapshot()::text AS snapshot')).rows[0].snapshot;
   const metadata={};
-  for(const table of ['token_info','token_signal_events'])metadata[table]=(await db.query(`SELECT * FROM public.${table} ${allKlines?'':'WHERE chain=ANY($1)'} ORDER BY chain,ca,id`,allKlines?[]:[chains])).rows;
-  if(researchMcapOnly)metadata.live_signals=(await db.query('SELECT DISTINCT chain,ca,signal_time,signal_source FROM live_watches WHERE signal_time IS NOT NULL ORDER BY chain,ca,signal_time')).rows;
+  for(const table of ['token_info','token_signal_events'])metadata[table]=(await db.query(`SELECT * FROM public.${table} ${selectedChains||!allKlines?'WHERE chain=ANY($1)':''} ORDER BY chain,ca,id`,selectedChains?[selectedChains]:allKlines?[]:[chains])).rows;
+  if(researchMcapOnly)metadata.live_signals=(await db.query(`SELECT DISTINCT chain,ca,signal_time,signal_source FROM live_watches WHERE signal_time IS NOT NULL ${selectedChains?'AND chain=ANY($1)':''} ORDER BY chain,ca,signal_time`,selectedChains?[selectedChains]:[])).rows;
+  if(selectedChains)metadata.poolInventory=(await db.query('SELECT DISTINCT chain,ca,pair_id FROM public.meme_kline WHERE chain=ANY($1) ORDER BY chain,ca,pair_id',[selectedChains])).rows;
   metadata.versions=(await db.query('SELECT t.name,t.status,v.* FROM backtest_strategy_versions v JOIN backtest_strategy_templates t ON t.id=v.template_id ORDER BY v.created_at,v.id')).rows;
   metadata.previousRuns=allKlines?[]:(await db.query("SELECT r.id,r.name,r.config_json,p.report_json FROM backtest_runs r JOIN backtest_reports p ON p.run_id=r.id WHERE r.status='completed' ORDER BY r.id")).rows;
   await saveJson(resolve(output,'metadata.json'),metadata);manifest.metadataHash=await fileHash(resolve(output,'metadata.json'));
   const dimensions=researchMcapOnly?(await db.query("SELECT DISTINCT chain,interval,type FROM public.meme_kline WHERE type='mcap' AND interval IN ('30s','1m') ORDER BY chain,interval,type")).rows:allKlines?(await db.query('SELECT DISTINCT chain,interval,type FROM public.meme_kline ORDER BY chain,interval,type')).rows:chains.flatMap(chain=>['30s','1m'].flatMap(interval=>['mcap','price'].map(type=>({chain,interval,type}))));
-  for(const {chain,interval,type} of dimensions){
+  for(const {chain,interval,type} of dimensions.filter(d=>!selectedChains||selectedChains.includes(d.chain))){
    const name=`${chain}-${interval}-${type}.jsonl.gz`,path=resolve(output,name),gzip=createGzip(),sink=createWriteStream(path+'.tmp',{flags:'wx'});
    const completion=finished(sink);gzip.on('error',e=>sink.destroy(e));gzip.pipe(sink);
    let rows=0,valid=0,firstTime=Infinity,lastTime=-Infinity;const digest=createHash('sha256');
-   await db.query('DECLARE export_rows NO SCROLL CURSOR FOR SELECT ca,pair_id,open_time::float8,close_time::float8,open::float8,high::float8,low::float8,close::float8,volume::float8,valid FROM meme_kline WHERE chain=$1 AND interval=$2 AND type=$3 ORDER BY ca,pair_id,open_time',[chain,interval,type]);
+   await db.query(`DECLARE export_rows NO SCROLL CURSOR FOR SELECT ca,pair_id,open_time::float8,close_time::float8,open::float8,high::float8,low::float8,close::float8,volume::float8,valid FROM meme_kline WHERE chain=$1 AND interval=$2 AND type=$3 ${closedOnly?'AND close_time <= $4 AND open_time < $4':''} ORDER BY ca,pair_id,open_time`,[chain,interval,type,...(closedOnly?[Date.parse(manifest.startedAt)]:[])]);
    try{for(;;){const batch=await db.query('FETCH 10000 FROM export_rows');if(!batch.rowCount)break;
     for(const r of batch.rows){const a=[r.ca,r.pair_id,r.open_time,r.close_time,r.open,r.high,r.low,r.close,r.volume,r.valid];const line=JSON.stringify(a)+'\n';digest.update(line);rows++;firstTime=Math.min(firstTime,Number(r.open_time));lastTime=Math.max(lastTime,Number(r.open_time));if(validCandle(decodeRow(chain,a).candle))valid++;if(!gzip.write(line))await once(gzip,'drain');}
    }gzip.end();await completion;await rename(path+'.tmp',path);}catch(e){gzip.destroy();sink.destroy();await completion.catch(()=>{});throw e;}
    await db.query('CLOSE export_rows');manifest.files.push({chain,interval,type,name,rows,valid,firstTime:rows?firstTime:null,lastTime:rows?lastTime:null,sha256:await fileHash(path),dataHash:digest.digest('hex')});
    console.log(JSON.stringify({stage:'snapshot',...manifest.files.at(-1)}));
   }
-  await db.query('COMMIT');manifest.completedAt=new Date().toISOString();manifest.checksum=hash(manifest);await saveJson(resolve(output,'manifest.json'),manifest);
+  await db.query('COMMIT');if(selectedChains)manifest.selectedChains=selectedChains;if(closedOnly)manifest.closedOnly=true;manifest.completedAt=new Date().toISOString();manifest.checksum=hash(manifest);await saveJson(resolve(output,'manifest.json'),manifest);
  }finally{await db.end();}
  return manifest;
 }
