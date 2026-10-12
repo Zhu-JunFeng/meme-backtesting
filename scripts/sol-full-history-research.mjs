@@ -118,7 +118,7 @@ export function reportMarkdown(report){
   '## 数据覆盖','', '| 周期 | CA | 池 | 有效已收盘 K 线 | 非法行 | 缺口桶 | 无信号 CA | 无对应周期数据池 |','|---|---:|---:|---:|---:|---:|---:|---:|'];
  for(const [interval,c] of Object.entries(report.coverage))lines.push(`| ${interval} | ${c.cas} | ${c.pools} | ${c.validClosedRows} | ${c.invalid} | ${c.gapBuckets} | ${c.missingSignalCas.length} | ${c.noDataPools.length} |`);
  lines.push('','## 前十名','', '| 候选 | 周期 | 净收益率 | 净利润 USD | 最大回撤 | 胜率 | 交易数 | 盈亏因子 | 成本 USD |','|---|---|---:|---:|---:|---:|---:|---:|---:|');
- for(const r of report.leaders)lines.push(`| ${r.id}${r.lowSample?'（样本不足）':''} | ${r.interval} | ${f(r.accountReturn)}% | ${f(r.netPnl)} | ${f(r.accountMaxDrawdown)}% | ${f(r.accountWinRate)}% | ${r.totalTrades} | ${f(r.profitFactor)} | ${f(r.costs.total)} |`);
+ for(const r of report.leaders)lines.push(`| ${r.id}${r.lowSample?'（样本不足）':''} | ${r.interval} | ${f(r.accountReturn)}% | ${f(r.netPnl)} | ${f(r.accountMaxDrawdown)}% | ${f(r.accountWinRate==null?null:r.accountWinRate*100)}% | ${r.totalTrades} | ${f(r.profitFactor)} | ${f(r.costs.total)} |`);
  lines.push('','## 前三名压力测试','', '| 候选 | 原收益率 | 滑点 2% | 移除最大盈利 CA 重放 |','|---|---:|---:|---:|');
  for(const r of report.leaders.slice(0,3))lines.push(`| ${r.id} | ${f(r.accountReturn)}% | ${f(r.stress?.accountReturn)}% | ${f(r.withoutBestCa?.accountReturn)}% |`);
  if(b){lines.push('','## 最佳候选的完整规则','',b.description.generatedText,'','## 最佳候选归因','',

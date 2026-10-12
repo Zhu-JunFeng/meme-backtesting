@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,readFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {normalizeStrategy,firstRound,secondRound,ranking,attribution,evaluate,research} from './sol-full-history-research.mjs';
+import {normalizeStrategy,firstRound,secondRound,ranking,attribution,evaluate,research,reportMarkdown} from './sol-full-history-research.mjs';
 import {baseStrategy,COSTS} from './temporal-holdout-research.mjs';
 import {snapshot,saveJson} from './cohort-snapshot.mjs';
 import {canonical,evaluateWindow} from './offline-strategy-research.mjs';
@@ -34,6 +34,10 @@ test('1024 deterministic unique first-round candidates and bounded unique refine
 test('ranking includes terminal pnl, excludes zero trades and has deterministic ties',()=>{
  const rows=[{id:'a',totalTrades:10,accountReturn:1,accountMaxDrawdown:2},{id:'b',totalTrades:11,accountReturn:1,accountMaxDrawdown:2},{id:'z',totalTrades:0,accountReturn:100,accountMaxDrawdown:0}];
  assert.deepEqual(ranking(rows).map(r=>r.id),['b','a']);
+});
+test('Chinese report converts fractional win rates and renders full rule text',()=>{
+ const r={id:'test',interval:'30s',accountReturn:2,netPnl:200,accountMaxDrawdown:1,accountWinRate:.5,totalTrades:20,profitFactor:2,costs:{total:10},description:{generatedText:'完整规则'},attribution:Object.fromEntries(['beforeOrAtSignal','afterSignal','missingSignal'].map(k=>[k,{trades:0,netPnl:0}]))};
+ const md=reportMarkdown({asOf:1700000000000,coverage:{},leaders:[r]});assert(md.includes('| 50.00% |'));assert(md.includes('完整规则'));assert(!md.includes('[object Object]'));
 });
 test('no signal is eligible; signal before/after/unknown attribution never conflates them',()=>{
  const symbol=ca=>({chain:'sol',ca,pairId:ca}),trades=[{symbol:symbol('A'),entryTime:100,netPnl:2},{symbol:symbol('A'),entryTime:101,netPnl:3},{symbol:symbol('B'),entryTime:100,netPnl:-1}];
