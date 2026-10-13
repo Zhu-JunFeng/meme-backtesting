@@ -281,6 +281,7 @@ export class LiveService {
   const capacity=(await this.pool.query(`SELECT r.id,COUNT(w.*) FILTER(WHERE w.status IN ('monitoring','recovering','pending_eviction'))::int AS active,
    BOOL_OR(w.ca=$2 AND w.status IN ('monitoring','recovering','pending_eviction')) AS existing
    FROM live_runs r LEFT JOIN live_watches w ON w.run_id=r.id WHERE r.id=ANY($1::uuid[]) GROUP BY r.id`,[runs.map(r=>r.id),signal.ca])).rows;
+  if(!valid())return;
   if(!capacity.some(r=>canMonitor(Number(r.active),!!r.existing))){for(const r of runs)this.countAdmission(r.id,signal,false,'监控名额已满');return;}
   // Lookup must not block the serialized market/decision queue.
   const info=await this.projects.fresh(signal);
@@ -289,32 +290,37 @@ export class LiveService {
   const facts={createdAt:info.createdAt,marketCap:info.marketCap,...signal.facts};
   if(latest?.pairId===info.pairId&&Date.now()-latest.time<60000)facts.marketCap=latest.value;
   signal={...signal,facts};
-  await new Promise<void>((resolve,reject)=>this.enqueue(async()=>{try{if(!this.stopped&&valid())await this.onSignal(signal,info);resolve();}catch(e){reject(e);}}));
+  await new Promise<void>((resolve,reject)=>this.enqueue(async()=>{try{if(!this.stopped&&valid())await this.onSignal(signal,info,valid);resolve();}catch(e){reject(e);}}));
  }
  private countAdmission(id:string,signal:Discovery,accepted:boolean,reason?:string){const key=`${id}:${signal.provider}`,c=this.admissionCounts.get(key)??{accepted:0,filtered:0,lastReceivedAt:0};c[accepted?'accepted':'filtered']++;c.lastReceivedAt=Date.now();c.reason=reason;this.admissionCounts.set(key,c);}
- private async onSignal(signal:Discovery,pool:{pairId:string;dexId:string}){
+ private async onSignal(signal:Discovery,pool:{pairId:string;dexId:string},valid:()=>boolean=()=>true){
+  const guard=()=>{if(!valid())throw new Error('项目准入执行已失效');};guard();
   if(signal.time>Date.now()+5_000)return;
   const runs=(await this.pool.query("SELECT * FROM live_runs WHERE status='running' AND chain=$1 AND started_at IS NOT NULL",[signal.chain])).rows;
+  guard();
   const relevant=runs.filter(r=>acceptsDiscovery(r,signal));
   if(!relevant.length)return;
   const capacities=(await this.pool.query(`SELECT r.id,COUNT(w.*) FILTER(WHERE w.status IN ('monitoring','recovering','pending_eviction'))::int AS active,
    BOOL_OR(w.ca=$2 AND w.status IN ('monitoring','recovering','pending_eviction')) AS existing
    FROM live_runs r LEFT JOIN live_watches w ON w.run_id=r.id WHERE r.id=ANY($1::uuid[]) GROUP BY r.id`,[relevant.map(r=>r.id),signal.ca])).rows;
+  guard();
   if(!capacities.some(r=>canMonitor(Number(r.active),!!r.existing))){
    await this.pool.query("INSERT INTO live_events(chain,ca,kind,event_time,payload) VALUES($1,$2,'signal_skipped',$3,$4)",[signal.chain,signal.ca,signal.time,JSON.stringify({reason:'all_matching_runs_full',limit:LIVE_CA_LIMIT})]);return;
   }
   const marketCap=signal.facts?.marketCap;
   const {pairId,dexId}=pool;
   const c=await this.pool.connect();
+  const admissionUpdates:Array<()=>void>=[];
   try{await c.query('BEGIN');
+   guard();await c.query("SET LOCAL statement_timeout='14s'");
    // Serialize admissions per run; concurrent signals cannot each claim the last slot.
    let admitted=(await c.query("SELECT * FROM live_runs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",[relevant.map(r=>r.id)])).rows.filter(r=>r.status==='running'&&acceptsDiscovery(r,signal)&&qualifiesSource(signal.provider,selectedProjectSources(r)[signal.provider],signal.facts??{},Date.now()));
-   for(const r of relevant)if(!admitted.some(a=>a.id===r.id))this.countAdmission(r.id,signal,false,'市值、年龄、KOL 或来源条件不符合');
+   guard();for(const r of relevant)if(!admitted.some(a=>a.id===r.id))admissionUpdates.push(()=>this.countAdmission(r.id,signal,false,'市值、年龄、KOL 或来源条件不符合'));
    if(signal.provider==='xxyy'){
     const seen=(await c.query("SELECT run_id FROM live_watches WHERE run_id=ANY($1::uuid[]) AND chain=$2 AND ca=$3 AND status<>'evicted_low_mcap' AND 'xxyy'=ANY(matched_sources)",[admitted.map(r=>r.id),signal.chain,signal.ca])).rows;
     admitted=admitted.filter(r=>!seen.some(w=>w.run_id===r.id));
    }
-   if(!admitted.length){await c.query('COMMIT');return;}
+   guard();if(!admitted.length){await c.query('COMMIT');if(valid())admissionUpdates.forEach(fn=>fn());return;}
    await c.query(`INSERT INTO token_signal_events(chain,ca,signal_source,detail_id,signal_time,source_signal,provenance)
     VALUES($1,$2,$3,$4,$5,$6,'[]') ON CONFLICT(chain,ca,signal_source,detail_id) DO NOTHING`,[signal.chain,signal.ca,signal.source,signal.key,signal.time,JSON.stringify(signal.identity)]);
    await c.query(`INSERT INTO token_info(chain,ca,pair,signal_source,source_signal,signal_time) VALUES($1,$2,$3,$4,$5,$6)
@@ -322,6 +328,7 @@ export class LiveService {
     source_signal=CASE WHEN token_info.signal_time IS NULL OR EXCLUDED.signal_time<token_info.signal_time THEN EXCLUDED.source_signal ELSE token_info.source_signal END,
     signal_time=LEAST(COALESCE(token_info.signal_time,EXCLUDED.signal_time),EXCLUDED.signal_time)`,[signal.chain,signal.ca,pairId,signal.source,JSON.stringify(signal.identity),signal.time]);
    for(const r of admitted){
+    guard();
     const active=Number((await c.query("SELECT COUNT(*) AS count FROM live_watches WHERE run_id=$1 AND status IN ('monitoring','recovering','pending_eviction')",[r.id])).rows[0].count);
     const prior=(await c.query('SELECT status,signal_key,matched_sources FROM live_watches WHERE run_id=$1 AND chain=$2 AND ca=$3',[r.id,signal.chain,signal.ca])).rows[0];
     const matched:ProjectProvider[]=prior&&prior.status!=='evicted_low_mcap'?[...new Set<ProjectProvider>([...(prior.matched_sources??['memeinfo']),signal.provider])]:[signal.provider];
@@ -339,11 +346,11 @@ export class LiveService {
     await c.query(`INSERT INTO live_watches(run_id,chain,ca,pair_id,dex_id,signal_source,signal_key,signal_time,status,state_json,last_candle_time,current_mcap,mcap_checked_at,recovery_reason,matched_sources,exit_market_cap,admitted_at)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,'recovering','{}',NULL,$9,now(),'新信号入组，预热指标',$10,$11,$12)
       ON CONFLICT(run_id,chain,ca) DO UPDATE SET pair_id=EXCLUDED.pair_id,dex_id=EXCLUDED.dex_id,signal_source=EXCLUDED.signal_source,signal_key=EXCLUDED.signal_key,signal_time=EXCLUDED.signal_time,status='recovering',state_json='{}',last_candle_time=NULL,current_mcap=EXCLUDED.current_mcap,mcap_checked_at=now(),recovery_reason=EXCLUDED.recovery_reason,matched_sources=EXCLUDED.matched_sources,exit_market_cap=EXCLUDED.exit_market_cap,admitted_at=EXCLUDED.admitted_at,exit_only=false`,[r.id,signal.chain,signal.ca,pairId,dexId,signal.source,signal.key,entryTime,marketCap,matched,exitCap,admittedAt]);
-    this.countAdmission(r.id,signal,true);
+    admissionUpdates.push(()=>this.countAdmission(r.id,signal,true));
     await c.query("UPDATE live_runs SET last_signal_at=GREATEST(COALESCE(last_signal_at,0),$2),feed_state='connecting' WHERE id=$1",[r.id,signal.time]);
     await c.query("INSERT INTO live_events(run_id,chain,ca,pair_id,kind,event_key,event_time,payload) VALUES($1,$2,$3,$4,'external_signal',$5,$6,$7) ON CONFLICT(event_key) DO NOTHING",[r.id,signal.chain,signal.ca,pairId,`${r.id}:${signal.key}`,signal.time,JSON.stringify(signal.identity)]);
    }
-   await c.query('COMMIT');
+   guard();await c.query('COMMIT');if(valid())admissionUpdates.forEach(fn=>fn());
   }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
   await this.refresh();
  }

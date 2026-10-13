@@ -126,6 +126,10 @@ describe('monitor admission',()=>{
   expect(ctx.ready).toBe(false);expect(service.connected.size).toBe(0);expect(service.marketSessions.size).toBe(0);expect(service.closedBars).toEqual([]);
   await service.chain;
  });
+ it('rejects an expired admission before querying or creating a watch',async()=>{
+  const query=vi.fn(async()=>({rows:[]}));const service:any=new LiveService({query} as never);
+  await expect(service.onSignal({time:Date.now()}, {pairId:'p',dexId:'d'},()=>false)).rejects.toThrow('已失效');expect(query).not.toHaveBeenCalled();
+ });
  it('allows exactly twenty active CAs per run and keeps existing watches',()=>{
   expect(canMonitor(LIVE_CA_LIMIT-1,false)).toBe(true);
   expect(canMonitor(LIVE_CA_LIMIT,false)).toBe(false);

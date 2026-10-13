@@ -4,7 +4,7 @@ import {createQueue,OperationsSampler,operationsAlerts,deadline} from '@meme/run
 @Controller('api/operations')
 export class OperationsController {
  private queue=createQueue();
- private sampler=new OperationsSampler('api',()=>({}),async()=> (await this.queue.client as any).ping());
+ private sampler=new OperationsSampler('api',()=>({}),async()=>{const client=await this.queue.client as any;if(client.status!=='ready')throw new Error('Redis disconnected');return client.ping();});
  private samples:any[]=[];
  private timer?:ReturnType<typeof setInterval>;private busy=false;
  onModuleInit(){this.sampler.start();this.timer=setInterval(()=>void this.refresh(),60000);void this.refresh();}
