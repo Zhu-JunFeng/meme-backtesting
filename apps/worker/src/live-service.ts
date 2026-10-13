@@ -86,6 +86,10 @@ export class XxyyTradeClient {
 }
 
 export class LiveService {
+ private signalLastMessage=0;
+ diagnostics(){return {discovery:Object.fromEntries(['wallet','xxyy'].map(p=>[p,this.sourceRuns.some(r=>selectedProjectSources(r)[p as 'wallet'|'xxyy'].enabled)?this.discovery.status[p]:{state:'disabled'}])),connections:[{name:'项目信号 WS',enabled:this.sourceRuns.some(r=>selectedProjectSources(r).memeinfo.enabled),state:this.feedHealthy?'connected':'disconnected',lastMessageAt:this.signalLastMessage,disconnectedAt:this.signalDisconnectedAt},...this.market.diagnostics()],history:this.history.diagnostics(),quality:this.quality,pendingMarket:this.pendingMarket,redisState:this.projectRedis.status,dbPool:{total:this.pool.totalCount,idle:this.pool.idleCount,waiting:this.pool.waitingCount},tasks:{paper:this.sourceRuns.filter(r=>r.mode==='paper').length,live:this.sourceRuns.filter(r=>r.mode==='live').length,monitored:this.watches.size,recovering:[...this.watches.values()].filter(c=>!c.ready).length},admission:[...this.admissionCounts.values()].reduce((a,c)=>({accepted:a.accepted+c.accepted,filtered:a.filtered+c.filtered}),{accepted:0,filtered:0})};}
+ private signalDisconnectedAt=Date.now();
+ walletDiagnostics(){return this.discovery.connectionDiagnostics();}
  private closedBars:ClosedMarketBar[]=[];
  private readonly aggregator=new LiveCandleAggregator(bar=>this.closedBars.push(bar));
  private executionClient?:PoolClient;
@@ -178,7 +182,7 @@ export class LiveService {
  private readonly admissionCounts=new Map<string,{accepted:number;filtered:number;lastReceivedAt:number;reason?:string}>();
  private sourceRuns:Run[]=[];
  private mcapBusy=false;
- constructor(private readonly pool:Pool){this.discovery=new ProjectDiscovery(pool,signal=>this.receiveDiscovery(signal));}
+ constructor(private readonly pool:Pool){this.discovery=new ProjectDiscovery(pool,(signal,valid)=>this.receiveDiscovery(signal,valid));}
  private enqueue(fn:()=>Promise<void>){this.chain=this.chain.then(fn).catch(e=>console.error('live service:',redact(e)));}
  async start(){
   const client=await this.pool.connect();
@@ -266,12 +270,12 @@ export class LiveService {
   const ws=new WebSocket(process.env.MEMEINFO_SIGNAL_URL??'wss://app.memeinfo.net/api/ws/external/signal-events',{headers:{Authorization:`Bearer ${process.env.MEMEINFO_SIGNAL_TOKEN}`}});
   this.signal=ws;
   ws.on('open',()=>{this.feedHealthy=true;});
-  ws.on('message',raw=>{const s=parseProjectSignal(raw.toString());if(!s)return;const signal:Discovery={...s,provider:'memeinfo',observedAt:Date.now()};if(this.sourceRuns.some(r=>r.chain===s.chain&&acceptsDiscovery(r,signal)))void this.discovery.accept(signal).catch(e=>console.error('信号持久化失败:',redact(e)));});
-  ws.on('close',()=>{this.feedHealthy=false;if(!this.stopped)setTimeout(()=>this.connectSignals(),3_000);});
+  ws.on('message',raw=>{this.signalLastMessage=Date.now();const s=parseProjectSignal(raw.toString());if(!s)return;const signal:Discovery={...s,provider:'memeinfo',observedAt:Date.now()};if(this.sourceRuns.some(r=>r.chain===s.chain&&acceptsDiscovery(r,signal)))void this.discovery.accept(signal).catch(e=>console.error('信号持久化失败:',redact(e)));});
+  ws.on('close',()=>{this.feedHealthy=false;this.signalDisconnectedAt=Date.now();if(!this.stopped)setTimeout(()=>this.connectSignals(),3_000);});
   ws.on('error',error=>console.error('MemeInfo signal connection:',redact(error)));
  }
- private async receiveDiscovery(signal:Discovery){
-  if(this.stopped)return;
+ private async receiveDiscovery(signal:Discovery,valid:()=>boolean=()=>true){
+  if(this.stopped||!valid())return;
   const runs=this.sourceRuns.filter(r=>r.chain===signal.chain&&acceptsDiscovery(r,signal));if(!runs.length)return;
   if(signal.provider==='xxyy'&&!runs.some(r=>qualifiesSource('xxyy',selectedProjectSources(r).xxyy,signal.facts??{},Date.now()))){for(const r of runs)this.countAdmission(r.id,signal,false,'XXYY 本地复核未通过');return;}
   const capacity=(await this.pool.query(`SELECT r.id,COUNT(w.*) FILTER(WHERE w.status IN ('monitoring','recovering','pending_eviction'))::int AS active,
@@ -280,11 +284,12 @@ export class LiveService {
   if(!capacity.some(r=>canMonitor(Number(r.active),!!r.existing))){for(const r of runs)this.countAdmission(r.id,signal,false,'监控名额已满');return;}
   // Lookup must not block the serialized market/decision queue.
   const info=await this.projects.fresh(signal);
+  if(!valid())return;
   const latest=this.latestCaps.get(projectKey(signal));
   const facts={createdAt:info.createdAt,marketCap:info.marketCap,...signal.facts};
   if(latest?.pairId===info.pairId&&Date.now()-latest.time<60000)facts.marketCap=latest.value;
   signal={...signal,facts};
-  await new Promise<void>((resolve,reject)=>this.enqueue(async()=>{try{if(!this.stopped)await this.onSignal(signal,info);resolve();}catch(e){reject(e);}}));
+  await new Promise<void>((resolve,reject)=>this.enqueue(async()=>{try{if(!this.stopped&&valid())await this.onSignal(signal,info);resolve();}catch(e){reject(e);}}));
  }
  private countAdmission(id:string,signal:Discovery,accepted:boolean,reason?:string){const key=`${id}:${signal.provider}`,c=this.admissionCounts.get(key)??{accepted:0,filtered:0,lastReceivedAt:0};c[accepted?'accepted':'filtered']++;c.lastReceivedAt=Date.now();c.reason=reason;this.admissionCounts.set(key,c);}
  private async onSignal(signal:Discovery,pool:{pairId:string;dexId:string}){

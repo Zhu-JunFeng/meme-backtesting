@@ -17,7 +17,8 @@ const difference=(a:Project[],b:Project[])=>a.filter(p=>!b.some(x=>projectKey(x)
 /** Incremental acknowledged membership; changing membership never resets a retained project's epoch. */
 export class MemeMarketConnection {
  private ws?:WebSocket;private timer?:ReturnType<typeof setInterval>;private retry?:ReturnType<typeof setTimeout>;
- private stopped=false;private fatal=false;private attempt=0;private revision=-1;private sequence=0;private session='';private deadline=0;private lastMessage=0;private opened=0;
+ private stopped=false;private fatal=false;private attempt=0;private revision=-1;private sequence=0;private session='';private deadline=0;private lastMessage=0;private opened=0;private disconnectedAt=Date.now();
+ diagnostics(){return {name:'Meme Market WS',enabled:true,state:this.ws?.readyState===WebSocket.OPEN&&this.revision>=0?'connected':'disconnected',lastMessageAt:this.lastMessage,disconnectedAt:this.disconnectedAt,subscriptionCount:this.confirmed.length,desiredCount:this.desired.length,sequence:this.sequence,protocolVersion:2,reconnectAttempts:this.attempt};}
  private desired:Project[];private confirmed:Project[]=[];private pending?:Control;private buffered:any[]=[];private nextControlAt=0;private controlDelay=1000;
  constructor(projects:Project[],private readonly hooks:Hooks,private readonly url:string,private readonly factory=(url:string)=>new WebSocket(url,{maxPayload:32_768})){this.desired=unique(projects);}
  get projects(){return this.desired;}
@@ -25,7 +26,7 @@ export class MemeMarketConnection {
  start(){if(this.stopped||this.fatal||this.ws)return;this.connect();}
  stop(){this.stopped=true;this.detach();if(this.retry)clearTimeout(this.retry);this.retry=undefined;}
  private detach(){if(this.timer)clearInterval(this.timer);this.timer=undefined;const ws=this.ws;this.ws=undefined;ws?.removeAllListeners();ws?.terminate();}
- private fail(reason:string,fatal=false){if(this.stopped||!this.ws)return;this.fatal=fatal;this.hooks.interrupted(this.projects,reason);this.detach();if(!fatal)this.retry=setTimeout(()=>{this.retry=undefined;this.connect();},Math.min(30_000,1000*2**Math.min(this.attempt++,5))*(0.8+Math.random()*0.4));}
+ private fail(reason:string,fatal=false){if(this.stopped||!this.ws)return;this.disconnectedAt=Date.now();this.fatal=fatal;this.hooks.interrupted(this.projects,reason);this.detach();if(!fatal)this.retry=setTimeout(()=>{this.retry=undefined;this.connect();},Math.min(30_000,1000*2**Math.min(this.attempt++,5))*(0.8+Math.random()*0.4));}
  private pump(){
   if(this.stopped||this.fatal||!this.ws||!this.session||this.pending||Date.now()<this.nextControlAt)return;
   const before=this.confirmed,removed=difference(before,this.desired),added=difference(this.desired,before);
@@ -91,6 +92,7 @@ export class MemeMarketConnection {
 
 /** Sticky shard ownership: existing projects never move when another project is added/removed. */
 export class MemeMarketFeed {
+ diagnostics(){return [...this.connections.values()].map((c,i)=>({...c.diagnostics(),name:`Meme Market WS ${i+1}`}));}
  private connections=new Map<number,MemeMarketConnection>();private capacity=100;private desired:Project[]=[];private nextId=0;
  lastMessageAt:number|null=null;
  constructor(private readonly hooks:Omit<Hooks,'capacity'|'message'>,private readonly url=process.env.MEME_MARKET_URL??'wss://app.memeinfo.net/api/ws/meme-market/v1',private readonly factory?:(url:string)=>WebSocket){}

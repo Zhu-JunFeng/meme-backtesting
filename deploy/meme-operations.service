@@ -1,0 +1,13 @@
+[Unit]
+Description=Meme lightweight host metrics
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/meme-operations/operations-host.py
+TimeoutStartSec=10
+Nice=19
+CPUQuota=5%
+MemoryMax=64M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/meme-operations

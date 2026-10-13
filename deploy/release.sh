@@ -43,7 +43,8 @@ fi
 for service in meme-backtesting-worker meme-backtesting-api meme-backtesting-web; do
   if docker inspect "$service" >/dev/null 2>&1; then docker rm "$service"; fi
 done
-docker run -d --name meme-backtesting-api --restart unless-stopped --network host --env-file deploy/.env -e NODE_ENV=production -e API_BIND_HOST=127.0.0.1 -e BACKTEST_QUEUE_PREFIX=meme-production-v3 meme-backtesting-api:latest
+sh deploy/install-operations.sh
+docker run -d --name meme-backtesting-api --restart unless-stopped --network host --env-file deploy/.env -v /run/meme-operations:/run/meme-operations:ro -e NODE_ENV=production -e API_BIND_HOST=127.0.0.1 -e BACKTEST_QUEUE_PREFIX=meme-production-v3 meme-backtesting-api:latest
 docker run -d --name meme-backtesting-worker --restart unless-stopped --stop-timeout 90 --network host --env-file deploy/.env -e NODE_ENV=production -e BACKTEST_QUEUE_PREFIX=meme-production-v3 meme-backtesting-worker:latest
 docker run -d --name meme-backtesting-web --restart unless-stopped --network host meme-backtesting-web:latest
 sh deploy/install-batch-timer.sh

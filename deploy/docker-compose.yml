@@ -1,5 +1,6 @@
 services:
   api:
+    volumes: ["/run/meme-operations:/run/meme-operations:ro"]
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api

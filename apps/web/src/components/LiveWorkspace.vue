@@ -25,7 +25,7 @@ const projectSources=ref(defaultProjectSources()),editingProjectSources=ref(defa
 watch(()=>form.value.chain,chain=>{if(chain!=='sol'){projectSources.value.wallet.enabled=false;projectSources.value.xxyy.enabled=false;projectSources.value.memeinfo.enabled=true;}});
 const editingSources=ref(false),watchSearch=ref(''),watchSource=ref<string>(),watchSort=ref<'asc'|'desc'>('desc'),watchPage=ref(1);
 const watchSourceOptions=[...signalSources,{label:'钱包买入',value:'wallet'},{label:'XXYY 项目列表',value:'xxyy'}];
-const discoveryState=(s:string)=>({connected:'已连接／最近查询成功',connecting:'连接中',retrying:'重试中',unconfigured:'未配置密钥',idle:'未启动'} as Record<string,string>)[s]??'等待更新';
+const discoveryState=(s:string)=>({connected:'最近扫描成功',connecting:'连接中',scanning:'扫描中',stalled:'扫描超时／等待恢复',retrying:'退避重试中',unconfigured:'未配置密钥',idle:'未启动',disabled:'未启用'} as Record<string,string>)[s]??'等待更新';
 const monitored=computed(()=>monitoringRows(detail.value?.watches??[],watchSearch.value,watchSource.value,watchSort.value));
 watch([watchSearch,watchSource,watchSort],()=>watchPage.value=1);
 watch(()=>monitored.value.length,()=>{watchPage.value=Math.min(watchPage.value,Math.max(1,Math.ceil(monitored.value.length/10)));});

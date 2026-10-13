@@ -1,4 +1,5 @@
 import {createHash} from 'node:crypto';
+import {assertExecution,bounded,scanExecution,type ScanExecution} from './discovery-execution.js';
 import WebSocket from 'ws';
 import type {Pool} from 'pg';
 import {feedQuery,selectedProjectSources,SOURCE_WALLETS,type ProjectProvider,type ProjectSources} from '@meme/domain';
@@ -49,23 +50,42 @@ export function walletBuys(tx:any,wallet:string):string[]{
  return acquired.length===1&&(spent||paidSol)?[acquired[0]![0]]:[];
 }
 
-type Status={state:string;lastSuccessAt?:number;lastReceivedAt?:number;scanned:number;received:number;error?:string};
+type Status={state:string;lastSuccessAt?:number;lastReceivedAt?:number;scanned:number;received:number;error?:string;generation?:number;startedAt?:number;progressAt?:number;stage?:string;nextRetryAt?:number;failures?:number;timeouts?:number;recoveries?:number;connectionState?:string};
 export class ProjectDiscovery {
  readonly status:Record<string,Status>={wallet:{state:'idle',scanned:0,received:0},xxyy:{state:'idle',scanned:0,received:0}};
  private runs:any[]=[];private ws?:WebSocket;private timer?:ReturnType<typeof setInterval>;private stopped=false;
  private feedBusy=false;private walletBusy=false;private inboxBusy=false;private inboxAt=0;private feedAt=0;private walletAt=0;private rpcAt=0;private rpcChain=Promise.resolve();
  private operations=new Set<Promise<unknown>>();
- constructor(private db:Pool,private deliver:(signal:Discovery)=>Promise<void>,private request:typeof fetch=fetch){}
+ private controllers=new Map<string,AbortController>();
+ private walletDisconnectedAt=Date.now();private walletReconnects=0;
+ connectionDiagnostics(){return {name:'钱包 WS',enabled:this.enabled('wallet'),state:this.ws?.readyState===WebSocket.OPEN?'connected':'disconnected',lastMessageAt:this.status.wallet.lastReceivedAt,disconnectedAt:this.walletDisconnectedAt,reconnectAttempts:this.walletReconnects};}
+ constructor(private db:Pool,private delivery:(signal:Discovery,valid?:()=>boolean)=>Promise<void>,private rawRequest:typeof fetch=fetch){}
+ private query(sql:string,params?:any[]){return bounded(()=>this.db.query(sql,params),15000,'数据库等待');}
+ private deliver(signal:Discovery){const ctx=scanExecution.getStore();return bounded(()=>this.delivery(signal,ctx?.valid),15000,'项目投递',ctx);}
+ private async request(url:string,options:RequestInit){const ctx=scanExecution.getStore(),controller=new AbortController();const signal=ctx?AbortSignal.any([ctx.signal,controller.signal]):controller.signal;try{return await bounded(async()=>{const response=await this.rawRequest(url,{...options,signal});const data=await response.json();return {ok:response.ok,json:async()=>data};},8000,'HTTP及响应解析',ctx);}finally{controller.abort();}}
+ private startScan(provider:'wallet'|'xxyy',work:()=>Promise<void>){
+  const status=this.status[provider],generation=(status.generation??0)+1,controller=new AbortController();this.controllers.set(provider,controller);
+  Object.assign(status,{generation,startedAt:Date.now(),progressAt:Date.now(),stage:'开始扫描',state:'scanning'});
+  const ctx:ScanExecution={signal:controller.signal,valid:()=>!this.stopped&&!controller.signal.aborted&&status.generation===generation,progress:stage=>{assertExecution(ctx);status.stage=stage;status.progressAt=Date.now();}};
+  const p=scanExecution.run(ctx,()=>bounded(work,provider==='xxyy'?60000:120000,'整轮扫描',ctx)).then(()=>{assertExecution(ctx);status.failures=0;status.nextRetryAt=undefined;}).catch(error=>{
+   if(this.stopped||status.generation!==generation)return;
+   controller.abort();const failures=(status.failures??0)+1,delay=Math.min(60000,15000*2**Math.min(2,failures-1));
+   const timedOut=String(error?.message).includes('超时');Object.assign(status,{state:timedOut?'stalled':'retrying',error:`${provider==='wallet'?'钱包':'XXYY'} ${status.stage}失败：${String(error?.message).replace(/https?:\/\/\S+/g,'[地址]').slice(0,160)}；自动重试`,failures,timeouts:(status.timeouts??0)+(timedOut?1:0),recoveries:(status.recoveries??0)+1,nextRetryAt:Date.now()+delay});
+   console.warn('discovery scan recovery',provider,generation,status.stage,timedOut?'timeout':'failure');
+   if(provider==='wallet'){this.walletAt=status.nextRetryAt!;this.rpcChain=Promise.resolve();}else this.feedAt=status.nextRetryAt!;
+  }).finally(()=>{controller.abort();if(status.generation===generation){if(provider==='wallet')this.walletBusy=false;else this.feedBusy=false;this.controllers.delete(provider);}});
+  this.track(p);
+ }
  update(runs:any[]){this.runs=runs;const enabled=this.enabled('wallet');if(enabled&&!this.ws)this.connectWallet();if(!enabled&&this.ws){const ws=this.ws;this.ws=undefined;ws.close();}if(!this.timer)this.timer=setInterval(()=>this.tick(),1000);this.tick();}
- async close(){this.stopped=true;if(this.timer)clearInterval(this.timer);this.ws?.close();await Promise.allSettled([...this.operations]);}
+ async close(){this.stopped=true;if(this.timer)clearInterval(this.timer);for(const c of this.controllers.values())c.abort();this.ws?.close();await bounded(()=>Promise.allSettled([...this.operations]),2000,'停止扫描',undefined).catch(()=>{});}
  private track(p:Promise<unknown>){this.operations.add(p);void p.finally(()=>this.operations.delete(p));}
  async accept(signal:Discovery){
-  await this.db.query('INSERT INTO live_source_receipts(event_key,provider,payload) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[`${signal.provider}:${signal.source}:${signal.key}`,signal.provider,JSON.stringify(signal)]);
+  await this.query('INSERT INTO live_source_receipts(event_key,provider,payload) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[`${signal.provider}:${signal.source}:${signal.key}`,signal.provider,JSON.stringify(signal)]);
  }
  private enabled(p:'wallet'|'xxyy'){return this.runs.some(r=>r.chain==='sol'&&selectedProjectSources(r)[p].enabled);}
  private tick(){if(this.stopped)return;const now=Date.now();
-  if(this.enabled('xxyy')&&!this.feedBusy&&now>=this.feedAt){this.feedAt=now+10000;this.feedBusy=true;this.track(this.pollFeed().catch(()=>{this.status.xxyy.state='retrying';this.status.xxyy.error='XXYY 查询失败，自动重试';this.feedAt=Date.now()+30000;}).finally(()=>this.feedBusy=false));}
-  if(this.enabled('wallet')&&!this.walletBusy&&now>=this.walletAt){this.walletAt=now+10000;this.walletBusy=true;this.track(this.scanWallets().catch(()=>{this.status.wallet.state='retrying';this.status.wallet.error='钱包 RPC 查询失败或交易暂不可用，游标保留并自动重试';this.walletAt=Date.now()+15000;}).finally(()=>this.walletBusy=false));}
+  if(this.enabled('xxyy')&&!this.feedBusy&&now>=this.feedAt){this.feedAt=now+10000;this.feedBusy=true;this.startScan('xxyy',()=>this.pollFeed());}
+  if(this.enabled('wallet')&&!this.walletBusy&&now>=this.walletAt&&now>=(this.status.wallet.nextRetryAt??0)){this.walletAt=now+10000;this.walletBusy=true;this.startScan('wallet',()=>this.scanWallets());}
   if(this.runs.length&&!this.inboxBusy&&now>=this.inboxAt){this.inboxAt=now+5000;this.inboxBusy=true;this.track(this.drainInbox().catch(()=>{this.inboxAt=Date.now()+15000;}).finally(()=>this.inboxBusy=false));}
  }
  private async pollFeed(){
@@ -77,7 +97,7 @@ export class ProjectDiscovery {
   if(this.stopped||!this.enabled('xxyy'))return;
   const now=Date.now();this.status.xxyy.scanned+=data.data.items.length;
   let failed=0;
-  for(const signal of feedCandidates(data.data.items,now)){if(this.stopped)return;try{await this.deliver(signal);this.status.xxyy.received++;}catch{failed++;}}
+  for(const signal of feedCandidates(data.data.items,now)){assertExecution();if(this.stopped)return;try{await this.deliver(signal);this.status.xxyy.received++;}catch(error){assertExecution();if(String((error as Error).message).includes('超时'))throw error;failed++;}}
   Object.assign(this.status.xxyy,{state:'connected',lastSuccessAt:now,lastReceivedAt:now,error:undefined});
   if(failed)this.status.xxyy.error=`${failed} 个项目资料或准入处理失败，下次轮询重试`;
  }
@@ -85,23 +105,24 @@ export class ProjectDiscovery {
   if(this.stopped||!this.enabled('wallet'))return;
   const ws=new WebSocket(process.env.SOLANA_RPC_WS_URL??'wss://api.mainnet-beta.solana.com');this.ws=ws;
   ws.on('open',()=>{SOURCE_WALLETS.forEach((wallet,i)=>ws.send(JSON.stringify({jsonrpc:'2.0',id:i+1,method:'logsSubscribe',params:[{mentions:[wallet]},{commitment:'confirmed'}]})));this.status.wallet.state='connecting';});
-  ws.on('message',raw=>{try{const m=JSON.parse(raw.toString());if(m.error){this.status.wallet.error='钱包订阅失败，自动重连';ws.close();return;}if(m.method==='logsNotification'){this.status.wallet.lastReceivedAt=Date.now();this.walletAt=0;}if(typeof m.result==='number')this.status.wallet.state='connected';}catch{/* malformed message does not advance any cursor */}});
+  ws.on('message',raw=>{if(this.ws!==ws||this.stopped)return;try{const m=JSON.parse(raw.toString());if(m.error){this.status.wallet.error='钱包订阅失败，自动重连';ws.close();return;}if(m.method==='logsNotification'){this.status.wallet.lastReceivedAt=Date.now();this.walletAt=0;}if(typeof m.result==='number')this.status.wallet.connectionState='connected';}catch{/* malformed message does not advance any cursor */}});
   ws.on('error',()=>{this.status.wallet.state='retrying';this.status.wallet.error='钱包 WebSocket 连接异常';});
-  ws.on('close',()=>{if(this.ws===ws)this.ws=undefined;if(!this.stopped&&this.enabled('wallet'))setTimeout(()=>{if(!this.ws)this.connectWallet();},3000);});
+  ws.on('close',()=>{if(this.ws===ws){this.ws=undefined;this.walletDisconnectedAt=Date.now();this.walletReconnects++;}if(!this.stopped&&this.enabled('wallet'))setTimeout(()=>{if(!this.ws)this.connectWallet();},3000);});
  }
  private rpc(method:string,params:any[]):Promise<any>{
-  const op=this.rpcChain.then(async()=>{const delay=this.rpcAt-Date.now();if(delay>0)await new Promise(r=>setTimeout(r,delay));this.rpcAt=Date.now()+1100;
+  const ctx=scanExecution.getStore(),prior=this.rpcChain;
+  const op=bounded(()=>prior,15000,'RPC队列',ctx).then(async()=>{assertExecution(ctx);const delay=this.rpcAt-Date.now();if(delay>0)await bounded(()=>new Promise(r=>setTimeout(r,delay)),15000,'RPC节流',ctx);assertExecution(ctx);this.rpcAt=Date.now()+1100;
    const r=await this.request(process.env.SOLANA_RPC_HTTP_URL??'https://api.mainnet-beta.solana.com',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params}),signal:AbortSignal.timeout(8000)});
    if(!r.ok)throw new Error('RPC HTTP');const data=await r.json() as any;if(data.error)throw new Error('RPC error');return data.result;
   });this.rpcChain=op.then(()=>undefined,()=>undefined);return op;
  }
- private async saveCursor(key:string,state:any){await this.db.query('INSERT INTO live_source_cursors(source_key,state_json) VALUES($1,$2) ON CONFLICT(source_key) DO UPDATE SET state_json=EXCLUDED.state_json,updated_at=now()',[key,JSON.stringify(state)]);}
+ private async saveCursor(key:string,state:any){await this.query('INSERT INTO live_source_cursors(source_key,state_json) VALUES($1,$2) ON CONFLICT(source_key) DO UPDATE SET state_json=EXCLUDED.state_json,updated_at=now()',[key,JSON.stringify(state)]);}
  private async scanWallets(){
   let failures=0;
   for(const wallet of SOURCE_WALLETS){if(this.stopped||!this.enabled('wallet'))return;
    try{
-   const key=`wallet:${wallet}`,saved=(await this.db.query('SELECT state_json FROM live_source_cursors WHERE source_key=$1',[key])).rows[0]?.state_json;
-   const state=saved??{since:Date.now(),head:null,before:null,target:null,pending:[]};
+   const key=`wallet:${wallet}`,saved=(await this.query('SELECT state_json FROM live_source_cursors WHERE source_key=$1',[key])).rows[0]?.state_json;
+   const state=saved?structuredClone(saved):{since:Date.now(),head:null,before:null,target:null,pending:[]};
    if(!saved)await this.saveCursor(key,state);
    if(!state.pending.length){
     const page=await this.rpc('getSignaturesForAddress',[wallet,{limit:100,before:state.before??undefined,commitment:'confirmed'}]);if(!Array.isArray(page))throw new Error('RPC signatures');
@@ -124,16 +145,16 @@ export class ProjectDiscovery {
     state.pending.shift();await this.saveCursor(key,state);
    }
    if(!state.pending.length&&state.finished){state.head=state.target;state.before=null;state.target=null;await this.saveCursor(key,state);}
-   }catch{failures++;}
+   }catch(error){assertExecution();if(String((error as Error).message).includes('超时'))throw error;failures++;}
   }
   if(failures)throw new Error('wallet scan incomplete');
   Object.assign(this.status.wallet,{state:'connected',lastSuccessAt:Date.now(),error:undefined});
  }
  private async drainInbox(){
-  const pending=(await this.db.query("SELECT event_key,provider,payload FROM live_source_receipts WHERE processed_at IS NULL AND (retry_at IS NULL OR retry_at<=now()) ORDER BY created_at LIMIT 20")).rows;
+  const pending=(await this.query("SELECT event_key,provider,payload FROM live_source_receipts WHERE processed_at IS NULL AND (retry_at IS NULL OR retry_at<=now()) ORDER BY created_at LIMIT 20")).rows;
   for(const row of pending){if(this.stopped)return;
-   try{await this.deliver(row.payload);await this.db.query('UPDATE live_source_receipts SET processed_at=now() WHERE event_key=$1',[row.event_key]);if(this.status[row.provider])this.status[row.provider].received++;}
-   catch{await this.db.query("UPDATE live_source_receipts SET retry_at=now()+interval '30 seconds' WHERE event_key=$1",[row.event_key]);}
+   try{await this.deliver(row.payload);await this.query('UPDATE live_source_receipts SET processed_at=now() WHERE event_key=$1',[row.event_key]);if(this.status[row.provider])this.status[row.provider].received++;}
+   catch{await this.query("UPDATE live_source_receipts SET retry_at=now()+interval '30 seconds' WHERE event_key=$1",[row.event_key]);}
   }
  }
 }

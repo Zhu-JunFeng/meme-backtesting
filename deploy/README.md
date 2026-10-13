@@ -1,5 +1,9 @@
 # Production deployment
 
+运维页按分钟读取缓存，保留七天采样。发布脚本安装 `meme-operations.timer`，通过 Python 3 读取服务器 `/proc` 和根文件系统容量，输出 `/run/meme-operations/host.json`；API 只读挂载此目录。不需要 Docker socket 或额外上游行情请求。首次 CPU／网络速率需要两次采样。采集器资源限制为 5% CPU、64 MiB 内存，单次最长 10 秒。
+
+本地没有服务器采集器时，服务器指标显示不可用；数据库、扫描和 Worker 指标仍可独立使用。状态接口 `/api/operations/status` 不执行即时探测，历史接口 `/api/operations/history?hours=24` 最多查询七天。
+
 GitHub Actions 需要以下 `production` secrets：
 
 - `DEPLOY_HOST`：PG/Redis 所在服务器 IP 或域名

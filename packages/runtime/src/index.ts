@@ -41,3 +41,4 @@ export async function rerun(pool:Pool,queue:Queue,id:string,requestId:string){
 export { randomUUID };
 export * from './runner.js';
 export * from './input.js';
+export {OperationsSampler,operationsAlerts,deadline} from './operations.js';

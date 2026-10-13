@@ -53,6 +53,8 @@ export function parseHistory(data:any,request:HistoryRequest,endpoint:string):Hi
 
 /** A worker-wide two-request limiter and single-flight cache; never runs on the live event queue. */
 export class HistoryClient {
+ readonly telemetry={success:0,failed:0,lastDurationMs:0,lastSuccessAt:0,lastError:undefined as string|undefined};
+ diagnostics(){return {...this.telemetry,active:this.active,queued:this.waiting.length};}
  private active=0;private waiting:Array<()=>void>=[];private inFlight=new Map<string,Promise<HistoryResult>>();
  private controller=new AbortController();
  constructor(readonly endpoint=process.env.MEMEINFO_HISTORY_URL??'https://app.memeinfo.net/api/project-overview/xxyy-klines',private readonly transport:typeof fetch=fetch,private readonly delay=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms))){}
@@ -61,7 +63,7 @@ export class HistoryClient {
   const step=request.interval==='30s'?30_000:60_000;
   if(!request.pair||!Number.isSafeInteger(request.from)||request.from<=0||request.from%step||!Number.isSafeInteger(request.to)||request.to%step||request.to<=request.from||request.to-request.from>step*5000)return Promise.reject(new HistoryError('历史补数请求范围非法'));
   const key=JSON.stringify(request),existing=this.inFlight.get(key);if(existing)return existing;
-  const operation=this.perform(request).finally(()=>this.inFlight.delete(key));this.inFlight.set(key,operation);return operation;
+  const started=Date.now();const operation=this.perform(request).then(result=>{this.telemetry.success++;this.telemetry.lastSuccessAt=Date.now();this.telemetry.lastError=undefined;return result;},error=>{this.telemetry.failed++;this.telemetry.lastError=String(error.message).replace(/https?:\/\/\S+/g,'[地址]').slice(0,240);throw error;}).finally(()=>{this.telemetry.lastDurationMs=Date.now()-started;this.inFlight.delete(key);});this.inFlight.set(key,operation);return operation;
  }
  private async limited<T>(fn:()=>Promise<T>):Promise<T>{
   if(this.active>=2)await new Promise<void>(resolve=>this.waiting.push(resolve));else this.active++;
