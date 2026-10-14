@@ -5,6 +5,7 @@ import type {StrategyConfig} from '@meme/domain';
 import {withCurrentImpulseSelection,LIVE_SIGNAL_SOURCES,liveSignalSources,legacyLiveSource,normalizeLiveSources,selectedLiveSources,type LiveSignalSourceCode} from '@meme/domain';
 import {selectedProjectSources,normalizeProjectSources,defaultProjectSources,PROJECT_PROVIDERS,type ProjectSources} from '@meme/domain';
 import {buildLivePortfolio} from './live-portfolio.js';
+import {realizedCapital} from './live-capital.js';
 import {liveFib,decisionBucket} from './live-locator.js';
 
 type Mode='paper'|'live';
@@ -247,6 +248,37 @@ export class LiveController {
     FROM live_events e WHERE e.run_id=$1 AND e.kind='external_signal' AND ($2::text IS NULL OR e.chain=$2) AND ($3::text IS NULL OR e.ca=$3) AND ($4::text IS NULL OR e.pair_id=$4)
     AND e.event_time BETWEEN $5 AND $6 ORDER BY e.event_time,e.id LIMIT $7 OFFSET $8`,[id,q.chain??null,q.ca??null,q.pairId??null,Number(q.from??0),Number(q.to??Date.now()),size,(page-1)*size])).rows;
   return {items:rows,total:Number(rows[0]?.total??0)};
+ }
+ @Get('live-runs/:id/capital-curve') async capitalCurve(@Param('id') id:string,@Query() q:Record<string,string>){
+  const kind=q.kind??'realized';
+  if(!['realized','equity'].includes(kind))throw new BadRequestException('资金曲线类型无效');
+  const run=(await this.pool.query('SELECT id,mode,initial_capital,started_at,created_at,strategy_json,interval,value_type FROM live_runs WHERE id=$1',[id])).rows[0];
+  if(!run)throw new BadRequestException('任务不存在');
+  const initialCapital=Number(run.initial_capital),base={kind,mode:run.mode,initialCapital,asOf:Date.now()};
+  if(kind==='equity'){
+   if(run.mode!=='paper')throw new BadRequestException('实盘暂无可信的钱包权益快照，请查看已平仓资金曲线');
+   // Full-history bounded display: each time bucket keeps first/last/min/max, not only the latest 1000 rows.
+   const result=await this.pool.query(`WITH ranked AS (
+    SELECT time,equity,cash,unrealized,ROW_NUMBER() OVER(ORDER BY time) AS rn,COUNT(*) OVER() AS total
+    FROM live_equity_curve WHERE run_id=$1
+   ), bucketed AS (SELECT *,floor((rn-1)::numeric/GREATEST(1,ceil(total::numeric/450))) AS bucket FROM ranked),
+   picked AS (SELECT *,ROW_NUMBER() OVER(PARTITION BY bucket ORDER BY time) AS first_row,
+    ROW_NUMBER() OVER(PARTITION BY bucket ORDER BY time DESC) AS last_row,
+    ROW_NUMBER() OVER(PARTITION BY bucket ORDER BY equity,time) AS low_row,
+    ROW_NUMBER() OVER(PARTITION BY bucket ORDER BY equity DESC,time) AS high_row FROM bucketed)
+   SELECT time,equity,cash,unrealized,total FROM picked WHERE first_row=1 OR last_row=1 OR low_row=1 OR high_row=1 ORDER BY time`,[id]);
+   const points=result.rows.map(r=>({time:Number(r.time),equity:Number(r.equity),cash:Number(r.cash),unrealized:Number(r.unrealized)})),total=Number(result.rows[0]?.total??0);
+   return {...base,total,points,sampled:total>points.length,lastDataTime:points.at(-1)?.time??null};
+  }
+  const [fills,watches]=await Promise.all([
+   this.pool.query(`SELECT o.id,o.position_id,o.chain,o.ca,o.pair_id,o.side,o.reason,o.decision_time,
+    f.fill_time,f.fill_value,f.fill_price,f.market_cap,f.quantity,f.gross_amount,f.fee,f.slippage_cost,f.tax_cost
+    FROM live_orders o JOIN live_fills f ON f.order_id=o.id WHERE o.run_id=$1 AND o.status='filled' ORDER BY f.fill_time,o.decision_time,o.id`,[id]),
+   this.pool.query('SELECT chain,ca,last_trade_at,state_json FROM live_watches WHERE run_id=$1',[id])
+  ]);
+  const portfolio=buildLivePortfolio(fills.rows,watches.rows,run.strategy_json,run.value_type,run.interval);
+  const curve=realizedCapital(initialCapital,new Date(run.started_at??run.created_at).getTime(),portfolio.closed);
+  return {...base,...curve,sampled:curve.total>curve.points.length,lastDataTime:curve.points.at(-1)?.time??null,incompleteCount:portfolio.summary.incompleteCount,closedCount:portfolio.closed.length};
  }
  @Get('live-runs/:id/equity') async equity(@Param('id') id:string){
   return (await this.pool.query('SELECT time,equity,cash,unrealized FROM live_equity_curve WHERE run_id=$1 ORDER BY time DESC LIMIT 1000',[id])).rows.reverse();

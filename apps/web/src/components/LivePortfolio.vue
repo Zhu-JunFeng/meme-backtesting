@@ -46,7 +46,7 @@ async function load(){const id=++epoch;loading.value=true;error.value='';try{
 }catch{if(id===epoch)error.value='持仓与信号加载失败，请重试';}finally{if(id===epoch)loading.value=false;}}
 watch([()=>props.runId,tab],()=>{page.value=1;items.value=[];void load();});
 watch(page,()=>void load());
-onMounted(()=>{void load();timer=window.setInterval(()=>void load(),5000);clockTimer=window.setInterval(()=>{clock.value=Date.now();},1000);});
+onMounted(()=>{void load();timer=window.setInterval(()=>{if(!document.hidden)void load();},5000);clockTimer=window.setInterval(()=>{clock.value=Date.now();},1000);});
 onBeforeUnmount(()=>{epoch++;window.clearInterval(timer);window.clearInterval(clockTimer);});
 </script>
 

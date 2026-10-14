@@ -7,8 +7,13 @@ import StrategyWorkspace from "./components/StrategyWorkspace.vue";
 import BacktestWorkspace from "./components/BacktestWorkspace.vue";
 import LiveWorkspace from "./components/LiveWorkspace.vue";
 import './responsive.css';
+import {parseRoute,type Page} from './navigation';
 
-const page = ref<"backtest"|"strategy"|"paper"|"live"|"operations">("backtest");
+const route=ref(parseRoute(window.location.hash));
+const page=computed<Page>({get:()=>route.value.page,set:value=>{window.location.hash=`#/${value}`;}});
+function syncRoute(){route.value=parseRoute(window.location.hash);}
+onMounted(()=>window.addEventListener('hashchange',syncRoute));
+onUnmounted(()=>window.removeEventListener('hashchange',syncRoute));
 const alertCount=ref<number|null>(null);let opsTimer:ReturnType<typeof setInterval>;
 async function pollOperations(){if(document.hidden||page.value==='operations')return;try{alertCount.value=(await api.get('/operations/status')).data.alerts.length;}catch{alertCount.value=null;}}
 onMounted(()=>{void pollOperations();opsTimer=setInterval(pollOperations,60000);});onUnmounted(()=>clearInterval(opsTimer));
@@ -35,7 +40,7 @@ const pageDescription = computed(() => ({strategy:"定义指标、组合规则�
         <BacktestWorkspace v-if="page==='backtest'" />
         <StrategyWorkspace v-else-if="page==='strategy'" />
         <OperationsWorkspace v-else-if="page==='operations'" @alerts="alertCount=$event" />
-        <LiveWorkspace v-else :key="page" :mode="page" />
+        <LiveWorkspace v-else :key="page" :mode="page" :run-id="route.runId" :tab="route.tab" />
       </main>
     </div>
   </a-config-provider>
